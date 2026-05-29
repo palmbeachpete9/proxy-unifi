@@ -2,8 +2,7 @@
 
 Run an [Xray-core](https://github.com/XTLS/Xray-core) proxy client
 (**VLESS**, **Trojan**, **Shadowsocks**) directly on your UniFi Cloud Gateway — and
-steer traffic into it from the native UniFi UI (**Policy Engine → Policy Table**),
-exactly like a commercial VPN.
+steer traffic into it from the native UniFi UI (via **Policy Engine**).
 
 UniFi gateways have no built-in proxy support and can't dial a `vless://` /
 `trojan://` / `ss://` server.
@@ -55,8 +54,8 @@ is required — it works with any plain `vless://` / `trojan://` / `ss://` provi
 
 ## Requirements
 
-- A UniFi gateway on **UniFi OS 4.x** (UCG-Ultra / Max / Fiber, UDM / Pro / SE,
-  UXG, UDR, …) with SSH enabled and `root` access.
+- A UniFi gateway on **UniFi OS 4.x** or newer (tested on 5.1.12): UCG-Ultra / Max / Fiber, UDM / Pro / SE,
+  UXG, UDR, …, with SSH enabled and `root` access.
 - `unifi-common` for boot persistence — the installer sets it up automatically if
   it isn't already present.
 
