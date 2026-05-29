@@ -69,7 +69,7 @@ run_step() {
         _i=$((_i + 1)); sleep 0.1 2>/dev/null || sleep 1
     done
     if wait "$_pid"; then
-        printf '\r  \033[32m\xe2\x9c\x93\033[0m  %s  %-40s\n' "$(_bar "$_pct")" "$_label"
+        printf '\r  \033[32m\342\234\223\033[0m  %s  %-40s\n' "$(_bar "$_pct")" "$_label"
     else
         printf '\r  \033[31mx\033[0m  %s  %-40s\n' "$(_bar "$_pct")" "$_label"
         red "Install step failed: $_label  (see $LOG)"
