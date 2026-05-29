@@ -28,6 +28,7 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 ONBOOT_DST="/data/on_boot.d/15-xray-unifi.sh"
 
 XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/latest/download"
+GEO_BASE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
 
 # defaults (overridable via settings.env)
 WG_LISTEN="127.0.0.1"
@@ -157,8 +158,9 @@ cmd_install_binary() {
     # rename swaps the inode and leaves the running process on the old one.
     install -m 0755 "$tmp/xray" "$XRAY.new"
     mv -f "$XRAY.new" "$XRAY"
-    # geo data (geoip.dat/geosite.dat) is intentionally NOT installed: routing is
-    # done in the UniFi Policy Table, so the binary never needs the geo files.
+    # geo data ships inside the xray zip, so it refreshes on every core update.
+    if [ -f "$tmp/geoip.dat" ];   then install -m 0644 "$tmp/geoip.dat"   "$BIN_DIR/geoip.dat";   fi
+    if [ -f "$tmp/geosite.dat" ]; then install -m 0644 "$tmp/geosite.dat" "$BIN_DIR/geosite.dat"; fi
     rm -rf "$tmp"
     c_grn "xray-core installed: $("$XRAY" version 2>/dev/null | head -1)"
 }
@@ -381,6 +383,23 @@ cmd_update() {
     systemctl restart "$SERVICE_NAME" 2>/dev/null || true
 }
 
+cmd_geo_update() {
+    mkdir -p "$BIN_DIR"
+    for f in geoip.dat geosite.dat; do
+        info "downloading $f ..."
+        if have curl; then
+            curl -fsSL "$GEO_BASE/$f" -o "$BIN_DIR/$f.new" || { rm -f "$BIN_DIR/$f.new"; fatal "failed to fetch $f"; }
+        elif have wget; then
+            wget -qO "$BIN_DIR/$f.new" "$GEO_BASE/$f" || { rm -f "$BIN_DIR/$f.new"; fatal "failed to fetch $f"; }
+        else
+            fatal "need curl or wget to download geo files"
+        fi
+        mv -f "$BIN_DIR/$f.new" "$BIN_DIR/$f"
+    done
+    systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+    c_grn "Geo files updated."
+}
+
 current_server() {
     [ -f "$OUTBOUND_LINK" ] || { echo "(none imported)"; return; }
     hp="$(py "$MKCONFIG" --link "$(cat "$OUTBOUND_LINK")" --print-server 2>/dev/null)" || { echo "?"; return; }
@@ -510,8 +529,9 @@ print_menu() {
     ml " 16. Disable autostart"
     printf '│%s│\n' "$HR"
     ml " 17. Update xray-core"
-    ml " 18. Version info"
-    ml " 19. Uninstall"
+    ml " 18. Update geo files"
+    ml " 19. Version info"
+    ml " 20. Uninstall"
     printf '╚%s╝\n' "$HR"
     printf '\n'
     printf 'Service:    %s\n' "$svc_d"
@@ -571,7 +591,7 @@ cmd_menu() {
     while true; do
         clear 2>/dev/null || true
         print_menu
-        printf '\nPlease enter your selection [0-19]: '
+        printf '\nPlease enter your selection [0-20]: '
         read -r sel || exit 0
         echo
         case "$sel" in
@@ -601,9 +621,10 @@ cmd_menu() {
             15) ( menu_enable ) ;;
             16) ( menu_disable ) ;;
             17) ( cmd_update ) ;;
-            18) ( if [ -x "$XRAY" ]; then "$XRAY" version | head -1; else c_ylw "xray-core: not installed"; fi
+            18) ( cmd_geo_update ) ;;
+            19) ( if [ -x "$XRAY" ]; then "$XRAY" version | head -1; else c_ylw "xray-core: not installed"; fi
                   echo "xray-unifi CLI 1.0.0" ) ;;
-            19) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
+            20) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
                 if [ "${_c:-}" = "y" ]; then ( cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
             *)  c_red "Invalid selection." ;;
         esac
@@ -666,6 +687,7 @@ case "$cmd" in
     enable)          need_root; cmd_enable ;;
     disable)         need_root; cmd_disable ;;
     update)          need_root; cmd_update ;;
+    geo-update)      need_root; cmd_geo_update ;;
     version)         [ -x "$XRAY" ] && "$XRAY" version | head -1; echo "xray-unifi CLI 1.0.0" ;;
     uninstall)       cmd_uninstall ;;
     install-binary)  need_root; cmd_install_binary ;;
