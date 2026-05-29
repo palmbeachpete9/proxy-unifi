@@ -1,4 +1,4 @@
-# xray-unifi
+# Xray-core on UniFi OS
 
 Run an [Xray-core](https://github.com/XTLS/Xray-core) **VLESS** client directly on
 your UniFi Cloud Gateway — and steer traffic into it from the native UniFi UI
