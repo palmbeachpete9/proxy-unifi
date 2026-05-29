@@ -1,0 +1,662 @@
+#!/bin/sh
+# xray-unifi - GUI-less Xray-core (VLESS) client for UniFi Cloud Gateways.
+#
+# It runs an Xray WireGuard inbound that the gateway's *native* WireGuard VPN
+# Client connects to over loopback, and forwards everything out a VLESS server.
+# Because the tunnel is a real, controller-managed WireGuard VPN Client, it shows
+# up in the UniFi UI (VPN -> VPN Client) and in Policy Engine -> Policy Table.
+#
+# POSIX sh on purpose: UniFi OS ships dash/busybox-ish environments.
+
+set -eu
+
+# --------------------------------------------------------------------------
+# Paths / constants
+# --------------------------------------------------------------------------
+ROOT="/data/xray-unifi"
+BIN_DIR="$ROOT/bin"
+ETC_DIR="$ROOT/etc"
+WG_DIR="$ETC_DIR/wg"
+XRAY="$BIN_DIR/xray"
+CONFIG="$ETC_DIR/config.json"
+OUTBOUND_LINK="$ETC_DIR/link.txt"
+SETTINGS="$ETC_DIR/settings.env"
+MKCONFIG="$BIN_DIR/mkconfig.py"
+SERVICE_NAME="xray-unifi"
+# (no RUN_DIR: xray runs under systemd, no pidfile needed)
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+ONBOOT_DST="/data/on_boot.d/15-xray-unifi.sh"
+
+XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/latest/download"
+
+# defaults (overridable via settings.env)
+WG_LISTEN="127.0.0.1"
+WG_PORT="51821"
+WG_MTU="1340"
+WG_KEEPALIVE="25"
+XRAY_ADDR="10.7.0.1/32"
+UNIFI_ADDR="10.7.0.2/32"
+INNER_DNS=""
+LOGLEVEL="warning"
+PING_MODE="get"
+PING_URL="https://www.gstatic.com/generate_204"
+PING_TIMEOUT="5"
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+c_red()   { printf '\033[31m%s\033[0m\n' "$*"; }
+c_grn()   { printf '\033[32m%s\033[0m\n' "$*"; }
+c_ylw()   { printf '\033[33m%s\033[0m\n' "$*"; }
+c_bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
+info()    { printf '   %s\n' "$*"; }
+err()     { c_red "error: $*" >&2; }
+fatal()   { err "$*"; exit 1; }
+
+need_root() {
+    [ "$(id -u)" = "0" ] || fatal "must be run as root (you are on a UniFi gateway via SSH, use 'root')."
+}
+
+load_settings() {
+    # shellcheck source=/dev/null
+    [ -f "$SETTINGS" ] && . "$SETTINGS" || true
+}
+
+save_settings() {
+    mkdir -p "$ETC_DIR"
+    cat > "$SETTINGS" <<EOF
+# xray-unifi settings - managed by the CLI ('xray set <key> <value>'). Safe to edit by hand.
+WG_LISTEN="$WG_LISTEN"
+WG_PORT="$WG_PORT"
+WG_MTU="$WG_MTU"
+WG_KEEPALIVE="$WG_KEEPALIVE"
+XRAY_ADDR="$XRAY_ADDR"
+UNIFI_ADDR="$UNIFI_ADDR"
+INNER_DNS="$INNER_DNS"
+LOGLEVEL="$LOGLEVEL"
+PING_MODE="$PING_MODE"
+PING_URL="$PING_URL"
+PING_TIMEOUT="$PING_TIMEOUT"
+EOF
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+py() {
+    if have python3; then python3 "$@";
+    elif have python; then python "$@";
+    else fatal "python3 is required but was not found on this gateway.";
+    fi
+}
+
+# Generate a WireGuard keypair -> prints "PRIVATE PUBLIC" on one line.
+gen_keypair() {
+    if have wg; then
+        _priv="$(wg genkey)"
+        _pub="$(printf '%s' "$_priv" | wg pubkey)"
+    elif have openssl; then
+        _tmp="$(mktemp)"
+        openssl genpkey -algorithm X25519 -out "$_tmp" 2>/dev/null \
+            || fatal "openssl could not generate an X25519 key"
+        _priv="$(openssl pkey -in "$_tmp" -outform DER 2>/dev/null | tail -c 32 | base64)"
+        _pub="$(openssl pkey -in "$_tmp" -pubout -outform DER 2>/dev/null | tail -c 32 | base64)"
+        rm -f "$_tmp"
+    else
+        fatal "need either 'wg' or 'openssl' to generate WireGuard keys"
+    fi
+    printf '%s %s\n' "$_priv" "$_pub"
+}
+
+ensure_keys() {
+    mkdir -p "$WG_DIR"
+    chmod 700 "$WG_DIR"
+    if [ ! -f "$WG_DIR/xray_private.key" ] || [ ! -f "$WG_DIR/unifi_private.key" ]; then
+        info "generating WireGuard keypairs (xray side + UniFi side)..."
+        # split "PRIV PUB" without word-splitting/globbing (base64 is glob-safe, but be strict)
+        _kp="$(gen_keypair)"; printf '%s' "${_kp% *}" > "$WG_DIR/xray_private.key";  printf '%s' "${_kp#* }" > "$WG_DIR/xray_public.key"
+        _kp="$(gen_keypair)"; printf '%s' "${_kp% *}" > "$WG_DIR/unifi_private.key"; printf '%s' "${_kp#* }" > "$WG_DIR/unifi_public.key"
+        chmod 600 "$WG_DIR"/*.key
+    fi
+}
+
+arch_slug() {
+    case "$(uname -m)" in
+        aarch64|arm64) echo "arm64-v8a" ;;
+        x86_64|amd64)  echo "64" ;;
+        armv7l|armhf)  echo "arm32-v7a" ;;
+        *) fatal "unsupported architecture: $(uname -m)" ;;
+    esac
+}
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+cmd_install_binary() {
+    mkdir -p "$BIN_DIR"
+    slug="$(arch_slug)"
+    url="${XRAY_RELEASE_BASE}/Xray-linux-${slug}.zip"
+    tmp="$(mktemp -d)"
+    info "downloading xray-core ($slug) ..."
+    if have curl; then
+        curl -fsSL "$url" -o "$tmp/xray.zip" || fatal "download failed: $url"
+    elif have wget; then
+        wget -qO "$tmp/xray.zip" "$url" || fatal "download failed: $url"
+    else
+        fatal "need curl or wget to download xray-core"
+    fi
+    if have unzip; then
+        unzip -oq "$tmp/xray.zip" -d "$tmp" || fatal "unzip failed"
+    else
+        py -c "import zipfile,sys; zipfile.ZipFile('$tmp/xray.zip').extractall('$tmp')" \
+            || fatal "could not extract xray.zip (no unzip and python failed)"
+    fi
+    [ -f "$tmp/xray" ] || fatal "downloaded archive did not contain an xray binary"
+    # Install via temp + atomic rename. Overwriting the file in place with `install`
+    # would fail with ETXTBSY ("Text file busy") while the service is running; a
+    # rename swaps the inode and leaves the running process on the old one.
+    install -m 0755 "$tmp/xray" "$XRAY.new"
+    mv -f "$XRAY.new" "$XRAY"
+    # geo data (geoip.dat/geosite.dat) is intentionally NOT installed: routing is
+    # done in the UniFi Policy Table, so the binary never needs the geo files.
+    rm -rf "$tmp"
+    c_grn "xray-core installed: $("$XRAY" version 2>/dev/null | head -1)"
+}
+
+write_service() {
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=xray-unifi (Xray-core WireGuard->VLESS bridge)
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+# Don't crash-loop before a link has been imported.
+ConditionPathExists=$CONFIG
+
+[Service]
+Type=simple
+ExecStart=$XRAY run -config $CONFIG
+Environment=XRAY_LOCATION_ASSET=$BIN_DIR
+WorkingDirectory=$ROOT
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+install_service() {
+    write_service
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+}
+
+regen_config() {
+    [ -f "$OUTBOUND_LINK" ] || fatal "no vless:// link imported yet. Run 'xray' and choose option 1."
+    ensure_keys
+    link="$(cat "$OUTBOUND_LINK")"
+    xray_priv="$(cat "$WG_DIR/xray_private.key")"
+    unifi_pub="$(cat "$WG_DIR/unifi_public.key")"
+    mkdir -p "$ETC_DIR"
+    # optional --dns, injected via positional params so it stays properly quoted
+    set --
+    [ -n "$INNER_DNS" ] && set -- --dns "$INNER_DNS"
+    tmpcfg="$(mktemp)"
+    py "$MKCONFIG" \
+        --link "$link" \
+        --listen "$WG_LISTEN" \
+        --port "$WG_PORT" \
+        --secret-key "$xray_priv" \
+        --peer-pubkey "$unifi_pub" \
+        --address "$XRAY_ADDR" \
+        --mtu "$WG_MTU" \
+        --keepalive "$WG_KEEPALIVE" \
+        --loglevel "$LOGLEVEL" \
+        "$@" \
+        > "$tmpcfg" || { rm -f "$tmpcfg"; fatal "config generation failed"; }
+    # validate before swapping it in. -format json is required because xray infers
+    # the config format from the file extension, and mktemp names have none.
+    if [ -x "$XRAY" ]; then
+        "$XRAY" run -test -config "$tmpcfg" -format json >/dev/null 2>&1 || {
+            rm -f "$tmpcfg"; fatal "xray rejected the generated config (-test failed)"
+        }
+    fi
+    mv "$tmpcfg" "$CONFIG"
+    chmod 600 "$CONFIG"
+}
+
+cmd_import() {
+    [ $# -ge 1 ] || fatal "usage: xray import <vless://...>"
+    link="$1"
+    case "$link" in
+        vless://*) : ;;
+        *) fatal "that doesn't look like a vless:// link" ;;
+    esac
+    mkdir -p "$ETC_DIR"
+    printf '%s' "$link" > "$OUTBOUND_LINK"
+    chmod 600 "$OUTBOUND_LINK"
+    load_settings; save_settings
+    regen_config
+    # Apply immediately (starts the service even if autostart is off; the unit's
+    # ConditionPathExists is now satisfied because config.json exists).
+    systemctl restart "$SERVICE_NAME" 2>/dev/null || systemctl start "$SERVICE_NAME" 2>/dev/null || true
+    c_grn "Imported and applied."
+    echo
+    cmd_wg_config
+}
+
+cmd_wg_config() {
+    [ -f "$WG_DIR/unifi_private.key" ] || fatal "no keys yet. Run 'xray' and choose option 1 to import a link first."
+    load_settings
+    upriv="$(cat "$WG_DIR/unifi_private.key")"
+    xpub="$(cat "$WG_DIR/xray_public.key")"
+    c_bold "================  UniFi WireGuard VPN Client  ================"
+    echo
+    echo "In unifi.ui.com:  Settings -> VPN -> VPN Client -> Create New"
+    echo "  Choose 'WireGuard' and 'Manual' configuration, then enter:"
+    echo
+    printf "  %-22s %s\n" "Private Key:"      "$upriv"
+    printf "  %-22s %s\n" "Public Key (peer):" "$xpub"
+    printf "  %-22s %s\n" "Endpoint:"          "${WG_LISTEN}:${WG_PORT}"
+    printf "  %-22s %s\n" "Pre-shared Key:"    "(leave empty)"
+    printf "  %-22s %s\n" "Address / Local IP:" "$UNIFI_ADDR"
+    printf "  %-22s %s\n" "Allowed IPs:"        "0.0.0.0/0, ::/0"
+    printf "  %-22s %s\n" "MTU:"                "$WG_MTU"
+    [ -n "$INNER_DNS" ] && printf "  %-22s %s\n" "DNS:" "$INNER_DNS"
+    echo
+    c_ylw "Or upload this .conf file (VPN Client -> Upload configuration):"
+    echo "  ----------------------------------------------------------------"
+    cat <<EOF
+  [Interface]
+  PrivateKey = $upriv
+  Address = $UNIFI_ADDR
+$( [ -n "$INNER_DNS" ] && echo "  DNS = $INNER_DNS" )
+  MTU = $WG_MTU
+
+  [Peer]
+  PublicKey = $xpub
+  Endpoint = ${WG_LISTEN}:${WG_PORT}
+  AllowedIPs = 0.0.0.0/0, ::/0
+  PersistentKeepalive = $WG_KEEPALIVE
+EOF
+    echo "  ----------------------------------------------------------------"
+    echo
+    info "After it connects, go to Policy Engine -> Policy Table and create a"
+    info "Traffic Route that sends your chosen VLAN/clients through this VPN Client."
+    c_bold "============================================================="
+}
+
+cmd_status() {
+    load_settings
+    act="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
+    ena="$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true)"
+    echo "service:   ${act:-unknown} / ${ena:-disabled}"
+    if [ -x "$XRAY" ]; then echo "xray:      $("$XRAY" version 2>/dev/null | head -1)"; else echo "xray:      not installed"; fi
+    echo "server:    $(current_server)"
+    echo "wg listen: ${WG_LISTEN}:${WG_PORT}  mtu=${WG_MTU}"
+    if have ss; then
+        if ss -lun 2>/dev/null | grep -q ":${WG_PORT}\b"; then c_grn "udp/${WG_PORT}: listening"; else c_ylw "udp/${WG_PORT}: not listening"; fi
+    fi
+}
+
+cmd_logs()    { shift || true; journalctl -u "$SERVICE_NAME" "$@"; }
+cmd_start()   { systemctl start "$SERVICE_NAME"; }
+cmd_stop()    { systemctl stop "$SERVICE_NAME"; }
+cmd_restart() { systemctl restart "$SERVICE_NAME"; }
+cmd_enable()  { systemctl enable "$SERVICE_NAME"; }
+cmd_disable() { systemctl disable "$SERVICE_NAME"; }   # autostart only; use 'stop' to stop now
+
+cmd_config()  { [ -f "$CONFIG" ] || fatal "no config generated yet"; cat "$CONFIG"; }
+
+cmd_set() {
+    load_settings
+    key="$1"; val="$2"
+    # 'ping' only changes a CLI default; it never touches the xray config.
+    if [ "$key" = "ping" ]; then
+        case "$val" in
+            get|head|tcp|icmp) PING_MODE="$val"; save_settings; c_grn "Default ping protocol = $val." ;;
+            *) fatal "ping protocol must be get|head|tcp|icmp" ;;
+        esac
+        return
+    fi
+    # validate up front so a bad value is never persisted to settings.env
+    case "$key" in
+        port)
+            case "$val" in ""|*[!0-9]*) fatal "port must be a number (1-65535)";; esac
+            { [ "$val" -ge 1 ] && [ "$val" -le 65535 ]; } || fatal "port out of range (1-65535)"
+            WG_PORT="$val" ;;
+        mtu)
+            case "$val" in ""|*[!0-9]*) fatal "mtu must be a number";; esac
+            { [ "$val" -ge 576 ] && [ "$val" -le 1500 ]; } || fatal "mtu out of range (576-1500)"
+            WG_MTU="$val" ;;
+        keepalive)
+            case "$val" in *[!0-9]*) fatal "keepalive must be a number";; esac
+            WG_KEEPALIVE="${val:-0}" ;;
+        dns)
+            INNER_DNS="$(printf '%s' "$val" | tr -d ' ')" ;;   # comma-separated, no spaces
+        loglevel)
+            case "$val" in debug|info|warning|error|none) LOGLEVEL="$val" ;; *) fatal "loglevel must be debug|info|warning|error|none";; esac ;;
+        *) fatal "unknown setting '$key' (port|mtu|dns|keepalive|loglevel|ping)" ;;
+    esac
+    save_settings
+    if [ -f "$OUTBOUND_LINK" ]; then
+        regen_config
+        systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+        c_grn "Updated $key and reloaded."
+        case "$key" in port|mtu|dns) echo; c_ylw "Update your UniFi VPN Client to match:"; cmd_wg_config ;; esac
+    else
+        c_grn "Updated $key (will apply when you import a link)."
+    fi
+    return 0
+}
+
+cmd_regen_keys() {
+    load_settings
+    rm -f "$WG_DIR"/*.key
+    ensure_keys
+    [ -f "$OUTBOUND_LINK" ] && regen_config && systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+    c_ylw "New keys generated. You MUST update the UniFi VPN Client with the new config:"
+    echo
+    cmd_wg_config
+}
+
+cmd_update() {
+    cmd_install_binary
+    systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+}
+
+current_server() {
+    [ -f "$OUTBOUND_LINK" ] || { echo "(none imported)"; return; }
+    hp="$(py "$MKCONFIG" --link "$(cat "$OUTBOUND_LINK")" --print-server 2>/dev/null)" || { echo "?"; return; }
+    printf '%s:%s\n' "$(printf '%s' "$hp" | cut -f1)" "$(printf '%s' "$hp" | cut -f2)"
+}
+
+# --------------------------------------------------------------------------
+# Connectivity test (`xray ping`)
+# --------------------------------------------------------------------------
+_ms_from_seconds() { py -c "print('%.0f'%(float('${1:-0}')*1000))" 2>/dev/null || echo "?"; }
+
+ping_proxy() {   # $1 = get|head
+    _m="$1"; _link="$(cat "$OUTBOUND_LINK")"
+    [ -x "$XRAY" ] || { err "xray binary not installed"; return 1; }
+    _port=21080
+    _cfg="$(mktemp)"
+    py "$MKCONFIG" --link "$_link" --socks-port "$_port" > "$_cfg" 2>/dev/null \
+        || { rm -f "$_cfg"; err "could not build test config"; return 1; }
+    # -format json: mktemp names have no extension for xray to infer the format from.
+    "$XRAY" run -config "$_cfg" -format json >/dev/null 2>&1 &
+    _pid=$!
+    # wait (max ~4.5s) for the SOCKS listener to come up
+    _i=0
+    while [ "$_i" -lt 15 ]; do
+        if py -c 'import socket,sys;s=socket.socket();s.settimeout(0.5)
+try:
+    s.connect(("127.0.0.1",'"$_port"'));s.close()
+except Exception: sys.exit(1)' >/dev/null 2>&1; then break; fi
+        _i=$((_i + 1)); sleep 0.3 2>/dev/null || sleep 1
+    done
+    if [ "$_m" = "head" ]; then _label="via proxy (HEAD)"; set -- -I; else _label="via proxy (GET)"; set -- -X GET; fi
+    _out="$(curl -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time "$PING_TIMEOUT" \
+             "$@" --proxy "socks5h://127.0.0.1:${_port}" "$PING_URL" 2>/dev/null)" || _out=""
+    kill "$_pid" 2>/dev/null || true; wait "$_pid" 2>/dev/null || true
+    rm -f "$_cfg"
+    if [ -z "$_out" ]; then c_red "${_label}: timeout (>${PING_TIMEOUT}s)"; return 1; fi
+    _code="${_out%% *}"; _ms="$(_ms_from_seconds "${_out##* }")"
+    case "$_code" in
+        204|200) c_grn "${_label}: ${_ms} ms  (HTTP ${_code})" ;;
+        *)       c_ylw "${_label}: ${_ms} ms  (HTTP ${_code})" ;;
+    esac
+}
+
+ping_tcp() {
+    _hp="$(py "$MKCONFIG" --link "$(cat "$OUTBOUND_LINK")" --print-server 2>/dev/null)"
+    _h="$(printf '%s' "$_hp" | cut -f1)"; _p="$(printf '%s' "$_hp" | cut -f2)"
+    [ -n "$_h" ] || { err "could not parse server from link"; return 1; }
+    _ms="$(py - "$_h" "$_p" "$PING_TIMEOUT" <<'PYEOF'
+import socket, time, sys
+host, port, timeout = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+start = time.time()
+try:
+    socket.create_connection((host, port), timeout=timeout).close()
+    print("%.0f" % ((time.time() - start) * 1000))
+except Exception:
+    sys.exit(1)
+PYEOF
+)" || { c_red "TCP ${_h}:${_p}: timeout (>${PING_TIMEOUT}s)"; return 1; }
+    c_grn "TCP ${_h}:${_p}: ${_ms} ms"
+}
+
+ping_icmp() {
+    _hp="$(py "$MKCONFIG" --link "$(cat "$OUTBOUND_LINK")" --print-server 2>/dev/null)"
+    _h="$(printf '%s' "$_hp" | cut -f1)"
+    [ -n "$_h" ] || { err "could not parse server from link"; return 1; }
+    _out="$(ping -c 1 -W "$PING_TIMEOUT" "$_h" 2>/dev/null)" || { c_red "ICMP ${_h}: timeout (>${PING_TIMEOUT}s)"; return 1; }
+    _ms="$(printf '%s\n' "$_out" | sed -n 's/.*time=\([0-9.]*\).*/\1/p' | head -1)"
+    if [ -n "$_ms" ]; then c_grn "ICMP ${_h}: ${_ms} ms"; else c_red "ICMP ${_h}: no reply (host may block ICMP)"; fi
+}
+
+cmd_ping() {
+    load_settings
+    if [ ! -f "$OUTBOUND_LINK" ]; then
+        c_ylw "No VLESS link imported. Import one first (run 'xray' -> option 1)."
+        return 1
+    fi
+    _mode="${1:-$PING_MODE}"
+    case "$_mode" in
+        get)  ping_proxy get ;;
+        head) ping_proxy head ;;
+        tcp)  ping_tcp ;;
+        icmp) ping_icmp ;;
+        *) fatal "unknown ping protocol '$_mode' (get|head|tcp|icmp)" ;;
+    esac
+}
+
+# --------------------------------------------------------------------------
+# Interactive menu (shown when `xray` is run with no arguments)
+# --------------------------------------------------------------------------
+pause() { printf '\n'; printf 'Press Enter to return to the menu...'; read -r _ || true; }
+
+print_menu() {
+    load_settings
+    HR="$(py -c "print('─'*51)" 2>/dev/null || printf '%0.s─' 1 2 3 4 5)"
+    svc="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo unknown)"
+    auto="$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || echo disabled)"
+    lst="down"; if have ss && ss -lun 2>/dev/null | grep -q ":${WG_PORT}\b"; then lst="up"; fi
+    ml() { printf '│ %-49s │\n' "$1"; }
+    case "$svc" in active) svc_d="Running";; inactive) svc_d="Stopped";; *) svc_d="$svc";; esac
+    case "$auto" in enabled) auto_d="Yes";; *) auto_d="No";; esac
+
+    printf '\n'
+    printf '╔%s╗\n' "$HR"
+    ml "  xray-unifi : Xray VLESS client for UniFi"
+    ml "  0. Exit Script"
+    printf '│%s│\n' "$HR"
+    ml "  1. Import / replace VLESS link"
+    ml "  2. Show current server & xray config"
+    ml "  3. Show UniFi WireGuard VPN Client config"
+    ml "  4. Regenerate WireGuard keys"
+    printf '│%s│\n' "$HR"
+    ml "  5. Change WireGuard port"
+    ml "  6. Change tunnel MTU"
+    ml "  7. Set inner DNS"
+    printf '│%s│\n' "$HR"
+    ml "  8. Ping / test VLESS link"
+    printf '│%s│\n' "$HR"
+    ml "  9. Start"
+    ml " 10. Stop"
+    ml " 11. Restart"
+    ml " 12. Check status"
+    ml " 13. View logs"
+    printf '│%s│\n' "$HR"
+    ml " 14. Enable autostart"
+    ml " 15. Disable autostart"
+    printf '│%s│\n' "$HR"
+    ml " 16. Update xray-core"
+    ml " 17. Version info"
+    ml " 18. Uninstall"
+    printf '╚%s╝\n' "$HR"
+    printf '\n'
+    printf 'Service:    %s\n' "$svc_d"
+    printf 'Autostart:  %s\n' "$auto_d"
+    printf 'Listener:   udp %s:%s (%s)\n' "$WG_LISTEN" "$WG_PORT" "$lst"
+    printf 'Server:     %s\n' "$(current_server)"
+}
+
+# State-aware service controls used by the menu (idempotent feedback).
+menu_start() {
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then c_ylw "Service is already running."
+    elif systemctl start "$SERVICE_NAME" 2>/dev/null;          then c_grn "Service started."
+    else c_red "Failed to start - is a link imported? Check 'View logs'."; fi
+}
+menu_stop() {
+    if ! systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then c_ylw "Service is already stopped."
+    elif systemctl stop "$SERVICE_NAME" 2>/dev/null;             then c_ylw "Service stopped."
+    else c_red "Failed to stop service."; fi
+}
+menu_restart() {
+    if systemctl restart "$SERVICE_NAME" 2>/dev/null; then c_grn "Service restarted."
+    else c_red "Failed to restart - is a link imported? Check 'View logs'."; fi
+}
+menu_enable() {
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then c_ylw "Autostart is already enabled."
+    elif systemctl enable "$SERVICE_NAME" >/dev/null 2>&1;       then c_grn "Autostart enabled."
+    else c_red "Failed to enable autostart (is the service installed?)."; fi
+}
+menu_disable() {
+    if ! systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then c_ylw "Autostart is already disabled."
+    elif systemctl disable "$SERVICE_NAME" >/dev/null 2>&1;        then c_ylw "Autostart disabled (service keeps running until stopped)."
+    else c_red "Failed to disable autostart."; fi
+}
+
+menu_ping() {
+    load_settings
+    echo "Ping protocol (current default: ${PING_MODE}):"
+    echo "  1) via proxy (GET)    - real delay through the VLESS tunnel"
+    echo "  2) via proxy (HEAD)   - same, HEAD request"
+    echo "  3) TCP                - handshake latency to the server"
+    echo "  4) ICMP               - echo to the server host"
+    printf 'Choice [Enter = default]: '
+    read -r _p || true
+    case "${_p:-}" in
+        1) _mode="get" ;; 2) _mode="head" ;; 3) _mode="tcp" ;; 4) _mode="icmp" ;;
+        "") _mode="$PING_MODE" ;;
+        *) c_red "invalid choice"; return ;;
+    esac
+    echo
+    cmd_ping "$_mode" || true
+    if [ "$_mode" != "$PING_MODE" ]; then
+        printf '\nMake "%s" the default protocol? [y/N]: ' "$_mode"
+        read -r _s || true; [ "${_s:-}" = "y" ] && cmd_set ping "$_mode"
+    fi
+}
+
+cmd_menu() {
+    # Interactive loop: turn off errexit and run each action in a subshell so a
+    # failing action (including any fatal/exit) reports its error and returns to
+    # the menu instead of killing the whole program.
+    set +e
+    while true; do
+        clear 2>/dev/null || true
+        print_menu
+        printf '\nPlease enter your selection [0-18]: '
+        read -r sel || exit 0
+        echo
+        case "$sel" in
+            0)  exit 0 ;;
+            1)  ( printf 'Paste vless:// link: '; read -r _l || true
+                  if [ -n "${_l:-}" ]; then cmd_import "$_l"; else c_ylw "No link entered."; fi ) ;;
+            2)  ( cmd_config ) ;;
+            3)  ( cmd_wg_config ) ;;
+            4)  ( printf 'Regenerate keys? This breaks the current UniFi VPN Client until you re-paste the new config. [y/N]: '
+                  read -r _c || true
+                  if [ "${_c:-}" = "y" ]; then cmd_regen_keys; else c_ylw "Cancelled."; fi ) ;;
+            5)  ( printf 'New WireGuard UDP port [%s]: ' "$WG_PORT"; read -r _v || true
+                  if [ -n "${_v:-}" ]; then cmd_set port "$_v"; else c_ylw "Unchanged."; fi ) ;;
+            6)  ( printf 'New tunnel MTU [%s]: ' "$WG_MTU"; read -r _v || true
+                  if [ -n "${_v:-}" ]; then cmd_set mtu "$_v"; else c_ylw "Unchanged."; fi ) ;;
+            7)  ( printf 'Inner DNS (comma-separated, empty to clear) [%s]: ' "$INNER_DNS"; read -r _v || true
+                  cmd_set dns "${_v:-}" ) ;;
+            8)  ( menu_ping ) ;;
+            9)  ( menu_start ) ;;
+            10) ( menu_stop ) ;;
+            11) ( menu_restart ) ;;
+            12) ( cmd_status ) ;;
+            13) ( printf 'Lines to show [100]: '; read -r _n || true
+                  case "${_n:-}" in ""|*[!0-9]*) _n=100 ;; esac
+                  cmd_logs logs -n "$_n" --no-pager ) ;;
+            14) ( menu_enable ) ;;
+            15) ( menu_disable ) ;;
+            16) ( cmd_update ) ;;
+            17) ( if [ -x "$XRAY" ]; then "$XRAY" version | head -1; else c_ylw "xray-core: not installed"; fi
+                  echo "xray-unifi CLI 1.0.0" ) ;;
+            18) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
+                if [ "${_c:-}" = "y" ]; then ( cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
+            *)  c_red "Invalid selection." ;;
+        esac
+        pause
+    done
+}
+
+cmd_uninstall() {
+    need_root
+    systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
+    rm -f "$SERVICE_FILE" "$ONBOOT_DST" /usr/bin/xray
+    systemctl daemon-reload 2>/dev/null || true
+    c_ylw "Removed service + boot hook. Data kept at $ROOT (delete it manually to purge keys/config)."
+    info "Don't forget to delete the WireGuard VPN Client in the UniFi UI."
+}
+
+usage() {
+    cat <<EOF
+xray - Xray-core VLESS client for UniFi gateways (via native WireGuard)
+
+Run 'xray' with no arguments for the interactive management menu
+(import links, keys, WireGuard config, updates, uninstall, etc.).
+
+Direct commands (for scripting / quick ops):
+  xray start        Start the service
+  xray stop         Stop the service
+  xray restart      Restart the service
+  xray status       Show service / server / listener status
+  xray ping [proto] Test the VLESS link; proto = get|head|tcp|icmp (default: get)
+  xray logs [args]  Tail service logs (passes args to journalctl)
+  xray help         This help
+
+Data lives in $ROOT and survives reboots/firmware upgrades via unifi-common.
+EOF
+}
+
+# --------------------------------------------------------------------------
+# Dispatch
+# --------------------------------------------------------------------------
+load_settings
+cmd="${1:-}"; [ $# -ge 1 ] && shift || true
+case "$cmd" in
+    # interactive menu (default)
+    "")           need_root; cmd_menu ;;
+    # kept direct commands
+    start)        need_root; cmd_start ;;
+    stop)         need_root; cmd_stop ;;
+    restart)      need_root; cmd_restart ;;
+    status)       cmd_status ;;
+    ping)         cmd_ping "$@" ;;
+    logs)         cmd_logs logs "$@" ;;
+    -h|--help|help) usage ;;
+    # internal / hidden (used by installer, boot hook, and the menu)
+    menu)            need_root; cmd_menu ;;
+    import)          need_root; cmd_import "$@" ;;
+    wg-config|wg)    cmd_wg_config ;;
+    config)          cmd_config ;;
+    set)             need_root; [ $# -ge 2 ] || fatal "usage: xray set <key> <value>"; cmd_set "$1" "$2" ;;
+    regen-keys)      need_root; cmd_regen_keys ;;
+    enable)          need_root; cmd_enable ;;
+    disable)         need_root; cmd_disable ;;
+    update)          need_root; cmd_update ;;
+    version)         [ -x "$XRAY" ] && "$XRAY" version | head -1; echo "xray-unifi CLI 1.0.0" ;;
+    uninstall)       cmd_uninstall ;;
+    install-binary)  need_root; cmd_install_binary ;;
+    install-service) need_root; install_service ;;
+    *) err "unknown command: $cmd"; echo; usage; exit 1 ;;
+esac
