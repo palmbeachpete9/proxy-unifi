@@ -193,10 +193,11 @@ install_service() {
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
 }
 
-regen_config() {
-    [ -f "$OUTBOUND_LINK" ] || fatal "no proxy link imported yet. Run 'xray' and choose option 1."
+# Build + validate a config from the given link and, only on success, swap it
+# into place. Never mutates stored state (link.txt) on failure.
+_build_config() {
+    _bl="$1"
     ensure_keys
-    link="$(cat "$OUTBOUND_LINK")"
     xray_priv="$(cat "$WG_DIR/xray_private.key")"
     unifi_pub="$(cat "$WG_DIR/unifi_public.key")"
     mkdir -p "$ETC_DIR"
@@ -205,7 +206,7 @@ regen_config() {
     [ -n "$INNER_DNS" ] && set -- --dns "$INNER_DNS"
     tmpcfg="$(mktemp)"
     py "$MKCONFIG" \
-        --link "$link" \
+        --link "$_bl" \
         --listen "$WG_LISTEN" \
         --port "$WG_PORT" \
         --secret-key "$xray_priv" \
@@ -215,7 +216,7 @@ regen_config() {
         --keepalive "$WG_KEEPALIVE" \
         --loglevel "$LOGLEVEL" \
         "$@" \
-        > "$tmpcfg" || { rm -f "$tmpcfg"; fatal "config generation failed"; }
+        > "$tmpcfg" || { rm -f "$tmpcfg"; fatal "config generation failed (check the link)"; }
     # validate before swapping it in. -format json is required because xray infers
     # the config format from the file extension, and mktemp names have none.
     if [ -x "$XRAY" ]; then
@@ -227,6 +228,11 @@ regen_config() {
     chmod 600 "$CONFIG"
 }
 
+regen_config() {
+    [ -f "$OUTBOUND_LINK" ] || fatal "no proxy link imported yet. Run 'xray' and choose option 1."
+    _build_config "$(cat "$OUTBOUND_LINK")"
+}
+
 cmd_import() {
     [ $# -ge 1 ] || fatal "usage: xray import <vless:// | trojan:// | ss:// ...>"
     link="$1"
@@ -234,11 +240,14 @@ cmd_import() {
         vless://*|trojan://*|ss://*) : ;;
         *) fatal "unsupported link (expected vless://, trojan://, or ss://)" ;;
     esac
+    load_settings
+    # Build + validate the NEW link FIRST. On any failure this fatals before we
+    # touch link.txt, so a bad import never clobbers a working configuration.
+    _build_config "$link"
     mkdir -p "$ETC_DIR"
     printf '%s' "$link" > "$OUTBOUND_LINK"
     chmod 600 "$OUTBOUND_LINK"
-    load_settings; save_settings
-    regen_config
+    save_settings
     # Apply immediately (starts the service even if autostart is off; the unit's
     # ConditionPathExists is now satisfied because config.json exists).
     systemctl restart "$SERVICE_NAME" 2>/dev/null || systemctl start "$SERVICE_NAME" 2>/dev/null || true
@@ -335,7 +344,11 @@ cmd_set() {
             case "$val" in *[!0-9]*) fatal "keepalive must be a number";; esac
             WG_KEEPALIVE="${val:-0}" ;;
         dns)
-            INNER_DNS="$(printf '%s' "$val" | tr -d ' ')" ;;   # comma-separated, no spaces
+            val="$(printf '%s' "$val" | tr -d ' ')"            # comma-separated, no spaces
+            # settings.env is sourced by the shell, so reject anything that isn't a
+            # plain DNS server/URL char (blocks shell-metachar injection).
+            case "$val" in *[!A-Za-z0-9.:/_,+-]*) fatal "invalid DNS value (allowed: letters, digits, . : / _ , + -)";; esac
+            INNER_DNS="$val" ;;
         loglevel)
             case "$val" in debug|info|warning|error|none) LOGLEVEL="$val" ;; *) fatal "loglevel must be debug|info|warning|error|none";; esac ;;
         *) fatal "unknown setting '$key' (port|mtu|dns|keepalive|loglevel|ping)" ;;
@@ -398,7 +411,8 @@ except Exception: sys.exit(1)' >/dev/null 2>&1; then break; fi
         _i=$((_i + 1)); sleep 0.3 2>/dev/null || sleep 1
     done
     if [ "$_m" = "head" ]; then _label="via proxy (HEAD)"; set -- -I; else _label="via proxy (GET)"; set -- -X GET; fi
-    _out="$(curl -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time "$PING_TIMEOUT" \
+    # LC_ALL=C so curl prints time_total with a '.' decimal regardless of locale
+    _out="$(LC_ALL=C curl -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time "$PING_TIMEOUT" \
              "$@" --proxy "socks5h://127.0.0.1:${_port}" "$PING_URL" 2>/dev/null)" || _out=""
     kill "$_pid" 2>/dev/null || true; wait "$_pid" 2>/dev/null || true
     rm -f "$_cfg"

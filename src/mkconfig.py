@@ -193,10 +193,9 @@ def parse_trojan(link):
     security = qg(q, "security", default="tls") or "tls"   # trojan implies TLS
     stream = build_stream(q, security, net, host)
 
+    # Note: xray removed the "flow" field for Trojan, so it is intentionally not
+    # emitted here even if the link carries one.
     server = {"address": host, "port": int(port), "password": password}
-    flow = qg(q, "flow")
-    if flow:
-        server["flow"] = flow
 
     outbound = {
         "tag": "proxy",
@@ -212,12 +211,19 @@ def parse_ss(link):
     host, port = u.hostname, u.port
     method = password = None
 
+    # SIP003 plugins (v2ray-plugin, obfs, ...) need a matching transport that a
+    # plain shadowsocks outbound can't provide. Fail loudly instead of silently
+    # generating a config that would never connect.
+    if qg(flat_query(u), "plugin"):
+        die("shadowsocks 'plugin' (SIP003) links are not supported; use a plain ss:// link")
+
     # SIP002: ss://base64(method:password)@host:port  (or plain method:password)
     if u.username is not None and host and port:
-        ui = unquote(u.username)
-        if ":" in ui:
-            method, password = ui.split(":", 1)
+        if u.password is not None:
+            # urlsplit already split a plain "method:password" userinfo
+            method, password = unquote(u.username), unquote(u.password)
         else:
+            # no ':' in userinfo -> it's base64(method:password)
             dec = _b64decode_any(u.username)
             if dec and ":" in dec:
                 method, password = dec.split(":", 1)
@@ -231,7 +237,7 @@ def parse_ss(link):
             host, p = hostport.rsplit(":", 1)
             port = int(p)
 
-    if not method or password is None or not host or not port:
+    if not method or not password or not host or not port:
         die("could not parse shadowsocks link")
 
     outbound = {
