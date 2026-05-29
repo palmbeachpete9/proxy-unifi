@@ -1,10 +1,12 @@
 # Xray-core on UniFi OS
 
-Run an [Xray-core](https://github.com/XTLS/Xray-core) **VLESS** client directly on
-your UniFi Cloud Gateway — and steer traffic into it from the native UniFi UI
-(**Policy Engine → Policy Table**), exactly like a commercial VPN.
+Run an [Xray-core](https://github.com/XTLS/Xray-core) proxy client
+(**VLESS**, **Trojan**, **Shadowsocks**) directly on your UniFi Cloud Gateway — and
+steer traffic into it from the native UniFi UI (**Policy Engine → Policy Table**),
+exactly like a commercial VPN.
 
-UniFi gateways have no built-in proxy support and can't dial a `vless://` server.
+UniFi gateways have no built-in proxy support and can't dial a `vless://` /
+`trojan://` / `ss://` server.
 `xray-unifi` bridges that gap **without** patching UniFi OS or adding a custom WAN:
 it presents the proxy to UniFi as an ordinary **WireGuard VPN Client**, which the
 controller already knows how to route. It is headless, SSH-only (no LAN port, no web
@@ -21,7 +23,7 @@ curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/xray-unifi/main/inst
 
 Then run `xray` for the management menu:
 
-1. **Import / replace VLESS link** — paste your `vless://…` link.
+1. **Import / replace proxy link** — paste your `vless://` / `trojan://` / `ss://` link.
 2. **Show UniFi WireGuard VPN Client config** — copy the printed settings into
    `unifi.ui.com → Settings → VPN → VPN Client → Create New → WireGuard`
    (or upload the printed `.conf`).
@@ -40,16 +42,16 @@ policy-based routing, kill switch, and per-client selection in the UniFi UI.
   │                              ▼  udp 127.0.0.1:51821                          │
   │                        xray-core  (WireGuard inbound)                       │
   │                              │  terminates the tunnel, then routes          │
-  │                              ▼  VLESS outbound (your vless:// link)          │
+  │                              ▼  proxy outbound (vless/trojan/ss link)       │
   └──────────────────────────────┼─────────────────────────────────────────────┘
                                   ▼  out the normal WAN
-                            your VLESS / VPN server ──▶ Internet
+                            your proxy / VPN server ──▶ Internet
 ```
 
 The gateway's own WireGuard VPN Client completes a real WireGuard handshake with
 xray-core over the loopback interface. xray terminates the tunnel and forwards
-everything out through the VLESS server from your link. No remote WireGuard server
-is required — it works with any plain `vless://` provider.
+everything out through the proxy server from your link. No remote WireGuard server
+is required — it works with any plain `vless://` / `trojan://` / `ss://` provider.
 
 ## Requirements
 
@@ -66,7 +68,7 @@ Run `xray` with no arguments for the interactive menu, or use the direct command
 |---|---|
 | `xray` | Interactive management menu |
 | `xray status` | Service, configured server, and listener status |
-| `xray ping [proto]` | Test the VLESS link — `proto` = `get`·`head`·`tcp`·`icmp` (default `get`) |
+| `xray ping [proto]` | Test the proxy link — `proto` = `get`·`head`·`tcp`·`icmp` (default `get`) |
 | `xray start` · `stop` · `restart` | Control the service |
 | `xray logs [args]` | Tail service logs (passed to `journalctl`) |
 | `xray help` | Show help |
@@ -83,20 +85,25 @@ default is configurable with `xray set ping <proto>`:
 
 | Protocol | What it measures |
 |---|---|
-| `get` (default) | HTTP **GET** to `https://www.gstatic.com/generate_204` **through the VLESS tunnel** — true end-to-end delay |
+| `get` (default) | HTTP **GET** to `https://www.gstatic.com/generate_204` **through the proxy tunnel** — true end-to-end delay |
 | `head` | Same, via **HEAD** |
-| `tcp` | TCP handshake latency directly to the VLESS server |
-| `icmp` | ICMP echo to the VLESS server host |
+| `tcp` | TCP handshake latency directly to the proxy server |
+| `icmp` | ICMP echo to the proxy server host |
 
-The proxied tests spin up a throwaway SOCKS→VLESS xray instance on loopback, so
+The proxied tests spin up a throwaway SOCKS→proxy xray instance on loopback, so
 they validate the actual link without disturbing the running tunnel.
 
-## Supported `vless://` features
+## Supported links
 
-UUID, `encryption`, `flow` (e.g. `xtls-rprx-vision`); security `none` / `tls` /
-`reality` (`sni`, `fp`, `alpn`, `pbk`, `sid`, `spx`, `allowInsecure`); transports
-`tcp` (incl. `headerType=http`), `ws`, `httpupgrade`, `http`/`h2`, `grpc`,
-`xhttp`, `kcp`, `quic`.
+- **VLESS** (`vless://`) — UUID, `encryption`, `flow` (e.g. `xtls-rprx-vision`).
+- **Trojan** (`trojan://`) — password auth, TLS by default.
+- **Shadowsocks** (`ss://`) — SIP002 (`base64(method:password)@host:port`) and the
+  legacy fully-base64 form; AEAD and 2022 ciphers.
+
+For VLESS and Trojan: security `none` / `tls` / `reality` (`sni`, `fp`, `alpn`,
+`pbk`, `sid`, `spx`, `allowInsecure`) and transports `tcp` (incl.
+`headerType=http`), `ws`, `httpupgrade`, `http`/`h2`, `grpc`, `xhttp`, `kcp`,
+`quic`.
 
 ## Notes & caveats
 
@@ -109,7 +116,7 @@ UUID, `encryption`, `flow` (e.g. `xtls-rprx-vision`); security `none` / `tls` /
   stall.
 - **Routing granularity:** xray sees decrypted IP packets, so do your per-client /
   per-VLAN selection in the UniFi Policy Table (the whole point); xray just forwards
-  everything out the VLESS outbound. The WireGuard inbound runs in userspace
+  everything out the proxy outbound. The WireGuard inbound runs in userspace
   (gVisor), not kernel mode.
 
 ## Persistence

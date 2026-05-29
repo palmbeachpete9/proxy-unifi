@@ -1,8 +1,8 @@
 #!/bin/sh
-# xray-unifi - GUI-less Xray-core (VLESS) client for UniFi Cloud Gateways.
+# xray-unifi - GUI-less Xray-core proxy client (VLESS/Trojan/Shadowsocks) for UniFi Cloud Gateways.
 #
 # It runs an Xray WireGuard inbound that the gateway's *native* WireGuard VPN
-# Client connects to over loopback, and forwards everything out a VLESS server.
+# Client connects to over loopback, and forwards everything out a proxy server.
 # Because the tunnel is a real, controller-managed WireGuard VPN Client, it shows
 # up in the UniFi UI (VPN -> VPN Client) and in Policy Engine -> Policy Table.
 #
@@ -166,7 +166,7 @@ cmd_install_binary() {
 write_service() {
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=xray-unifi (Xray-core WireGuard->VLESS bridge)
+Description=xray-unifi (Xray-core WireGuard->proxy bridge)
 After=network-online.target nss-lookup.target
 Wants=network-online.target
 # Don't crash-loop before a link has been imported.
@@ -194,7 +194,7 @@ install_service() {
 }
 
 regen_config() {
-    [ -f "$OUTBOUND_LINK" ] || fatal "no vless:// link imported yet. Run 'xray' and choose option 1."
+    [ -f "$OUTBOUND_LINK" ] || fatal "no proxy link imported yet. Run 'xray' and choose option 1."
     ensure_keys
     link="$(cat "$OUTBOUND_LINK")"
     xray_priv="$(cat "$WG_DIR/xray_private.key")"
@@ -228,11 +228,11 @@ regen_config() {
 }
 
 cmd_import() {
-    [ $# -ge 1 ] || fatal "usage: xray import <vless://...>"
+    [ $# -ge 1 ] || fatal "usage: xray import <vless:// | trojan:// | ss:// ...>"
     link="$1"
     case "$link" in
-        vless://*) : ;;
-        *) fatal "that doesn't look like a vless:// link" ;;
+        vless://*|trojan://*|ss://*) : ;;
+        *) fatal "unsupported link (expected vless://, trojan://, or ss://)" ;;
     esac
     mkdir -p "$ETC_DIR"
     printf '%s' "$link" > "$OUTBOUND_LINK"
@@ -440,7 +440,7 @@ ping_icmp() {
 cmd_ping() {
     load_settings
     if [ ! -f "$OUTBOUND_LINK" ]; then
-        c_ylw "No VLESS link imported. Import one first (run 'xray' -> option 1)."
+        c_ylw "No proxy link imported. Import one first (run 'xray' -> option 1)."
         return 1
     fi
     _mode="${1:-$PING_MODE}"
@@ -470,10 +470,10 @@ print_menu() {
 
     printf '\n'
     printf '╔%s╗\n' "$HR"
-    ml "  xray-unifi : Xray VLESS client for UniFi"
+    ml "  xray-unifi : Xray proxy client for UniFi"
     ml "  0. Exit Script"
     printf '│%s│\n' "$HR"
-    ml "  1. Import / replace VLESS link"
+    ml "  1. Import / replace proxy link"
     ml "  2. Show current server & xray config"
     ml "  3. Show UniFi WireGuard VPN Client config"
     ml "  4. Regenerate WireGuard keys"
@@ -482,7 +482,7 @@ print_menu() {
     ml "  6. Change tunnel MTU"
     ml "  7. Set inner DNS"
     printf '│%s│\n' "$HR"
-    ml "  8. Ping / test VLESS link"
+    ml "  8. Ping / test proxy link"
     printf '│%s│\n' "$HR"
     ml "  9. Start"
     ml " 10. Stop"
@@ -533,7 +533,7 @@ menu_disable() {
 menu_ping() {
     load_settings
     echo "Ping protocol (current default: ${PING_MODE}):"
-    echo "  1) via proxy (GET)    - real delay through the VLESS tunnel"
+    echo "  1) via proxy (GET)    - real delay through the proxy tunnel"
     echo "  2) via proxy (HEAD)   - same, HEAD request"
     echo "  3) TCP                - handshake latency to the server"
     echo "  4) ICMP               - echo to the server host"
@@ -565,7 +565,7 @@ cmd_menu() {
         echo
         case "$sel" in
             0)  exit 0 ;;
-            1)  ( printf 'Paste vless:// link: '; read -r _l || true
+            1)  ( printf 'Paste proxy link (vless:// | trojan:// | ss://): '; read -r _l || true
                   if [ -n "${_l:-}" ]; then cmd_import "$_l"; else c_ylw "No link entered."; fi ) ;;
             2)  ( cmd_config ) ;;
             3)  ( cmd_wg_config ) ;;
@@ -610,7 +610,7 @@ cmd_uninstall() {
 
 usage() {
     cat <<EOF
-xray - Xray-core VLESS client for UniFi gateways (via native WireGuard)
+xray - Xray-core proxy client for UniFi gateways (via native WireGuard)
 
 Run 'xray' with no arguments for the interactive management menu
 (import links, keys, WireGuard config, updates, uninstall, etc.).
@@ -620,7 +620,7 @@ Direct commands (for scripting / quick ops):
   xray stop         Stop the service
   xray restart      Restart the service
   xray status       Show service / server / listener status
-  xray ping [proto] Test the VLESS link; proto = get|head|tcp|icmp (default: get)
+  xray ping [proto] Test the proxy link; proto = get|head|tcp|icmp (default: get)
   xray logs [args]  Tail service logs (passes args to journalctl)
   xray help         This help
 

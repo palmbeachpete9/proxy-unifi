@@ -79,7 +79,7 @@ echo
 echo "Next steps:"
 echo "  Run:  xray"
 echo "  ...for the management menu. Then:"
-echo "    1) option 1  -> import your VLESS link"
+echo "    1) option 1  -> import your proxy link (vless/trojan/ss)"
 echo "    2) option 3  -> copy the WireGuard settings into"
 echo "                    unifi.ui.com -> Settings -> VPN -> VPN Client -> WireGuard"
 echo "    3) Route traffic through it in Policy Engine -> Policy Table."

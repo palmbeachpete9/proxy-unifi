@@ -4,14 +4,14 @@ mkconfig.py - Build a complete Xray-core config.json for the UniFi WireGuard bri
 
 Topology:
     UniFi WireGuard VPN Client  --(UDP 127.0.0.1:PORT)-->  Xray WireGuard inbound
-        --> VLESS outbound (parsed from a vless:// link) --> remote VPN server
+        --> proxy outbound (parsed from a vless:// / trojan:// / ss:// link)
+        --> remote proxy server
 
-This script parses a vless:// share link into an Xray outbound and emits a full
-config that terminates a WireGuard peer (the UniFi gateway) locally and forwards
-everything out through that VLESS server.
+It parses a proxy share link into an Xray outbound and emits a full config that
+terminates a WireGuard peer (the UniFi gateway) locally and forwards everything
+out through that proxy server.
 
-It is intentionally dependency-free (Python 3.7+ stdlib only) so it runs on the
-gateway as shipped.
+Dependency-free (Python 3.7+ stdlib only) so it runs on the gateway as shipped.
 """
 
 import argparse
@@ -31,54 +31,40 @@ def _b64_pad(s):
     return s + "=" * (-len(s) % 4)
 
 
-def parse_vless(link):
-    """Parse a vless:// link into (outbound dict)."""
-    link = link.strip()
-    if not link.lower().startswith("vless://"):
-        die("not a vless:// link")
+def _b64decode_any(s):
+    """Decode url-safe or standard base64, with or without padding."""
+    s = s.strip()
+    for dec in (base64.urlsafe_b64decode, base64.b64decode):
+        try:
+            return dec(_b64_pad(s)).decode("utf-8")
+        except Exception:
+            pass
+    return None
 
-    u = urlsplit(link)
-    uuid = unquote(u.username or "")
-    if not uuid:
-        die("vless link is missing the UUID (user info)")
 
-    host = u.hostname
-    port = u.port
-    if not host:
-        die("vless link is missing the server host")
-    if not port:
-        die("vless link is missing the server port")
-
-    # parse_qs returns lists; flatten to single values
+def flat_query(u):
     raw = parse_qs(u.query, keep_blank_values=True)
-    q = {k: v[0] for k, v in raw.items()}
+    return {k: v[0] for k, v in raw.items()}
 
-    def g(*names, default=""):
-        for n in names:
-            if n in q and q[n] != "":
-                return q[n]
-        return default
 
-    encryption = g("encryption", default="none") or "none"
-    flow = g("flow")
-    net = g("type", "net", default="tcp") or "tcp"
-    security = g("security", default="none") or "none"
+def qg(q, *names, default=""):
+    for n in names:
+        if q.get(n, "") != "":
+            return q[n]
+    return default
 
-    # normalize aliases
+
+def build_stream(q, security, net, host):
+    """Build streamSettings shared by VLESS and Trojan."""
     if net == "h2":
         net = "http"
-
-    user = {"id": uuid, "encryption": encryption}
-    if flow:
-        user["flow"] = flow
-
     stream = {"network": net, "security": security}
 
     # ---- security layer -------------------------------------------------
-    sni = g("sni", "peer", "host") or host
-    fp = g("fp", "fingerprint")
-    alpn = g("alpn")
-    allow_insecure = g("allowInsecure", "insecure") in ("1", "true", "True")
+    sni = qg(q, "sni", "peer", "host") or host
+    fp = qg(q, "fp", "fingerprint")
+    alpn = qg(q, "alpn")
+    allow_insecure = qg(q, "allowInsecure", "insecure") in ("1", "true", "True")
 
     if security == "tls":
         tls = {"serverName": sni}
@@ -90,23 +76,22 @@ def parse_vless(link):
             tls["allowInsecure"] = True
         stream["tlsSettings"] = tls
     elif security == "reality":
-        reality = {
+        stream["realitySettings"] = {
             "serverName": sni,
             "fingerprint": fp or "chrome",
-            "publicKey": g("pbk", "publicKey"),
-            "shortId": g("sid", "shortId"),
-            "spiderX": g("spx", "spiderX", default="/"),
+            "publicKey": qg(q, "pbk", "publicKey"),
+            "shortId": qg(q, "sid", "shortId"),
+            "spiderX": qg(q, "spx", "spiderX", default="/"),
         }
-        stream["realitySettings"] = reality
     elif security in ("", "none"):
         stream["security"] = "none"
     else:
         die("unsupported security '%s'" % security)
 
     # ---- transport layer ------------------------------------------------
-    header_type = g("headerType", default="none")
-    host_hdr = g("host")
-    path = g("path", default="/")
+    header_type = qg(q, "headerType", default="none")
+    host_hdr = qg(q, "host")
+    path = qg(q, "path", default="/")
 
     if net == "tcp":
         if header_type == "http":
@@ -114,20 +99,13 @@ def parse_vless(link):
             stream["tcpSettings"] = {
                 "header": {
                     "type": "http",
-                    "request": {
-                        "path": [path] if path else ["/"],
-                        "headers": {"Host": req_host},
-                    },
+                    "request": {"path": [path] if path else ["/"], "headers": {"Host": req_host}},
                 }
             }
-        # plain tcp needs no tcpSettings
     elif net == "ws":
         ws = {"path": path or "/"}
-        headers = {}
         if host_hdr:
-            headers["Host"] = host_hdr
-        if headers:
-            ws["headers"] = headers
+            ws["headers"] = {"Host": host_hdr}
         stream["wsSettings"] = ws
     elif net == "httpupgrade":
         hu = {"path": path or "/"}
@@ -141,53 +119,147 @@ def parse_vless(link):
             h["host"] = hosts
         stream["httpSettings"] = h
     elif net == "grpc":
-        grpc = {"serviceName": g("serviceName", "path", default="")}
-        mode = g("mode")
+        grpc = {"serviceName": qg(q, "serviceName", "path", default="")}
+        mode = qg(q, "mode")
         if mode in ("multi", "gun"):
             grpc["multiMode"] = mode == "multi"
         stream["grpcSettings"] = grpc
-    elif net == "xhttp" or net == "splithttp":
+    elif net in ("xhttp", "splithttp"):
         stream["network"] = "xhttp"
         xh = {"path": path or "/"}
         if host_hdr:
             xh["host"] = host_hdr
-        mode = g("mode")
+        mode = qg(q, "mode")
         if mode:
             xh["mode"] = mode
         stream["xhttpSettings"] = xh
     elif net == "kcp":
         kcp = {"header": {"type": header_type or "none"}}
-        seed = g("seed")
+        seed = qg(q, "seed")
         if seed:
             kcp["seed"] = seed
         stream["kcpSettings"] = kcp
     elif net == "quic":
-        quic = {
-            "security": g("quicSecurity", default="none"),
-            "key": g("key", default=""),
+        stream["quicSettings"] = {
+            "security": qg(q, "quicSecurity", default="none"),
+            "key": qg(q, "key", default=""),
             "header": {"type": header_type or "none"},
         }
-        stream["quicSettings"] = quic
     else:
         die("unsupported transport type '%s'" % net)
+
+    return stream
+
+
+def parse_vless(link):
+    u = urlsplit(link)
+    uuid = unquote(u.username or "")
+    host, port = u.hostname, u.port
+    if not uuid:
+        die("vless link is missing the UUID")
+    if not host or not port:
+        die("vless link is missing the server host/port")
+    q = flat_query(u)
+
+    user = {"id": uuid, "encryption": qg(q, "encryption", default="none") or "none"}
+    flow = qg(q, "flow")
+    if flow:
+        user["flow"] = flow
+
+    net = qg(q, "type", "net", default="tcp") or "tcp"
+    security = qg(q, "security", default="none") or "none"
+    stream = build_stream(q, security, net, host)
 
     outbound = {
         "tag": "proxy",
         "protocol": "vless",
-        "settings": {
-            "vnext": [
-                {"address": host, "port": int(port), "users": [user]}
-            ]
-        },
+        "settings": {"vnext": [{"address": host, "port": int(port), "users": [user]}]},
         "streamSettings": stream,
     }
-    return outbound, host
+    return outbound, host, int(port)
+
+
+def parse_trojan(link):
+    u = urlsplit(link)
+    password = unquote(u.username or "")
+    host, port = u.hostname, u.port
+    if not password:
+        die("trojan link is missing the password")
+    if not host or not port:
+        die("trojan link is missing the server host/port")
+    q = flat_query(u)
+
+    net = qg(q, "type", "net", default="tcp") or "tcp"
+    security = qg(q, "security", default="tls") or "tls"   # trojan implies TLS
+    stream = build_stream(q, security, net, host)
+
+    server = {"address": host, "port": int(port), "password": password}
+    flow = qg(q, "flow")
+    if flow:
+        server["flow"] = flow
+
+    outbound = {
+        "tag": "proxy",
+        "protocol": "trojan",
+        "settings": {"servers": [server]},
+        "streamSettings": stream,
+    }
+    return outbound, host, int(port)
+
+
+def parse_ss(link):
+    u = urlsplit(link)
+    host, port = u.hostname, u.port
+    method = password = None
+
+    # SIP002: ss://base64(method:password)@host:port  (or plain method:password)
+    if u.username is not None and host and port:
+        ui = unquote(u.username)
+        if ":" in ui:
+            method, password = ui.split(":", 1)
+        else:
+            dec = _b64decode_any(u.username)
+            if dec and ":" in dec:
+                method, password = dec.split(":", 1)
+
+    # Legacy: ss://base64(method:password@host:port)
+    if method is None:
+        dec = _b64decode_any(u.netloc)
+        if dec and "@" in dec and ":" in dec:
+            creds, hostport = dec.rsplit("@", 1)
+            method, password = creds.split(":", 1)
+            host, p = hostport.rsplit(":", 1)
+            port = int(p)
+
+    if not method or password is None or not host or not port:
+        die("could not parse shadowsocks link")
+
+    outbound = {
+        "tag": "proxy",
+        "protocol": "shadowsocks",
+        "settings": {
+            "servers": [{"address": host, "port": int(port), "method": method, "password": password}]
+        },
+    }
+    return outbound, host, int(port)
+
+
+def parse_link(link):
+    link = link.strip()
+    low = link.lower()
+    if low.startswith("vless://"):
+        return parse_vless(link)
+    if low.startswith("trojan://"):
+        return parse_trojan(link)
+    if low.startswith("ss://"):
+        return parse_ss(link)
+    die("unsupported link (expected vless://, trojan://, or ss://)")
 
 
 def build_test_config(args):
-    """A throwaway config: SOCKS inbound on loopback -> the same VLESS outbound.
+    """Throwaway config: SOCKS inbound on loopback -> the same proxy outbound.
     Used by `xray ping` to send a real request through the link in isolation."""
-    outbound, _ = parse_vless(args.link)
+    outbound, _, _ = parse_link(args.link)
     return {
         "log": {"loglevel": "warning"},
         "inbounds": [
@@ -208,7 +280,7 @@ def build_test_config(args):
 
 
 def build_config(args):
-    outbound, server_host = parse_vless(args.link)
+    outbound, _, _ = parse_link(args.link)
 
     peer = {
         "publicKey": args.peer_pubkey,
@@ -228,11 +300,7 @@ def build_config(args):
             "noKernelTun": True,
             "peers": [peer],
         },
-        "sniffing": {
-            "enabled": True,
-            "destOverride": ["http", "tls", "quic"],
-            "routeOnly": True,
-        },
+        "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True},
     }
 
     config = {
@@ -245,24 +313,19 @@ def build_config(args):
         ],
         "routing": {
             "domainStrategy": "AsIs",
-            "rules": [
-                # everything that enters via the WireGuard tunnel goes out the proxy
-                {"type": "field", "inboundTag": ["wg-in"], "outboundTag": "proxy"}
-            ],
+            "rules": [{"type": "field", "inboundTag": ["wg-in"], "outboundTag": "proxy"}],
         },
     }
 
-    # optional DNS pinning for the inner resolver
     if args.dns:
-        servers = [s for s in args.dns.split(",") if s]
-        config["dns"] = {"servers": servers}
+        config["dns"] = {"servers": [s for s in args.dns.split(",") if s]}
 
     return config
 
 
 def main():
     ap = argparse.ArgumentParser(description="Build Xray config for the UniFi WireGuard bridge")
-    ap.add_argument("--link", required=True, help="vless:// share link")
+    ap.add_argument("--link", required=True, help="proxy share link (vless:// / trojan:// / ss://)")
     ap.add_argument("--listen", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=0, help="UDP port for the WireGuard inbound")
     ap.add_argument("--secret-key", default="", help="Xray (server) WireGuard private key, base64")
@@ -274,27 +337,22 @@ def main():
     ap.add_argument("--dns", default="", help="comma-separated inner DNS servers (optional)")
     ap.add_argument("--loglevel", default="warning")
     ap.add_argument("--socks-port", type=int, default=0, help="emit a SOCKS test config on this port instead")
-    ap.add_argument("--print-server", action="store_true", help="print 'host<TAB>port' of the VLESS server and exit")
+    ap.add_argument("--print-server", action="store_true", help="print 'host<TAB>port' of the server and exit")
     args = ap.parse_args()
 
-    # mode: print the server endpoint (for tcp/icmp ping)
     if args.print_server:
-        outbound, host = parse_vless(args.link)
-        port = outbound["settings"]["vnext"][0]["port"]
+        _, host, port = parse_link(args.link)
         sys.stdout.write("%s\t%s\n" % (host, port))
         return
 
-    # mode: throwaway SOCKS test config (for proxied GET/HEAD ping)
     if args.socks_port:
         json.dump(build_test_config(args), sys.stdout, indent=2)
         sys.stdout.write("\n")
         return
 
-    # default: full WireGuard->VLESS bridge config
     if not args.secret_key or not args.peer_pubkey or not args.port:
         die("--port, --secret-key and --peer-pubkey are required to build the bridge config")
 
-    # light validation of the tunnel addresses
     for a in args.address.split(","):
         a = a.strip()
         if not a:
@@ -304,8 +362,7 @@ def main():
         except ValueError:
             die("invalid --address '%s'" % a)
 
-    config = build_config(args)
-    json.dump(config, sys.stdout, indent=2)
+    json.dump(build_config(args), sys.stdout, indent=2)
     sys.stdout.write("\n")
 
 
