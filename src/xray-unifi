@@ -36,7 +36,7 @@ WG_MTU="1340"
 WG_KEEPALIVE="25"
 XRAY_ADDR="10.7.0.1/32"
 UNIFI_ADDR="10.7.0.2/32"
-INNER_DNS=""
+INNER_DNS="8.8.8.8"
 LOGLEVEL="warning"
 PING_MODE="get"
 PING_URL="https://www.gstatic.com/generate_204"
@@ -263,37 +263,37 @@ cmd_wg_config() {
     xpub="$(cat "$WG_DIR/xray_public.key")"
     c_bold "================  UniFi WireGuard VPN Client  ================"
     echo
-    echo "In unifi.ui.com:  Settings -> VPN -> VPN Client -> Create New"
-    echo "  Choose 'WireGuard' and 'Manual' configuration, then enter:"
+    echo "In unifi.ui.com: Settings -> VPN -> VPN Client -> Create New (WireGuard)."
+    echo "Either enter these manually, or upload the .conf below:"
     echo
-    printf "  %-22s %s\n" "Private Key:"      "$upriv"
-    printf "  %-22s %s\n" "Public Key (peer):" "$xpub"
-    printf "  %-22s %s\n" "Endpoint:"          "${WG_LISTEN}:${WG_PORT}"
-    printf "  %-22s %s\n" "Pre-shared Key:"    "(leave empty)"
-    printf "  %-22s %s\n" "Address / Local IP:" "$UNIFI_ADDR"
-    printf "  %-22s %s\n" "Allowed IPs:"        "0.0.0.0/0, ::/0"
-    printf "  %-22s %s\n" "MTU:"                "$WG_MTU"
-    [ -n "$INNER_DNS" ] && printf "  %-22s %s\n" "DNS:" "$INNER_DNS"
+    printf '%-19s %s\n' "Private Key:"        "$upriv"
+    printf '%-19s %s\n' "Public Key (peer):"  "$xpub"
+    printf '%-19s %s\n' "Endpoint:"           "${WG_LISTEN}:${WG_PORT}"
+    printf '%-19s %s\n' "Pre-shared Key:"     "(leave empty)"
+    printf '%-19s %s\n' "Address/Local IP:"   "$UNIFI_ADDR"
+    printf '%-19s %s\n' "Allowed IPs:"        "0.0.0.0/0, ::/0"
+    printf '%-19s %s\n' "MTU:"                "$WG_MTU"
+    [ -n "$INNER_DNS" ] && printf '%-19s %s\n' "DNS:" "$INNER_DNS"
     echo
-    c_ylw "Or upload this .conf file (VPN Client -> Upload configuration):"
-    echo "  ----------------------------------------------------------------"
+    c_ylw "Save this as a .conf and use 'Upload Configuration File':"
+    echo "----------------------------------------------------------------"
     cat <<EOF
-  [Interface]
-  PrivateKey = $upriv
-  Address = $UNIFI_ADDR
-$( [ -n "$INNER_DNS" ] && echo "  DNS = $INNER_DNS" )
-  MTU = $WG_MTU
+[Interface]
+PrivateKey = $upriv
+Address = $UNIFI_ADDR
+$( [ -n "$INNER_DNS" ] && echo "DNS = $INNER_DNS" )
+MTU = $WG_MTU
 
-  [Peer]
-  PublicKey = $xpub
-  Endpoint = ${WG_LISTEN}:${WG_PORT}
-  AllowedIPs = 0.0.0.0/0, ::/0
-  PersistentKeepalive = $WG_KEEPALIVE
+[Peer]
+PublicKey = $xpub
+Endpoint = ${WG_LISTEN}:${WG_PORT}
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = $WG_KEEPALIVE
 EOF
-    echo "  ----------------------------------------------------------------"
+    echo "----------------------------------------------------------------"
     echo
-    info "After it connects, go to Policy Engine -> Policy Table and create a"
-    info "Traffic Route that sends your chosen VLAN/clients through this VPN Client."
+    echo "After it connects, go to Policy Engine -> Policy Table and create a"
+    echo "Traffic Route that sends your chosen VLAN/clients through this VPN Client."
     c_bold "============================================================="
 }
 
@@ -345,6 +345,7 @@ cmd_set() {
             WG_KEEPALIVE="${val:-0}" ;;
         dns)
             val="$(printf '%s' "$val" | tr -d ' ')"            # comma-separated, no spaces
+            [ -z "$val" ] && val="8.8.8.8"                      # empty -> reset to default
             # settings.env is sourced by the shell, so reject anything that isn't a
             # plain DNS server/URL char (blocks shell-metachar injection).
             case "$val" in *[!A-Za-z0-9.:/_,+-]*) fatal "invalid DNS value (allowed: letters, digits, . : / _ , + -)";; esac
@@ -494,22 +495,23 @@ print_menu() {
     printf '│%s│\n' "$HR"
     ml "  5. Change WireGuard port"
     ml "  6. Change tunnel MTU"
-    ml "  7. Set inner DNS"
+    ml "  7. Change tunnel DNS"
     printf '│%s│\n' "$HR"
-    ml "  8. Ping / test proxy link"
+    ml "  8. Ping test"
+    ml "  9. Change test algorithm"
     printf '│%s│\n' "$HR"
-    ml "  9. Start"
-    ml " 10. Stop"
-    ml " 11. Restart"
-    ml " 12. Check status"
-    ml " 13. View logs"
+    ml " 10. Start"
+    ml " 11. Stop"
+    ml " 12. Restart"
+    ml " 13. Check status"
+    ml " 14. View logs"
     printf '│%s│\n' "$HR"
-    ml " 14. Enable autostart"
-    ml " 15. Disable autostart"
+    ml " 15. Enable autostart"
+    ml " 16. Disable autostart"
     printf '│%s│\n' "$HR"
-    ml " 16. Update xray-core"
-    ml " 17. Version info"
-    ml " 18. Uninstall"
+    ml " 17. Update xray-core"
+    ml " 18. Version info"
+    ml " 19. Uninstall"
     printf '╚%s╝\n' "$HR"
     printf '\n'
     printf 'Service:    %s\n' "$svc_d"
@@ -544,26 +546,21 @@ menu_disable() {
     else c_red "Failed to disable autostart."; fi
 }
 
-menu_ping() {
+menu_set_ping() {
     load_settings
-    echo "Ping protocol (current default: ${PING_MODE}):"
-    echo "  1) via proxy (GET)    - real delay through the proxy tunnel"
-    echo "  2) via proxy (HEAD)   - same, HEAD request"
-    echo "  3) TCP                - handshake latency to the server"
-    echo "  4) ICMP               - echo to the server host"
-    printf 'Choice [Enter = default]: '
+    _cur="$(printf '%s' "$PING_MODE" | tr '[:lower:]' '[:upper:]')"
+    echo "Choose default ping protocol (currently selected: ${_cur}):"
+    echo "  1. via proxy (GET)    - real delay through the proxy tunnel"
+    echo "  2. via proxy (HEAD)   - same, HEAD request"
+    echo "  3. TCP                - handshake latency to the server"
+    echo "  4. ICMP               - echo to the server host"
+    printf 'Choice [Enter = 1]: '
     read -r _p || true
-    case "${_p:-}" in
-        1) _mode="get" ;; 2) _mode="head" ;; 3) _mode="tcp" ;; 4) _mode="icmp" ;;
-        "") _mode="$PING_MODE" ;;
+    case "${_p:-1}" in
+        1) _m="get" ;; 2) _m="head" ;; 3) _m="tcp" ;; 4) _m="icmp" ;;
         *) c_red "invalid choice"; return ;;
     esac
-    echo
-    cmd_ping "$_mode" || true
-    if [ "$_mode" != "$PING_MODE" ]; then
-        printf '\nMake "%s" the default protocol? [y/N]: ' "$_mode"
-        read -r _s || true; [ "${_s:-}" = "y" ] && cmd_set ping "$_mode"
-    fi
+    cmd_set ping "$_m"
 }
 
 cmd_menu() {
@@ -574,7 +571,7 @@ cmd_menu() {
     while true; do
         clear 2>/dev/null || true
         print_menu
-        printf '\nPlease enter your selection [0-18]: '
+        printf '\nPlease enter your selection [0-19]: '
         read -r sel || exit 0
         echo
         case "$sel" in
@@ -590,22 +587,23 @@ cmd_menu() {
                   if [ -n "${_v:-}" ]; then cmd_set port "$_v"; else c_ylw "Unchanged."; fi ) ;;
             6)  ( printf 'New tunnel MTU [%s]: ' "$WG_MTU"; read -r _v || true
                   if [ -n "${_v:-}" ]; then cmd_set mtu "$_v"; else c_ylw "Unchanged."; fi ) ;;
-            7)  ( printf 'Inner DNS (comma-separated, empty to clear) [%s]: ' "$INNER_DNS"; read -r _v || true
+            7)  ( printf 'Tunnel DNS (comma-separated, empty to reset to 8.8.8.8) [%s]: ' "$INNER_DNS"; read -r _v || true
                   cmd_set dns "${_v:-}" ) ;;
-            8)  ( menu_ping ) ;;
-            9)  ( menu_start ) ;;
-            10) ( menu_stop ) ;;
-            11) ( menu_restart ) ;;
-            12) ( cmd_status ) ;;
-            13) ( printf 'Lines to show [100]: '; read -r _n || true
+            8)  ( cmd_ping ) ;;
+            9)  ( menu_set_ping ) ;;
+            10) ( menu_start ) ;;
+            11) ( menu_stop ) ;;
+            12) ( menu_restart ) ;;
+            13) ( cmd_status ) ;;
+            14) ( printf 'Lines to show [100]: '; read -r _n || true
                   case "${_n:-}" in ""|*[!0-9]*) _n=100 ;; esac
                   cmd_logs logs -n "$_n" --no-pager ) ;;
-            14) ( menu_enable ) ;;
-            15) ( menu_disable ) ;;
-            16) ( cmd_update ) ;;
-            17) ( if [ -x "$XRAY" ]; then "$XRAY" version | head -1; else c_ylw "xray-core: not installed"; fi
+            15) ( menu_enable ) ;;
+            16) ( menu_disable ) ;;
+            17) ( cmd_update ) ;;
+            18) ( if [ -x "$XRAY" ]; then "$XRAY" version | head -1; else c_ylw "xray-core: not installed"; fi
                   echo "xray-unifi CLI 1.0.0" ) ;;
-            18) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
+            19) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
                 if [ "${_c:-}" = "y" ]; then ( cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
             *)  c_red "Invalid selection." ;;
         esac
