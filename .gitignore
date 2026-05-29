@@ -1,0 +1,10 @@
+# local build/test artifacts
+*.zip
+*.log
+err.txt
+/xray
+/geoip.dat
+/geosite.dat
+*.key
+config.json
+.DS_Store
