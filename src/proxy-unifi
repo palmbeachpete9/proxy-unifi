@@ -641,9 +641,28 @@ cmd_set() {
 
 cmd_regen_keys() {
     load_settings
-    rm -f "$WG_DIR"/*.key
-    ensure_keys
-    [ -f "$OUTBOUND_LINK" ] && regen_config && systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+    # Rotate atomically: if a link is configured, rebuild the config with the NEW
+    # keys and only keep them if that succeeds. On failure, restore the old keys so
+    # the key files always match the running config (never a silent mismatch).
+    if [ -f "$OUTBOUND_LINK" ]; then
+        _bk="$(mktemp -d)"
+        cp -p "$WG_DIR"/*.key "$_bk"/ 2>/dev/null || true
+        rm -f "$WG_DIR"/*.key
+        ensure_keys
+        if regen_config 2>/dev/null; then
+            rm -rf "$_bk"
+            systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+        else
+            # roll back to the previous keypair
+            rm -f "$WG_DIR"/*.key
+            cp -p "$_bk"/*.key "$WG_DIR"/ 2>/dev/null || true
+            rm -rf "$_bk"
+            fatal "key regeneration failed (config rebuild error); previous keys kept"
+        fi
+    else
+        rm -f "$WG_DIR"/*.key
+        ensure_keys
+    fi
     c_ylw "New keys generated. You MUST update the UniFi VPN Client with the new config:"
     echo
     cmd_wg_config
