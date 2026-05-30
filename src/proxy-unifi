@@ -123,10 +123,19 @@ gen_keypair() {
 ensure_keys() {
     mkdir -p "$WG_DIR"
     chmod 700 "$WG_DIR"
-    if [ ! -f "$WG_DIR/xray_private.key" ] || [ ! -f "$WG_DIR/unifi_private.key" ]; then
+    # migrate legacy key names (xray-only era) -> engine-neutral names, so an
+    # upgrade reuses the existing keypair instead of regenerating (which would
+    # break the already-applied UniFi WireGuard VPN Client).
+    if [ -f "$WG_DIR/xray_private.key" ] && [ ! -f "$WG_DIR/wg_private.key" ]; then
+        mv "$WG_DIR/xray_private.key" "$WG_DIR/wg_private.key"
+    fi
+    if [ -f "$WG_DIR/xray_public.key" ] && [ ! -f "$WG_DIR/wg_public.key" ]; then
+        mv "$WG_DIR/xray_public.key" "$WG_DIR/wg_public.key"
+    fi
+    if [ ! -f "$WG_DIR/wg_private.key" ] || [ ! -f "$WG_DIR/unifi_private.key" ]; then
         info "generating WireGuard keypairs (local + UniFi side)..."
         # split "PRIV PUB" without word-splitting/globbing (base64 is glob-safe, but be strict)
-        _kp="$(gen_keypair)"; printf '%s' "${_kp% *}" > "$WG_DIR/xray_private.key";  printf '%s' "${_kp#* }" > "$WG_DIR/xray_public.key"
+        _kp="$(gen_keypair)"; printf '%s' "${_kp% *}" > "$WG_DIR/wg_private.key";  printf '%s' "${_kp#* }" > "$WG_DIR/wg_public.key"
         _kp="$(gen_keypair)"; printf '%s' "${_kp% *}" > "$WG_DIR/unifi_private.key"; printf '%s' "${_kp#* }" > "$WG_DIR/unifi_public.key"
         chmod 600 "$WG_DIR"/*.key
     fi
@@ -434,7 +443,7 @@ _build_config() {
     ensure_keys
     _eng="$(engine_for_link "$_bl")"
     [ -n "$_eng" ] || fatal "unsupported link (expected vless/vmess/trojan/ss/hysteria2/tuic)"
-    xray_priv="$(cat "$WG_DIR/xray_private.key")"
+    wg_priv="$(cat "$WG_DIR/wg_private.key")"
     unifi_pub="$(cat "$WG_DIR/unifi_public.key")"
     mkdir -p "$ETC_DIR"
     tmpcfg="$(mktemp)"
@@ -443,7 +452,7 @@ _build_config() {
         PLG_ACTIVE=0    # sing-box runs SIP003 plugins in-process; no external xray plugin
         py "$MKSB" \
             --link "$_bl" --port "$WG_PORT" \
-            --secret-key "$xray_priv" --peer-pubkey "$unifi_pub" \
+            --secret-key "$wg_priv" --peer-pubkey "$unifi_pub" \
             --address "$XRAY_ADDR" --mtu "$WG_MTU" --loglevel "$(sb_loglevel)" \
             > "$tmpcfg" || { rm -f "$tmpcfg"; fatal "config generation failed (check the link)"; }
         if [ -x "$SBIN" ]; then
@@ -461,7 +470,7 @@ _build_config() {
             --link "$_bl" \
             --listen "$WG_LISTEN" \
             --port "$WG_PORT" \
-            --secret-key "$xray_priv" \
+            --secret-key "$wg_priv" \
             --peer-pubkey "$unifi_pub" \
             --address "$XRAY_ADDR" \
             --mtu "$WG_MTU" \
@@ -514,7 +523,7 @@ cmd_wg_config() {
     [ -f "$WG_DIR/unifi_private.key" ] || fatal "no keys yet. Run 'proxy' and choose option 1 to import a link first."
     load_settings
     upriv="$(cat "$WG_DIR/unifi_private.key")"
-    xpub="$(cat "$WG_DIR/xray_public.key")"
+    xpub="$(cat "$WG_DIR/wg_public.key")"
     c_bold "================  UniFi WireGuard VPN Client  ================"
     echo
     echo "In unifi.ui.com: Settings -> VPN -> VPN Client -> Create New (WireGuard)."
