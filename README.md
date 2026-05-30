@@ -98,7 +98,10 @@ they validate the actual link without disturbing the running tunnel.
 - **VMess** (`vmess://`) — standard base64-JSON share link (`add`/`port`/`id`/`aid`/`scy`/`net`/`tls`/…).
 - **Trojan** (`trojan://`) — password auth, TLS by default.
 - **Shadowsocks** (`ss://`) — SIP002 (`base64(method:password)@host:port`) and the
-  legacy fully-base64 form; AEAD and 2022 ciphers.
+  legacy fully-base64 form; AEAD and 2022 ciphers. **SIP003 plugins** are supported
+  via a supervised, boot-persistent plugin process: `v2ray-plugin` is installed
+  automatically; any other plugin (e.g. `obfs-local`/`simple-obfs`) works once its
+  binary is placed in `/data/xray-unifi/plugins/`.
 
 For VLESS, VMess and Trojan: security `none` / `tls` / `reality` (`sni`, `fp`, `alpn`,
 `pbk`, `sid`, `spx`, `allowInsecure`) and transports `tcp` (incl.

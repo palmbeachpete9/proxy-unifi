@@ -31,6 +31,11 @@ def _b64_pad(s):
     return s + "=" * (-len(s) % 4)
 
 
+# Loopback port where a SIP003 plugin (if any) listens; xray's Shadowsocks
+# outbound dials this, and the plugin forwards (obfuscated) to the real server.
+SIP003_LOCAL_PORT = 29900
+
+
 def _b64decode_any(s):
     """Decode url-safe or standard base64, with or without padding."""
     s = s.strip()
@@ -206,24 +211,17 @@ def parse_trojan(link):
     return outbound, host, int(port)
 
 
-def parse_ss(link):
+def _ss_creds(link):
+    """Decode (method, password, host, port) from an ss:// link (no plugin logic)."""
     u = urlsplit(link)
     host, port = u.hostname, u.port
     method = password = None
 
-    # SIP003 plugins (v2ray-plugin, obfs, ...) need a matching transport that a
-    # plain shadowsocks outbound can't provide. Fail loudly instead of silently
-    # generating a config that would never connect.
-    if qg(flat_query(u), "plugin"):
-        die("shadowsocks 'plugin' (SIP003) links are not supported; use a plain ss:// link")
-
     # SIP002: ss://base64(method:password)@host:port  (or plain method:password)
     if u.username is not None and host and port:
         if u.password is not None:
-            # urlsplit already split a plain "method:password" userinfo
             method, password = unquote(u.username), unquote(u.password)
         else:
-            # no ':' in userinfo -> it's base64(method:password)
             dec = _b64decode_any(u.username)
             if dec and ":" in dec:
                 method, password = dec.split(":", 1)
@@ -239,15 +237,41 @@ def parse_ss(link):
 
     if not method or not password or not host or not port:
         die("could not parse shadowsocks link")
+    return method, password, host, int(port)
+
+
+def ss_plugin_info(link):
+    """Return SIP003 plugin spec for an ss:// link, or None if it has no plugin."""
+    raw = qg(flat_query(urlsplit(link)), "plugin")
+    if not raw:
+        return None
+    raw = unquote(raw)
+    if ";" in raw:
+        name, opts = raw.split(";", 1)   # 'name;opt1;opt2=...' -> name, SS_PLUGIN_OPTIONS
+    else:
+        name, opts = raw, ""
+    _, _, host, port = _ss_creds(link)
+    return {"name": name, "opts": opts, "host": host, "port": port, "local_port": SIP003_LOCAL_PORT}
+
+
+def parse_ss(link):
+    method, password, host, port = _ss_creds(link)
+    plug = ss_plugin_info(link)
+    # With a SIP003 plugin, xray talks to the local plugin listener, which forwards
+    # (obfuscated) to the real server. Without one, xray dials the server directly.
+    if plug:
+        addr, oport = "127.0.0.1", SIP003_LOCAL_PORT
+    else:
+        addr, oport = host, port
 
     outbound = {
         "tag": "proxy",
         "protocol": "shadowsocks",
         "settings": {
-            "servers": [{"address": host, "port": int(port), "method": method, "password": password}]
+            "servers": [{"address": addr, "port": oport, "method": method, "password": password}]
         },
     }
-    return outbound, host, int(port)
+    return outbound, host, port
 
 
 def parse_vmess(link):
@@ -399,11 +423,21 @@ def main():
     ap.add_argument("--loglevel", default="warning")
     ap.add_argument("--socks-port", type=int, default=0, help="emit a SOCKS test config on this port instead")
     ap.add_argument("--print-server", action="store_true", help="print 'host<TAB>port' of the server and exit")
+    ap.add_argument("--print-plugin", action="store_true",
+                    help="print 'name<TAB>opts<TAB>host<TAB>port<TAB>localport' for an ss:// SIP003 plugin, else nothing")
     args = ap.parse_args()
 
     if args.print_server:
         _, host, port = parse_link(args.link)
         sys.stdout.write("%s\t%s\n" % (host, port))
+        return
+
+    if args.print_plugin:
+        if args.link.strip().lower().startswith("ss://"):
+            info = ss_plugin_info(args.link)
+            if info:
+                sys.stdout.write("%s\t%s\t%s\t%s\t%s\n" % (
+                    info["name"], info["opts"], info["host"], info["port"], info["local_port"]))
         return
 
     if args.socks_port:
