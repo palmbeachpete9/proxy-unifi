@@ -1,21 +1,21 @@
 #!/bin/sh
-# install.sh - installer for xray-unifi on UniFi Cloud Gateways / UniFi OS devices.
+# install.sh - installer for proxy-unifi on UniFi Cloud Gateways / UniFi OS devices.
 #
 # Usage (on the gateway, via SSH as root):
-#   curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/xray-unifi/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/main/install.sh | sh
 # or, from a local clone:
 #   ./install.sh
 #
-# It installs the persistent package under /data/xray-unifi, downloads xray-core,
+# It installs the persistent package under /data/proxy-unifi, downloads xray-core,
 # wires up the unifi-common boot hook, and installs the systemd service.
 set -eu
 
-REPO_RAW="${XRAY_UNIFI_RAW:-https://raw.githubusercontent.com/palmbeachpete9/xray-unifi/main}"
-ROOT="/data/xray-unifi"
+REPO_RAW="${PROXY_UNIFI_RAW:-https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/main}"
+ROOT="/data/proxy-unifi"
 BIN_DIR="$ROOT/bin"
 ONBOOT_DIR="/data/on_boot.d"
-ONBOOT_DST="$ONBOOT_DIR/15-xray-unifi.sh"
-LOG="/tmp/xray-unifi-install.log"
+ONBOOT_DST="$ONBOOT_DIR/15-proxy-unifi.sh"
+LOG="/tmp/proxy-unifi-install.log"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 grn() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -88,28 +88,28 @@ ensure_unifi_common() {
 }
 install_files() {
     mkdir -p "$BIN_DIR"
-    fetch "xray-unifi" "$BIN_DIR/xray-unifi" 0755
+    fetch "proxy-unifi" "$BIN_DIR/proxy-unifi" 0755
     fetch "mkconfig.py" "$BIN_DIR/mkconfig.py" 0755
     fetch "mksingbox.py" "$BIN_DIR/mksingbox.py" 0755
-    ln -sf "$BIN_DIR/xray-unifi" /usr/bin/xray
+    ln -sf "$BIN_DIR/proxy-unifi" /usr/bin/proxy
     fetch "on_boot.sh" "$ONBOOT_DST" 0755
 }
 
 : > "$LOG" 2>/dev/null || true
-printf '\n  Installing xray-unifi\n\n'
+printf '\n  Installing proxy-unifi\n\n'
 run_step "Preparing boot persistence" ensure_unifi_common
 run_step "Installing files"           install_files
-run_step "Downloading cores (xray + sing-box)" "$BIN_DIR/xray-unifi" install-binary
-run_step "Installing service"         "$BIN_DIR/xray-unifi" install-service
+run_step "Downloading cores (xray + sing-box)" "$BIN_DIR/proxy-unifi" install-binary
+run_step "Installing service"         "$BIN_DIR/proxy-unifi" install-service
 printf '\n'
 grn "Installed."
 cat <<'EOF'
 
-Run: "xray"
+Run: "proxy"
 
   ...for the management menu. Then:
 
-    1. Import your proxy link (VLESS / VMess / Trojan / Shadowsocks) - option "1"
+    1. Import your proxy link (VLESS/VMess/Trojan/SS/Hysteria2/TUIC) - option "1"
 
 2. Copy shown WireGuard settings into a .conf file on your PC / Mac. Then, go to:
 
@@ -121,6 +121,6 @@ Run: "xray"
 
 4. Success!
 
-  xray status     # quick health check
-  xray help       # direct commands
+  proxy status     # quick health check
+  proxy help       # direct commands
 EOF
