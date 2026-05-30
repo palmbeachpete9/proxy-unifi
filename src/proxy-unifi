@@ -1,5 +1,5 @@
 #!/bin/sh
-# xray-unifi - GUI-less Xray-core proxy client (VLESS/Trojan/Shadowsocks) for UniFi Cloud Gateways.
+# proxy-unifi - GUI-less Xray-core proxy client (VLESS/Trojan/Shadowsocks) for UniFi Cloud Gateways.
 #
 # It runs an Xray WireGuard inbound that the gateway's *native* WireGuard VPN
 # Client connects to over loopback, and forwards everything out a proxy server.
@@ -13,7 +13,7 @@ set -eu
 # --------------------------------------------------------------------------
 # Paths / constants
 # --------------------------------------------------------------------------
-ROOT="/data/xray-unifi"
+ROOT="/data/proxy-unifi"
 BIN_DIR="$ROOT/bin"
 ETC_DIR="$ROOT/etc"
 WG_DIR="$ETC_DIR/wg"
@@ -25,16 +25,16 @@ ENGINE_FILE="$ETC_DIR/engine"               # active engine: "xray" or "singbox"
 SETTINGS="$ETC_DIR/settings.env"
 MKCONFIG="$BIN_DIR/mkconfig.py"
 MKSB="$BIN_DIR/mksingbox.py"
-SERVICE_NAME="xray-unifi"
+SERVICE_NAME="proxy-unifi"
 # (no RUN_DIR: xray runs under systemd, no pidfile needed)
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-ONBOOT_DST="/data/on_boot.d/15-xray-unifi.sh"
+ONBOOT_DST="/data/on_boot.d/15-proxy-unifi.sh"
 
 # SIP003 plugin support (Shadowsocks)
 PLUGINS_DIR="$ROOT/plugins"
 PLUGIN_ENV="$ETC_DIR/plugin.env"            # systemd EnvironmentFile (SS_* vars); present => plugin active
 PLUGIN_BIN_FILE="$ETC_DIR/plugin.bin"       # one line: absolute path to the plugin binary
-PLUGIN_SERVICE_NAME="xray-unifi-plugin"
+PLUGIN_SERVICE_NAME="proxy-unifi-plugin"
 PLUGIN_SERVICE_FILE="/etc/systemd/system/${PLUGIN_SERVICE_NAME}.service"
 
 XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/latest/download"
@@ -78,7 +78,7 @@ load_settings() {
 save_settings() {
     mkdir -p "$ETC_DIR"
     cat > "$SETTINGS" <<EOF
-# xray-unifi settings - managed by the CLI ('xray set <key> <value>'). Safe to edit by hand.
+# proxy-unifi settings - managed by the CLI ('proxy set <key> <value>'). Safe to edit by hand.
 WG_LISTEN="$WG_LISTEN"
 WG_PORT="$WG_PORT"
 WG_MTU="$WG_MTU"
@@ -124,7 +124,7 @@ ensure_keys() {
     mkdir -p "$WG_DIR"
     chmod 700 "$WG_DIR"
     if [ ! -f "$WG_DIR/xray_private.key" ] || [ ! -f "$WG_DIR/unifi_private.key" ]; then
-        info "generating WireGuard keypairs (xray side + UniFi side)..."
+        info "generating WireGuard keypairs (local + UniFi side)..."
         # split "PRIV PUB" without word-splitting/globbing (base64 is glob-safe, but be strict)
         _kp="$(gen_keypair)"; printf '%s' "${_kp% *}" > "$WG_DIR/xray_private.key";  printf '%s' "${_kp#* }" > "$WG_DIR/xray_public.key"
         _kp="$(gen_keypair)"; printf '%s' "${_kp% *}" > "$WG_DIR/unifi_private.key"; printf '%s' "${_kp#* }" > "$WG_DIR/unifi_public.key"
@@ -303,7 +303,7 @@ cmd_install_binary() {
     rm -rf "$tmp"
     c_grn "xray-core installed: $("$XRAY" version 2>/dev/null | head -1)"
     # Pre-stage / refresh the v2ray-plugin SIP003 binary (best-effort).
-    cmd_install_plugins || c_ylw "v2ray-plugin not installed (continuing); install it later with: xray update"
+    cmd_install_plugins || c_ylw "v2ray-plugin not installed (continuing); install it later with: proxy update"
     # Pre-stage / refresh the sing-box engine (best-effort).
     cmd_install_singbox || c_ylw "sing-box not installed (continuing); needed only for hysteria2/tuic/ss+plugin links"
 }
@@ -323,7 +323,7 @@ After=${PLUGIN_SERVICE_NAME}.service"
     fi
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=xray-unifi (WireGuard->proxy bridge)
+Description=proxy-unifi (WireGuard->proxy bridge)
 After=network-online.target nss-lookup.target
 Wants=network-online.target
 # Don't crash-loop before a link has been imported.
@@ -349,7 +349,7 @@ write_plugin_service() {
     _pbin="$(cat "$PLUGIN_BIN_FILE")"
     cat > "$PLUGIN_SERVICE_FILE" <<EOF
 [Unit]
-Description=xray-unifi SIP003 plugin
+Description=proxy-unifi SIP003 plugin
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=$PLUGIN_ENV
@@ -483,12 +483,12 @@ _build_config() {
 }
 
 regen_config() {
-    [ -f "$OUTBOUND_LINK" ] || fatal "no proxy link imported yet. Run 'xray' and choose option 1."
+    [ -f "$OUTBOUND_LINK" ] || fatal "no proxy link imported yet. Run 'proxy' and choose option 1."
     _build_config "$(cat "$OUTBOUND_LINK")"
 }
 
 cmd_import() {
-    [ $# -ge 1 ] || fatal "usage: xray import <vless:// | vmess:// | trojan:// | ss:// | hysteria2:// | tuic:// ...>"
+    [ $# -ge 1 ] || fatal "usage: proxy import <vless:// | vmess:// | trojan:// | ss:// | hysteria2:// | tuic:// ...>"
     link="$1"
     case "$link" in
         vless://*|vmess://*|trojan://*|ss://*|hysteria2://*|hy2://*|tuic://*) : ;;
@@ -511,7 +511,7 @@ cmd_import() {
 }
 
 cmd_wg_config() {
-    [ -f "$WG_DIR/unifi_private.key" ] || fatal "no keys yet. Run 'xray' and choose option 1 to import a link first."
+    [ -f "$WG_DIR/unifi_private.key" ] || fatal "no keys yet. Run 'proxy' and choose option 1 to import a link first."
     load_settings
     upriv="$(cat "$WG_DIR/unifi_private.key")"
     xpub="$(cat "$WG_DIR/xray_public.key")"
@@ -677,7 +677,7 @@ current_server() {
 }
 
 # --------------------------------------------------------------------------
-# Connectivity test (`xray ping`)
+# Connectivity test (`proxy ping`)
 # --------------------------------------------------------------------------
 _ms_from_seconds() { py -c "print('%.0f'%(float('${1:-0}')*1000))" 2>/dev/null || echo "?"; }
 
@@ -751,7 +751,7 @@ ping_icmp() {
 cmd_ping() {
     load_settings
     if [ ! -f "$OUTBOUND_LINK" ]; then
-        c_ylw "No proxy link imported. Import one first (run 'xray' -> option 1)."
+        c_ylw "No proxy link imported. Import one first (run 'proxy' -> option 1)."
         return 1
     fi
     _mode="${1:-$PING_MODE}"
@@ -765,7 +765,7 @@ cmd_ping() {
 }
 
 # --------------------------------------------------------------------------
-# Interactive menu (shown when `xray` is run with no arguments)
+# Interactive menu (shown when `proxy` is run with no arguments)
 # --------------------------------------------------------------------------
 pause() { printf '\n'; printf 'Press Enter to return to the menu...'; read -r _ || true; }
 
@@ -781,11 +781,11 @@ print_menu() {
 
     printf '\n'
     printf '╔%s╗\n' "$HR"
-    ml "  xray-unifi : Xray proxy client for UniFi"
+    ml "  proxy-unifi : multi-core proxy client"
     ml "  0. Exit Script"
     printf '│%s│\n' "$HR"
     ml "  1. Import / replace proxy link"
-    ml "  2. Show current server & xray config"
+    ml "  2. Show current server & config"
     ml "  3. Show UniFi WireGuard VPN Client config"
     ml "  4. Regenerate WireGuard keys"
     printf '│%s│\n' "$HR"
@@ -900,7 +900,7 @@ cmd_menu() {
             17) ( cmd_update ) ;;
             18) ( cmd_geo_update ) ;;
             19) ( if [ -x "$XRAY" ]; then "$XRAY" version | head -1; else c_ylw "xray-core: not installed"; fi
-                  echo "xray-unifi CLI 1.0.0" ) ;;
+                  echo "proxy-unifi CLI 1.0.0" ) ;;
             20) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
                 if [ "${_c:-}" = "y" ]; then ( cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
             *)  c_red "Invalid selection." ;;
@@ -913,7 +913,7 @@ cmd_uninstall() {
     need_root
     systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
     systemctl disable --now "$PLUGIN_SERVICE_NAME" 2>/dev/null || true
-    rm -f "$SERVICE_FILE" "$PLUGIN_SERVICE_FILE" "$ONBOOT_DST" /usr/bin/xray
+    rm -f "$SERVICE_FILE" "$PLUGIN_SERVICE_FILE" "$ONBOOT_DST" /usr/bin/proxy
     systemctl daemon-reload 2>/dev/null || true
     c_ylw "Removed service + boot hook. Data kept at $ROOT (delete it manually to purge keys/config)."
     info "Don't forget to delete the WireGuard VPN Client in the UniFi UI."
@@ -921,19 +921,19 @@ cmd_uninstall() {
 
 usage() {
     cat <<EOF
-xray - Xray-core proxy client for UniFi gateways (via native WireGuard)
+proxy - multi-core proxy client (xray-core + sing-box) for UniFi gateways
 
-Run 'xray' with no arguments for the interactive management menu
+Run 'proxy' with no arguments for the interactive management menu
 (import links, keys, WireGuard config, updates, uninstall, etc.).
 
 Direct commands (for scripting / quick ops):
-  xray start        Start the service
-  xray stop         Stop the service
-  xray restart      Restart the service
-  xray status       Show service / server / listener status
-  xray ping [proto] Test the proxy link; proto = get|head|tcp|icmp (default: get)
-  xray logs [args]  Tail service logs (passes args to journalctl)
-  xray help         This help
+  proxy start        Start the service
+  proxy stop         Stop the service
+  proxy restart      Restart the service
+  proxy status       Show engine / server / listener status
+  proxy ping [proto] Test the proxy link; proto = get|head|tcp|icmp (default: get)
+  proxy logs [args]  Tail service logs (passes args to journalctl)
+  proxy help         This help
 
 Data lives in $ROOT and survives reboots/firmware upgrades via unifi-common.
 EOF
@@ -960,13 +960,13 @@ case "$cmd" in
     import)          need_root; cmd_import "$@" ;;
     wg-config|wg)    cmd_wg_config ;;
     config)          cmd_config ;;
-    set)             need_root; [ $# -ge 2 ] || fatal "usage: xray set <key> <value>"; cmd_set "$1" "$2" ;;
+    set)             need_root; [ $# -ge 2 ] || fatal "usage: proxy set <key> <value>"; cmd_set "$1" "$2" ;;
     regen-keys)      need_root; cmd_regen_keys ;;
     enable)          need_root; cmd_enable ;;
     disable)         need_root; cmd_disable ;;
     update)          need_root; cmd_update ;;
     geo-update)      need_root; cmd_geo_update ;;
-    version)         [ -x "$XRAY" ] && "$XRAY" version | head -1; echo "xray-unifi CLI 1.0.0" ;;
+    version)         [ -x "$XRAY" ] && "$XRAY" version | head -1; echo "proxy-unifi CLI 1.0.0" ;;
     uninstall)       cmd_uninstall ;;
     install-binary)  need_root; cmd_install_binary ;;
     install-service) need_root; install_service ;;
