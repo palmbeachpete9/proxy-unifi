@@ -18,10 +18,13 @@ BIN_DIR="$ROOT/bin"
 ETC_DIR="$ROOT/etc"
 WG_DIR="$ETC_DIR/wg"
 XRAY="$BIN_DIR/xray"
+SBIN="$BIN_DIR/sing-box"
 CONFIG="$ETC_DIR/config.json"
 OUTBOUND_LINK="$ETC_DIR/link.txt"
+ENGINE_FILE="$ETC_DIR/engine"               # active engine: "xray" or "singbox"
 SETTINGS="$ETC_DIR/settings.env"
 MKCONFIG="$BIN_DIR/mkconfig.py"
+MKSB="$BIN_DIR/mksingbox.py"
 SERVICE_NAME="xray-unifi"
 # (no RUN_DIR: xray runs under systemd, no pidfile needed)
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -37,6 +40,7 @@ PLUGIN_SERVICE_FILE="/etc/systemd/system/${PLUGIN_SERVICE_NAME}.service"
 XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/latest/download"
 GEO_BASE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
 V2RAY_PLUGIN_RELEASES="https://github.com/shadowsocks/v2ray-plugin/releases"
+SINGBOX_RELEASES="https://github.com/SagerNet/sing-box/releases"
 
 # defaults (overridable via settings.env)
 WG_LISTEN="127.0.0.1"
@@ -189,6 +193,82 @@ cmd_install_plugins() {
 }
 
 # --------------------------------------------------------------------------
+# Engine selection (xray vs sing-box)
+# --------------------------------------------------------------------------
+# Which engine handles a link: "xray", "singbox", or "" (unsupported).
+engine_for_link() {
+    case "$1" in
+        vless://*|vmess://*|trojan://*) echo xray; return ;;
+        hysteria2://*|hy2://*|tuic://*) echo singbox; return ;;
+        ss://*)
+            _pn="$(py "$MKCONFIG" --link "$1" --print-plugin 2>/dev/null | cut -f1)"
+            if [ -z "$_pn" ]; then echo xray; return; fi   # plain SS -> xray
+            case "$_pn" in
+                obfs-local|simple-obfs|v2ray-plugin) echo singbox ;;  # sing-box runs these in-process
+                *) echo xray ;;                                      # exotic plugin -> xray external runner
+            esac
+            return ;;
+    esac
+    echo ""
+}
+
+current_engine() {
+    if [ -f "$ENGINE_FILE" ]; then cat "$ENGINE_FILE"
+    elif [ -f "$OUTBOUND_LINK" ]; then engine_for_link "$(cat "$OUTBOUND_LINK")"
+    else echo xray; fi
+}
+
+# map our (xray-style) loglevel to sing-box's vocabulary
+sb_loglevel() {
+    case "$LOGLEVEL" in
+        warning) echo warn ;;
+        none)    echo fatal ;;
+        debug|info|error) echo "$LOGLEVEL" ;;
+        *) echo warn ;;
+    esac
+}
+
+sb_arch() {
+    case "$(uname -m)" in
+        aarch64|arm64) echo "arm64" ;;
+        x86_64|amd64)  echo "amd64" ;;
+        armv7l|armhf)  echo "armv7" ;;
+        *) fatal "unsupported architecture: $(uname -m)" ;;
+    esac
+}
+
+cmd_install_singbox() {
+    mkdir -p "$BIN_DIR"
+    _sa="$(sb_arch)"
+    _tag="$(curl -fsSLI "$SINGBOX_RELEASES/latest" 2>/dev/null | tr -d '\r' \
+            | awk -F'/tag/' 'tolower($0) ~ /^location:/ {print $2}' | tail -1)"
+    [ -n "$_tag" ] || { err "could not resolve sing-box latest version"; return 1; }
+    _ver="${_tag#v}"
+    _url="$SINGBOX_RELEASES/download/${_tag}/sing-box-${_ver}-linux-${_sa}.tar.gz"
+    _tmp="$(mktemp -d)"
+    info "downloading sing-box ${_tag} (${_sa}) ..."
+    if have curl; then
+        curl -fsSL "$_url" -o "$_tmp/sb.tgz" || { rm -rf "$_tmp"; err "sing-box download failed"; return 1; }
+    elif have wget; then
+        wget -qO "$_tmp/sb.tgz" "$_url" || { rm -rf "$_tmp"; err "sing-box download failed"; return 1; }
+    else
+        rm -rf "$_tmp"; err "need curl or wget to download sing-box"; return 1
+    fi
+    have tar || { rm -rf "$_tmp"; err "need tar to extract sing-box"; return 1; }
+    tar xzf "$_tmp/sb.tgz" -C "$_tmp" || { rm -rf "$_tmp"; err "could not extract sing-box"; return 1; }
+    _b="$(find "$_tmp" -name sing-box -type f | head -1)"
+    [ -n "$_b" ] || { rm -rf "$_tmp"; err "sing-box binary not found in archive"; return 1; }
+    install -m 0755 "$_b" "$SBIN.new" && mv -f "$SBIN.new" "$SBIN"
+    rm -rf "$_tmp"
+    c_grn "sing-box installed: $("$SBIN" version 2>/dev/null | head -1)"
+}
+
+ensure_singbox() {
+    [ -x "$SBIN" ] || cmd_install_singbox || true
+    [ -x "$SBIN" ] || fatal "sing-box is required for this link but could not be installed"
+}
+
+# --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
 
@@ -224,10 +304,18 @@ cmd_install_binary() {
     c_grn "xray-core installed: $("$XRAY" version 2>/dev/null | head -1)"
     # Pre-stage / refresh the v2ray-plugin SIP003 binary (best-effort).
     cmd_install_plugins || c_ylw "v2ray-plugin not installed (continuing); install it later with: xray update"
+    # Pre-stage / refresh the sing-box engine (best-effort).
+    cmd_install_singbox || c_ylw "sing-box not installed (continuing); needed only for hysteria2/tuic/ss+plugin links"
 }
 
 write_service() {
-    # If a SIP003 plugin is active, make xray require + start after the plugin unit.
+    # ExecStart depends on the active engine (xray vs sing-box).
+    if [ "$(cat "$ENGINE_FILE" 2>/dev/null || echo xray)" = "singbox" ]; then
+        _exec="$SBIN run -c $CONFIG"
+    else
+        _exec="$XRAY run -config $CONFIG"
+    fi
+    # If a SIP003 plugin (xray external runner) is active, order xray after it.
     _dep=""
     if [ -f "$PLUGIN_ENV" ]; then
         _dep="Requires=${PLUGIN_SERVICE_NAME}.service
@@ -235,7 +323,7 @@ After=${PLUGIN_SERVICE_NAME}.service"
     fi
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=xray-unifi (Xray-core WireGuard->proxy bridge)
+Description=xray-unifi (WireGuard->proxy bridge)
 After=network-online.target nss-lookup.target
 Wants=network-online.target
 # Don't crash-loop before a link has been imported.
@@ -244,7 +332,7 @@ $_dep
 
 [Service]
 Type=simple
-ExecStart=$XRAY run -config $CONFIG
+ExecStart=$_exec
 Environment=XRAY_LOCATION_ASSET=$BIN_DIR
 WorkingDirectory=$ROOT
 Restart=on-failure
@@ -344,36 +432,53 @@ _plugin_commit() {
 _build_config() {
     _bl="$1"
     ensure_keys
-    # verify any SIP003 plugin binary BEFORE mutating anything (keeps failed imports safe)
-    _plugin_detect "$_bl"
+    _eng="$(engine_for_link "$_bl")"
+    [ -n "$_eng" ] || fatal "unsupported link (expected vless/vmess/trojan/ss/hysteria2/tuic)"
     xray_priv="$(cat "$WG_DIR/xray_private.key")"
     unifi_pub="$(cat "$WG_DIR/unifi_public.key")"
     mkdir -p "$ETC_DIR"
-    # optional --dns, injected via positional params so it stays properly quoted
-    set --
-    [ -n "$INNER_DNS" ] && set -- --dns "$INNER_DNS"
     tmpcfg="$(mktemp)"
-    py "$MKCONFIG" \
-        --link "$_bl" \
-        --listen "$WG_LISTEN" \
-        --port "$WG_PORT" \
-        --secret-key "$xray_priv" \
-        --peer-pubkey "$unifi_pub" \
-        --address "$XRAY_ADDR" \
-        --mtu "$WG_MTU" \
-        --keepalive "$WG_KEEPALIVE" \
-        --loglevel "$LOGLEVEL" \
-        "$@" \
-        > "$tmpcfg" || { rm -f "$tmpcfg"; fatal "config generation failed (check the link)"; }
-    # validate before swapping it in. -format json is required because xray infers
-    # the config format from the file extension, and mktemp names have none.
-    if [ -x "$XRAY" ]; then
-        "$XRAY" run -test -config "$tmpcfg" -format json >/dev/null 2>&1 || {
-            rm -f "$tmpcfg"; fatal "xray rejected the generated config (-test failed)"
-        }
+    if [ "$_eng" = "singbox" ]; then
+        ensure_singbox
+        PLG_ACTIVE=0    # sing-box runs SIP003 plugins in-process; no external xray plugin
+        py "$MKSB" \
+            --link "$_bl" --port "$WG_PORT" \
+            --secret-key "$xray_priv" --peer-pubkey "$unifi_pub" \
+            --address "$XRAY_ADDR" --mtu "$WG_MTU" --loglevel "$(sb_loglevel)" \
+            > "$tmpcfg" || { rm -f "$tmpcfg"; fatal "config generation failed (check the link)"; }
+        if [ -x "$SBIN" ]; then
+            "$SBIN" check -c "$tmpcfg" >/dev/null 2>&1 || {
+                rm -f "$tmpcfg"; fatal "sing-box rejected the generated config"
+            }
+        fi
+    else
+        # verify any (exotic) SIP003 plugin binary BEFORE mutating anything
+        _plugin_detect "$_bl"
+        # optional --dns, injected via positional params so it stays properly quoted
+        set --
+        [ -n "$INNER_DNS" ] && set -- --dns "$INNER_DNS"
+        py "$MKCONFIG" \
+            --link "$_bl" \
+            --listen "$WG_LISTEN" \
+            --port "$WG_PORT" \
+            --secret-key "$xray_priv" \
+            --peer-pubkey "$unifi_pub" \
+            --address "$XRAY_ADDR" \
+            --mtu "$WG_MTU" \
+            --keepalive "$WG_KEEPALIVE" \
+            --loglevel "$LOGLEVEL" \
+            "$@" \
+            > "$tmpcfg" || { rm -f "$tmpcfg"; fatal "config generation failed (check the link)"; }
+        # -format json is required because xray infers format from the extension.
+        if [ -x "$XRAY" ]; then
+            "$XRAY" run -test -config "$tmpcfg" -format json >/dev/null 2>&1 || {
+                rm -f "$tmpcfg"; fatal "xray rejected the generated config (-test failed)"
+            }
+        fi
     fi
     mv "$tmpcfg" "$CONFIG"
     chmod 600 "$CONFIG"
+    printf '%s' "$_eng" > "$ENGINE_FILE"
     _plugin_commit
 }
 
@@ -383,11 +488,11 @@ regen_config() {
 }
 
 cmd_import() {
-    [ $# -ge 1 ] || fatal "usage: xray import <vless:// | vmess:// | trojan:// | ss:// ...>"
+    [ $# -ge 1 ] || fatal "usage: xray import <vless:// | vmess:// | trojan:// | ss:// | hysteria2:// | tuic:// ...>"
     link="$1"
     case "$link" in
-        vless://*|vmess://*|trojan://*|ss://*) : ;;
-        *) fatal "unsupported link (expected vless://, vmess://, trojan://, or ss://)" ;;
+        vless://*|vmess://*|trojan://*|ss://*|hysteria2://*|hy2://*|tuic://*) : ;;
+        *) fatal "unsupported link (expected vless://, vmess://, trojan://, ss://, hysteria2:// or tuic://)" ;;
     esac
     load_settings
     # Build + validate the NEW link FIRST. On any failure this fatals before we
@@ -451,7 +556,13 @@ cmd_status() {
     act="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
     ena="$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true)"
     echo "service:   ${act:-unknown} / ${ena:-disabled}"
-    if [ -x "$XRAY" ]; then echo "xray:      $("$XRAY" version 2>/dev/null | head -1)"; else echo "xray:      not installed"; fi
+    _eng="$(current_engine)"
+    echo "engine:    $_eng"
+    if [ "$_eng" = "singbox" ]; then
+        if [ -x "$SBIN" ]; then echo "core:      $("$SBIN" version 2>/dev/null | head -1)"; else echo "core:      sing-box not installed"; fi
+    else
+        if [ -x "$XRAY" ]; then echo "core:      $("$XRAY" version 2>/dev/null | head -1)"; else echo "core:      xray not installed"; fi
+    fi
     echo "server:    $(current_server)"
     if [ -f "$PLUGIN_ENV" ] && [ -f "$PLUGIN_BIN_FILE" ]; then
         pst="$(systemctl is-active "$PLUGIN_SERVICE_NAME" 2>/dev/null || true)"
@@ -551,9 +662,17 @@ cmd_geo_update() {
     c_grn "Geo files updated."
 }
 
+# Print 'host<TAB>port' for the current link using the engine-appropriate generator.
+_server_hp() {
+    [ -f "$OUTBOUND_LINK" ] || return 1
+    if [ "$(current_engine)" = "singbox" ]; then _gen="$MKSB"; else _gen="$MKCONFIG"; fi
+    py "$_gen" --link "$(cat "$OUTBOUND_LINK")" --print-server 2>/dev/null
+}
+
 current_server() {
     [ -f "$OUTBOUND_LINK" ] || { echo "(none imported)"; return; }
-    hp="$(py "$MKCONFIG" --link "$(cat "$OUTBOUND_LINK")" --print-server 2>/dev/null)" || { echo "?"; return; }
+    hp="$(_server_hp)" || { echo "?"; return; }
+    [ -n "$hp" ] || { echo "?"; return; }
     printf '%s:%s\n' "$(printf '%s' "$hp" | cut -f1)" "$(printf '%s' "$hp" | cut -f2)"
 }
 
@@ -563,14 +682,21 @@ current_server() {
 _ms_from_seconds() { py -c "print('%.0f'%(float('${1:-0}')*1000))" 2>/dev/null || echo "?"; }
 
 ping_proxy() {   # $1 = get|head
-    _m="$1"; _link="$(cat "$OUTBOUND_LINK")"
-    [ -x "$XRAY" ] || { err "xray binary not installed"; return 1; }
+    _m="$1"; _link="$(cat "$OUTBOUND_LINK")"; _e="$(current_engine)"
     _port=21080
     _cfg="$(mktemp)"
-    py "$MKCONFIG" --link "$_link" --socks-port "$_port" > "$_cfg" 2>/dev/null \
-        || { rm -f "$_cfg"; err "could not build test config"; return 1; }
-    # -format json: mktemp names have no extension for xray to infer the format from.
-    "$XRAY" run -config "$_cfg" -format json >/dev/null 2>&1 &
+    if [ "$_e" = "singbox" ]; then
+        [ -x "$SBIN" ] || { err "sing-box not installed"; return 1; }
+        py "$MKSB" --link "$_link" --socks-port "$_port" > "$_cfg" 2>/dev/null \
+            || { rm -f "$_cfg"; err "could not build test config"; return 1; }
+        "$SBIN" run -c "$_cfg" >/dev/null 2>&1 &
+    else
+        [ -x "$XRAY" ] || { err "xray binary not installed"; return 1; }
+        py "$MKCONFIG" --link "$_link" --socks-port "$_port" > "$_cfg" 2>/dev/null \
+            || { rm -f "$_cfg"; err "could not build test config"; return 1; }
+        # -format json: mktemp names have no extension for xray to infer the format from.
+        "$XRAY" run -config "$_cfg" -format json >/dev/null 2>&1 &
+    fi
     _pid=$!
     # wait (max ~4.5s) for the SOCKS listener to come up
     _i=0
@@ -596,7 +722,7 @@ except Exception: sys.exit(1)' >/dev/null 2>&1; then break; fi
 }
 
 ping_tcp() {
-    _hp="$(py "$MKCONFIG" --link "$(cat "$OUTBOUND_LINK")" --print-server 2>/dev/null)"
+    _hp="$(_server_hp)"
     _h="$(printf '%s' "$_hp" | cut -f1)"; _p="$(printf '%s' "$_hp" | cut -f2)"
     [ -n "$_h" ] || { err "could not parse server from link"; return 1; }
     _ms="$(py - "$_h" "$_p" "$PING_TIMEOUT" <<'PYEOF'
@@ -614,7 +740,7 @@ PYEOF
 }
 
 ping_icmp() {
-    _hp="$(py "$MKCONFIG" --link "$(cat "$OUTBOUND_LINK")" --print-server 2>/dev/null)"
+    _hp="$(_server_hp)"
     _h="$(printf '%s' "$_hp" | cut -f1)"
     [ -n "$_h" ] || { err "could not parse server from link"; return 1; }
     _out="$(ping -c 1 -W "$PING_TIMEOUT" "$_h" 2>/dev/null)" || { c_red "ICMP ${_h}: timeout (>${PING_TIMEOUT}s)"; return 1; }
@@ -747,7 +873,7 @@ cmd_menu() {
         echo
         case "$sel" in
             0)  exit 0 ;;
-            1)  ( printf 'Paste proxy link (vless:// | vmess:// | trojan:// | ss://): '; read -r _l || true
+            1)  ( printf 'Paste proxy link (vless/vmess/trojan/ss/hysteria2/tuic): '; read -r _l || true
                   if [ -n "${_l:-}" ]; then cmd_import "$_l"; else c_ylw "No link entered."; fi ) ;;
             2)  ( cmd_config ) ;;
             3)  ( cmd_wg_config ) ;;

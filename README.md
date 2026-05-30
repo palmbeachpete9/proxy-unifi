@@ -98,15 +98,32 @@ they validate the actual link without disturbing the running tunnel.
 - **VMess** (`vmess://`) — standard base64-JSON share link (`add`/`port`/`id`/`aid`/`scy`/`net`/`tls`/…).
 - **Trojan** (`trojan://`) — password auth, TLS by default.
 - **Shadowsocks** (`ss://`) — SIP002 (`base64(method:password)@host:port`) and the
-  legacy fully-base64 form; AEAD and 2022 ciphers. **SIP003 plugins** are supported
-  via a supervised, boot-persistent plugin process: `v2ray-plugin` is installed
-  automatically; any other plugin (e.g. `obfs-local`/`simple-obfs`) works once its
-  binary is placed in `/data/xray-unifi/plugins/`.
+  legacy fully-base64 form; AEAD and 2022 ciphers. **SIP003 plugins:**
+  `obfs-local`/`simple-obfs` and `v2ray-plugin` run **natively via sing-box** (no
+  external binary). Any *other* plugin works through xray once its binary is placed
+  in `/data/xray-unifi/plugins/`.
+- **Hysteria2** (`hysteria2://` / `hy2://`) and **TUIC** (`tuic://`) — via sing-box.
 
 For VLESS, VMess and Trojan: security `none` / `tls` / `reality` (`sni`, `fp`, `alpn`,
 `pbk`, `sid`, `spx`, `allowInsecure`) and transports `tcp` (incl.
 `headerType=http`), `ws`, `httpupgrade`, `http`/`h2`, `grpc`, `xhttp`, `kcp`,
 `quic`.
+
+## Engines (xray-core + sing-box)
+
+xray-unifi ships **two cores** and picks one automatically per imported link:
+
+- **xray-core** — VLESS, VMess, Trojan, plain Shadowsocks (default for everything
+  it supports; strong REALITY / XTLS-Vision).
+- **sing-box** — Shadowsocks **+ obfs/v2ray-plugin (in-process, no build)**,
+  **Hysteria2**, **TUIC**.
+
+Both terminate the **same** WireGuard tunnel (identical keys/port), so there is
+always a single UniFi VPN Client entry regardless of which core is active. Only
+one core runs at a time; `xray status` shows which. Note: xray binds the WireGuard
+port on loopback (`127.0.0.1`); sing-box binds it on all interfaces (it has no
+listen-address option) — harmless, since WireGuard only ever answers the one
+configured peer key.
 
 ## Notes & caveats
 

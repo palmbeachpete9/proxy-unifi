@@ -90,6 +90,7 @@ install_files() {
     mkdir -p "$BIN_DIR"
     fetch "xray-unifi" "$BIN_DIR/xray-unifi" 0755
     fetch "mkconfig.py" "$BIN_DIR/mkconfig.py" 0755
+    fetch "mksingbox.py" "$BIN_DIR/mksingbox.py" 0755
     ln -sf "$BIN_DIR/xray-unifi" /usr/bin/xray
     fetch "on_boot.sh" "$ONBOOT_DST" 0755
 }
@@ -98,7 +99,7 @@ install_files() {
 printf '\n  Installing xray-unifi\n\n'
 run_step "Preparing boot persistence" ensure_unifi_common
 run_step "Installing files"           install_files
-run_step "Downloading xray-core"      "$BIN_DIR/xray-unifi" install-binary
+run_step "Downloading cores (xray + sing-box)" "$BIN_DIR/xray-unifi" install-binary
 run_step "Installing service"         "$BIN_DIR/xray-unifi" install-service
 printf '\n'
 grn "Installed."
