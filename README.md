@@ -1,8 +1,7 @@
 # proxy-unifi
 
 Run a headless proxy client on your UniFi Cloud Gateway and steer traffic into it
-from the native UniFi UI (**Policy Engine → Policy Table**), exactly like a
-commercial VPN.
+from the native UniFi UI (**Policy Engine → Policy Table**).
 
 proxy-unifi ships **two cores** — [xray-core](https://github.com/XTLS/Xray-core) and
 [sing-box](https://github.com/SagerNet/sing-box) — and automatically picks the right
