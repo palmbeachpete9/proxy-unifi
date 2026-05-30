@@ -1,7 +1,7 @@
 # Xray-core on UniFi OS
 
 Run an [Xray-core](https://github.com/XTLS/Xray-core) proxy client
-(**VLESS**, **Trojan**, **Shadowsocks**) directly on your UniFi Cloud Gateway — and
+(**VLESS**, **VMess**, **Trojan**, **Shadowsocks**) directly on your UniFi Cloud Gateway — and
 steer traffic into it from the native UniFi UI (via **Policy Engine**).
 
 UniFi gateways have no built-in proxy support and can't dial a `vless://` /
@@ -95,11 +95,12 @@ they validate the actual link without disturbing the running tunnel.
 ## Supported links
 
 - **VLESS** (`vless://`) — UUID, `encryption`, `flow` (e.g. `xtls-rprx-vision`).
+- **VMess** (`vmess://`) — standard base64-JSON share link (`add`/`port`/`id`/`aid`/`scy`/`net`/`tls`/…).
 - **Trojan** (`trojan://`) — password auth, TLS by default.
 - **Shadowsocks** (`ss://`) — SIP002 (`base64(method:password)@host:port`) and the
   legacy fully-base64 form; AEAD and 2022 ciphers.
 
-For VLESS and Trojan: security `none` / `tls` / `reality` (`sni`, `fp`, `alpn`,
+For VLESS, VMess and Trojan: security `none` / `tls` / `reality` (`sni`, `fp`, `alpn`,
 `pbk`, `sid`, `spx`, `allowInsecure`) and transports `tcp` (incl.
 `headerType=http`), `ws`, `httpupgrade`, `http`/`h2`, `grpc`, `xhttp`, `kcp`,
 `quic`.
