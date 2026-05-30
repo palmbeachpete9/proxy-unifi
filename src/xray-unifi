@@ -236,11 +236,11 @@ regen_config() {
 }
 
 cmd_import() {
-    [ $# -ge 1 ] || fatal "usage: xray import <vless:// | trojan:// | ss:// ...>"
+    [ $# -ge 1 ] || fatal "usage: xray import <vless:// | vmess:// | trojan:// | ss:// ...>"
     link="$1"
     case "$link" in
-        vless://*|trojan://*|ss://*) : ;;
-        *) fatal "unsupported link (expected vless://, trojan://, or ss://)" ;;
+        vless://*|vmess://*|trojan://*|ss://*) : ;;
+        *) fatal "unsupported link (expected vless://, vmess://, trojan://, or ss://)" ;;
     esac
     load_settings
     # Build + validate the NEW link FIRST. On any failure this fatals before we
@@ -596,7 +596,7 @@ cmd_menu() {
         echo
         case "$sel" in
             0)  exit 0 ;;
-            1)  ( printf 'Paste proxy link (vless:// | trojan:// | ss://): '; read -r _l || true
+            1)  ( printf 'Paste proxy link (vless:// | vmess:// | trojan:// | ss://): '; read -r _l || true
                   if [ -n "${_l:-}" ]; then cmd_import "$_l"; else c_ylw "No link entered."; fi ) ;;
             2)  ( cmd_config ) ;;
             3)  ( cmd_wg_config ) ;;

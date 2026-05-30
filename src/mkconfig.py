@@ -4,7 +4,7 @@ mkconfig.py - Build a complete Xray-core config.json for the UniFi WireGuard bri
 
 Topology:
     UniFi WireGuard VPN Client  --(UDP 127.0.0.1:PORT)-->  Xray WireGuard inbound
-        --> proxy outbound (parsed from a vless:// / trojan:// / ss:// link)
+        --> proxy outbound (parsed from a vless:// / vmess:// / trojan:// / ss:// link)
         --> remote proxy server
 
 It parses a proxy share link into an Xray outbound and emits a full config that
@@ -250,16 +250,71 @@ def parse_ss(link):
     return outbound, host, int(port)
 
 
+def parse_vmess(link):
+    # Standard (v2rayN) form: vmess://base64(json). Decode and map the fields.
+    body = link[len("vmess://"):]
+    body = body.split("#", 1)[0]
+    dec = _b64decode_any(body)
+    if not dec:
+        die("could not decode vmess link (expected base64-encoded JSON)")
+    try:
+        v = json.loads(dec)
+    except Exception:
+        die("vmess link is not valid base64-encoded JSON")
+
+    host = str(v.get("add", "") or "")
+    port = v.get("port")
+    uid = str(v.get("id", "") or "")
+    if not host or not port or not uid:
+        die("vmess link is missing add/port/id")
+
+    net = str(v.get("net", "tcp") or "tcp")
+    tls = str(v.get("tls", "") or "")
+    if tls == "reality":
+        security = "reality"
+    elif tls in ("tls", "xtls"):
+        security = "tls"
+    else:
+        security = "none"
+
+    # translate vmess fields into the same dict shape build_stream() consumes
+    q = {}
+    for src, dst in (("sni", "sni"), ("host", "host"), ("fp", "fp"),
+                     ("alpn", "alpn"), ("type", "headerType"),
+                     ("pbk", "pbk"), ("sid", "sid"), ("spx", "spx")):
+        if v.get(src) not in (None, ""):
+            q[dst] = str(v[src])
+    if v.get("path") not in (None, ""):
+        q["path"] = str(v["path"])
+        q["serviceName"] = str(v["path"])   # grpc carries serviceName in "path"
+    stream = build_stream(q, security, net, host)
+
+    user = {
+        "id": uid,
+        "alterId": int(v.get("aid", 0) or 0),
+        "security": str(v.get("scy", "auto") or "auto"),
+    }
+    outbound = {
+        "tag": "proxy",
+        "protocol": "vmess",
+        "settings": {"vnext": [{"address": host, "port": int(port), "users": [user]}]},
+        "streamSettings": stream,
+    }
+    return outbound, host, int(port)
+
+
 def parse_link(link):
     link = link.strip()
     low = link.lower()
     if low.startswith("vless://"):
         return parse_vless(link)
+    if low.startswith("vmess://"):
+        return parse_vmess(link)
     if low.startswith("trojan://"):
         return parse_trojan(link)
     if low.startswith("ss://"):
         return parse_ss(link)
-    die("unsupported link (expected vless://, trojan://, or ss://)")
+    die("unsupported link (expected vless://, vmess://, trojan://, or ss://)")
 
 
 def build_test_config(args):
@@ -331,7 +386,7 @@ def build_config(args):
 
 def main():
     ap = argparse.ArgumentParser(description="Build Xray config for the UniFi WireGuard bridge")
-    ap.add_argument("--link", required=True, help="proxy share link (vless:// / trojan:// / ss://)")
+    ap.add_argument("--link", required=True, help="proxy share link (vless:// / vmess:// / trojan:// / ss://)")
     ap.add_argument("--listen", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=0, help="UDP port for the WireGuard inbound")
     ap.add_argument("--secret-key", default="", help="Xray (server) WireGuard private key, base64")

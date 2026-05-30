@@ -108,7 +108,7 @@ Run: "xray"
 
   ...for the management menu. Then:
 
-    1. Import your proxy link (VLESS / Trojan / Shadowsocks) - option "1"
+    1. Import your proxy link (VLESS / VMess / Trojan / Shadowsocks) - option "1"
 
 2. Copy shown WireGuard settings into a .conf file on your PC / Mac. Then, go to:
 
