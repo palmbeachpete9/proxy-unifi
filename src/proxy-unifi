@@ -649,7 +649,11 @@ cmd_regen_keys() {
         cp -p "$WG_DIR"/*.key "$_bk"/ 2>/dev/null || true
         rm -f "$WG_DIR"/*.key
         ensure_keys
-        if regen_config 2>/dev/null; then
+        # regen_config may call fatal() (which exits); run it in a subshell so a
+        # failure is caught here as a non-zero status instead of killing the CLI
+        # before we can roll the keys back. On success it has already written
+        # config.json (the mv inside it is atomic), so re-running it is not needed.
+        if ( regen_config ) >/dev/null 2>&1; then
             rm -rf "$_bk"
             systemctl restart "$SERVICE_NAME" 2>/dev/null || true
         else
