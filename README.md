@@ -8,10 +8,10 @@ proxy-unifi ships **two cores** — [xray-core](https://github.com/XTLS/Xray-cor
 one for each link you import. Both terminate the **same** WireGuard tunnel, so the
 UniFi UI only ever needs **one** VPN Client entry.
 
-UniFi gateways have no built-in proxy support and can't dial a `vless://` /
-`trojan://` / `ss://` / `hysteria2://` / `tuic://` server. proxy-unifi bridges that
-gap **without** patching UniFi OS or adding a custom WAN: it presents the proxy to
-UniFi as an ordinary **WireGuard VPN Client**, which the controller already knows
+UniFi gateways have no built-in outbound proxy support and can't dial any proxy protocol server's links (`vless://` /
+`trojan://` / `ss://` / `hysteria2://` / `tuic://`). proxy-unifi bridges that
+gap **without** altering UniFi OS packages: it presents the proxy to
+UniFi as an ordinary, natively supported **WireGuard VPN Client**, which the controller already knows
 how to route. It is headless, SSH-only (no web UI), and persists across reboots and
 firmware upgrades via [unifi-common](https://github.com/unifi-utilities/unifi-common).
 
