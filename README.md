@@ -125,9 +125,19 @@ autostart, update cores, update geo files, and uninstall.
 ## Persistence
 
 Everything lives under **`/data/proxy-unifi`**, which UniFi OS preserves across
-reboots and firmware upgrades. A boot hook at `/data/on_boot.d/15-proxy-unifi.sh`
+reboots and most firmware upgrades. A boot hook at `/data/on_boot.d/15-proxy-unifi.sh`
 re-creates the `proxy` command and the systemd service (with the correct engine) on
-every boot, so a firmware upgrade does not break the install.
+every boot.
+
+## Update
+
+To update client functionality (pull files from GitHub), simply run the script again:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/main/install.sh | sh
+```
+
+Re-running the installer only overwrites `bin/` (script + binaries) and the `systemd` unit. Your WireGuard keys, added proxy link and client settings (DNS, MTU) persist — the UniFi WireGuard client keeps working without any changes required.
 
 ## Uninstall
 
