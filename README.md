@@ -142,9 +142,7 @@ Then delete the WireGuard VPN Client in the UniFi UI.
 
 ## Credits
 
-Persistence model inspired by
-[SierraSoftworks/tailscale-unifi](https://github.com/SierraSoftworks/tailscale-unifi)
-and built on [unifi-utilities/unifi-common](https://github.com/unifi-utilities/unifi-common).
+Persistence model built on [unifi-utilities/unifi-common](https://github.com/unifi-utilities/unifi-common).
 Powered by [XTLS/Xray-core](https://github.com/XTLS/Xray-core) and
 [SagerNet/sing-box](https://github.com/SagerNet/sing-box).
 
