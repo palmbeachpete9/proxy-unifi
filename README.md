@@ -71,12 +71,10 @@ This package is compatible with UniFi OS 4.x or newer and is known to work on th
 | UniFi Express 7 | `UX7` |
 | UniFi Enterprise Fortress Gateway | `EFG` |
 
-**Important notice:**
-Some UniFi OS updates (i.e. UniFi OS 5.1.12 that introduced several CVE patches) may completely wipe the script & its data from onboard memory. Keep your proxy link saved for cases like that, and reinstall proxy-unifi.
+> **Note:** Some UniFi OS updates (i.e. UniFi OS 5.1.12 that introduced several CVE patches) may completely wipe the script & its data from onboard memory. 
+> Keep your proxy link saved for cases like that, and reinstall proxy-unifi.
 
-## Proxy engines & protocol selection
-
-The engine is chosen automatically based on the imported link:
+The proxy engine is chosen automatically based on the imported link:
 
 | Protocol | Engine |
 |---|---|
@@ -90,8 +88,7 @@ The engine is chosen automatically based on the imported link:
 | TUIC | sing-box |
 
 Only one core runs at a time. Both use the **same** WireGuard keys/port, so the
-single UniFi VPN Client entry works no matter which core is active — switching links
-never requires re-pasting anything in UniFi.
+single UniFi VPN Client entry works no matter which core is active.
 
 > **Note:** xray binds the WireGuard port on loopback (`127.0.0.1:51821`);
 > sing-box binds it on all interfaces (it has no listen-address option). This is
@@ -109,6 +106,7 @@ Run `proxy` for the interactive menu, or use the direct commands:
 | `proxy start` · `stop` · `restart` | Service controls |
 | `proxy logs [args]` | Service logs (passed to `journalctl`) |
 | `proxy help` | Show help |
+| `proxy update` | Updates engine binaries (xray + sing-box) and geo files |
 
 The menu covers: import/replace link, UniFi WireGuard config,
 regenerate keys, change port/MTU/DNS, ping test + protocol, enable/disable
