@@ -8,10 +8,9 @@ proxy-unifi ships **two cores** — [xray-core](https://github.com/XTLS/Xray-cor
 one for each link you import. Both terminate the **same** WireGuard tunnel, so the
 UniFi UI only ever needs **one** VPN Client entry.
 
-UniFi gateways have no built-in outbound proxy support and can't dial any proxy protocol server's links (`vless://` /
-`trojan://` / `ss://` / `hysteria2://` / `tuic://`). proxy-unifi bridges that
-gap **without** altering UniFi OS packages: it presents the proxy to
-UniFi as an ordinary, natively supported **WireGuard VPN Client**, which the controller already knows
+UniFi gateways have no built-in outbound proxy support and can't dial any proxy protocol server's links (`vless://`, `hysteria2://`, ...).
+proxy-unifi bridges that gap **without** altering UniFi OS packages: it presents the proxy to
+UniFi as a natively supported **WireGuard VPN Client**, which the controller already knows
 how to route. It is headless, SSH-only (no web UI), and persists across reboots and
 firmware upgrades via [unifi-common](https://github.com/unifi-utilities/unifi-common).
 
@@ -23,19 +22,17 @@ SSH into your gateway as `root` and run:
 curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/main/install.sh | sh
 ```
 
-Then run `proxy` for the management menu:
+After the script finishes the installation, run `proxy` for the management menu:
 
-1. **Import / replace proxy link** — paste your `vless://` / `vmess://` /
-   `trojan://` / `ss://` / `hysteria2://` / `tuic://` link.
-2. **Show UniFi WireGuard VPN Client config** — copy the printed settings into a
-   `.conf` file and upload it at
-   `unifi.ui.com → Settings → VPN → VPN Client → Create New → WireGuard`
-   (or enter the fields manually).
-3. In **Policy Engine → Policy Table**, create a Traffic Route that sends your
-   chosen VLAN/clients through that VPN Client.
+1. **Import / replace proxy link** — paste your link (i.e.: `vless://`). Currently, only single-server links are supported! Subscriptions links are unsupported, planned to be in the future.
 
-You apply the WireGuard config in UniFi **once** — it stays valid even when you
-switch between links/engines later.
+2. **Copy the shown WireGuard VPN Client config** — create a `.conf` file locally on your computer and upload it at:
+
+   `unifi.ui.com → Your gateway -> Settings → VPN → VPN Client → Create New → WireGuard`
+
+3. Finally, use **Policy Engine** to create any traffic routes you desire, utilising native Ubiquiti functionality - VLAN / Device / IP / Domain / Region routing.
+
+The created `.conf` file & Ubiquiti WireGuard config is persistent for the entire script's life. Swapping proxy links or protocols from one to another does **not** change it, making it easier to maintain.
 
 ## How it works
 
@@ -48,7 +45,7 @@ switch between links/engines later.
   │                              │  terminates the tunnel, then routes          │
   │                              ▼  proxy outbound (your imported link)          │
   └──────────────────────────────┼─────────────────────────────────────────────┘
-                                  ▼  out the normal WAN
+                                 ▼  out the normal WAN
                             your proxy / VPN server ──▶ Internet
 ```
 
@@ -56,38 +53,49 @@ The gateway's own WireGuard VPN Client does a real WireGuard handshake with the
 active core over loopback. The core terminates the tunnel and forwards everything
 out through the proxy server from your link. No remote WireGuard server is required.
 
-## Engines & protocol selection
+## Compatibility
 
-The engine is chosen automatically from the imported link:
-
-| Link | Engine |
+This package is compatible with UniFi OS 4.x or newer and is known to work on the following UniFi devices:
+| Model | Code |
 |---|---|
-| `vless://`, `vmess://`, `trojan://`, plain `ss://` | **xray-core** |
-| `ss://` with `obfs-local`/`simple-obfs`/`v2ray-plugin` | **sing-box** (plugin in-process — no external binary) |
-| `hysteria2://` / `hy2://`, `tuic://` | **sing-box** |
-| `ss://` with any *other* SIP003 plugin | **xray-core** (external plugin binary, see below) |
+| UniFi Cloud Gateway Ultra | `UCG-Ultra` |
+| UniFi Cloud Gateway Max | `UCG-Max` |
+| UniFi Cloud Gateway Fiber | `UCG-Fiber` |
+| UniFi Dream Router | `UDR` |
+| UniFi Dream Router 7 | `UDR7` |
+| UniFi Dream Machine | `UDM` |
+| UniFi Dream Machine Pro | `UDM-Pro` |
+| UniFi Dream Machine SE | `UDM-SE` |
+| UniFi Dream Machine Pro Max | `UDM-Pro-Max` |
+| UniFi Express | `UX` |
+| UniFi Express 7 | `UX7` |
+| UniFi Enterprise Fortress Gateway | `EFG` |
+
+**Important notice:**
+Some UniFi OS updates (i.e. UniFi OS 5.1.12 that introduced several CVE patches) may completely wipe the script & its data from onboard memory. Keep your proxy link saved for cases like that.
+
+## Proxy engines & protocol selection
+
+The engine is chosen automatically based on the imported link:
+
+| Protocol | Engine |
+|---|---|
+| VLESS | xray-core |
+| VMess | xray-core |
+| Trojan | xray-core |
+| Shadowsocks — plain, AEAD + 2022 ciphers | xray-core |
+| Shadowsocks + SIP003 plugin: obfs-local / simple-obfs | sing-box |
+| Shadowsocks + SIP003 plugin: v2ray-plugin | sing-box |
+| Hysteria2 | sing-box |
+| TUIC | sing-box |
 
 Only one core runs at a time. Both use the **same** WireGuard keys/port, so the
 single UniFi VPN Client entry works no matter which core is active — switching links
 never requires re-pasting anything in UniFi.
 
-> **Bind note:** xray binds the WireGuard port on loopback (`127.0.0.1:51821`);
+> **Note:** xray binds the WireGuard port on loopback (`127.0.0.1:51821`);
 > sing-box binds it on all interfaces (it has no listen-address option). This is
-> harmless — WireGuard only ever answers the one configured peer key — but it is a
-> difference worth knowing.
-
-## Supported links
-
-- **VLESS** (`vless://`) — UUID, `encryption`, `flow` (e.g. `xtls-rprx-vision`).
-- **VMess** (`vmess://`) — standard base64-JSON share link.
-- **Trojan** (`trojan://`) — password auth, TLS by default.
-- **Shadowsocks** (`ss://`) — SIP002 and legacy base64; AEAD and 2022 ciphers.
-  SIP003 `obfs-local`/`simple-obfs`/`v2ray-plugin` run natively via sing-box.
-- **Hysteria2** (`hysteria2://` / `hy2://`) and **TUIC** (`tuic://`) — via sing-box.
-
-For VLESS / VMess / Trojan: security `none` / `tls` / `reality` (`sni`, `fp`,
-`alpn`, `pbk`, `sid`, `spx`, `allowInsecure`) and transports `tcp` (incl.
-`headerType=http`), `ws`, `httpupgrade`, `http`/`h2`, `grpc`, `xhttp`, `kcp`, `quic`.
+> still secure — WireGuard only ever answers the one configured peer key.
 
 ## Usage
 
@@ -95,14 +103,14 @@ Run `proxy` for the interactive menu, or use the direct commands:
 
 | Command | Description |
 |---|---|
-| `proxy` | Interactive management menu |
+| `proxy` | Main management menu |
 | `proxy status` | Engine, configured server, and listener status |
 | `proxy ping [proto]` | Test the link — `proto` = `get`·`head`·`tcp`·`icmp` (default `get`) |
 | `proxy start` · `stop` · `restart` | Control the service |
 | `proxy logs [args]` | Tail service logs (passed to `journalctl`) |
 | `proxy help` | Show help |
 
-The menu also covers: import/replace link, show the UniFi WireGuard config,
+The menu covers: import/replace link, UniFi WireGuard config,
 regenerate keys, change port/MTU/DNS, ping test + protocol, enable/disable
 autostart, update cores, update geo files, and uninstall.
 
