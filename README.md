@@ -84,8 +84,8 @@ The engine is chosen automatically based on the imported link:
 | VMess | xray-core |
 | Trojan | xray-core |
 | Shadowsocks — plain, AEAD + 2022 ciphers | xray-core |
-| Shadowsocks + SIP003 plugin: obfs-local / simple-obfs | sing-box |
-| Shadowsocks + SIP003 plugin: v2ray-plugin | sing-box |
+| Shadowsocks + obfs-local / simple-obfs | sing-box |
+| Shadowsocks + v2ray-plugin | sing-box |
 | Hysteria2 | sing-box |
 | TUIC | sing-box |
 
