@@ -49,6 +49,15 @@ def qg(q, *names, default=""):
     return default
 
 
+def host_port(u):
+    """(hostname, port) from a urlsplit result, dying cleanly on a bad port
+    (urlsplit raises ValueError instead of returning None for non-numeric ports)."""
+    try:
+        return u.hostname, u.port
+    except ValueError:
+        die("invalid port in link (must be 1-65535)")
+
+
 def _truthy(v):
     return str(v).lower() in ("1", "true", "yes")
 
@@ -79,7 +88,7 @@ def plugin_alias(name):
 # --------------------------------------------------------------------------
 def parse_ss(link):
     u = urlsplit(link)
-    host, port = u.hostname, u.port
+    host, port = host_port(u)
     method = password = None
     if u.username is not None and host and port:
         if u.password is not None:
@@ -112,7 +121,7 @@ def parse_ss(link):
 
 def parse_hysteria2(link):
     u = urlsplit(link)
-    host, port = u.hostname, u.port
+    host, port = host_port(u)
     auth = unquote(u.username or "")
     if u.password:                       # hysteria2://user:pass@ -> password is after ':'
         auth = auth + ":" + unquote(u.password) if auth else unquote(u.password)
@@ -130,7 +139,7 @@ def parse_hysteria2(link):
 
 def parse_tuic(link):
     u = urlsplit(link)
-    host, port = u.hostname, u.port
+    host, port = host_port(u)
     uuid = unquote(u.username or "")
     password = unquote(u.password or "")
     if not uuid or not host or not port:

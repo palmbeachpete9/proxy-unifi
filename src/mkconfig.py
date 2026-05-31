@@ -42,6 +42,16 @@ def _b64decode_any(s):
     return None
 
 
+def host_port(u):
+    """(hostname, port) from a urlsplit result. urlsplit raises ValueError for a
+    non-numeric/out-of-range port instead of returning None, so catch it and die
+    cleanly rather than letting a traceback escape."""
+    try:
+        return u.hostname, u.port
+    except ValueError:
+        die("invalid port in link (must be 1-65535)")
+
+
 def flat_query(u):
     raw = parse_qs(u.query, keep_blank_values=True)
     return {k: v[0] for k, v in raw.items()}
@@ -154,7 +164,7 @@ def build_stream(q, security, net, host):
 def parse_vless(link):
     u = urlsplit(link)
     uuid = unquote(u.username or "")
-    host, port = u.hostname, u.port
+    host, port = host_port(u)
     if not uuid:
         die("vless link is missing the UUID")
     if not host or not port:
@@ -182,7 +192,7 @@ def parse_vless(link):
 def parse_trojan(link):
     u = urlsplit(link)
     password = unquote(u.username or "")
-    host, port = u.hostname, u.port
+    host, port = host_port(u)
     if not password:
         die("trojan link is missing the password")
     if not host or not port:
@@ -209,7 +219,7 @@ def parse_trojan(link):
 def _ss_creds(link):
     """Decode (method, password, host, port) from an ss:// link (no plugin logic)."""
     u = urlsplit(link)
-    host, port = u.hostname, u.port
+    host, port = host_port(u)
     method = password = None
 
     # SIP002: ss://base64(method:password)@host:port  (or plain method:password)
