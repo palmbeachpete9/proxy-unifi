@@ -31,11 +31,6 @@ def _b64_pad(s):
     return s + "=" * (-len(s) % 4)
 
 
-# Loopback port where a SIP003 plugin (if any) listens; xray's Shadowsocks
-# outbound dials this, and the plugin forwards (obfuscated) to the real server.
-SIP003_LOCAL_PORT = 29900
-
-
 def _b64decode_any(s):
     """Decode url-safe or standard base64, with or without padding."""
     s = s.strip()
@@ -240,35 +235,25 @@ def _ss_creds(link):
     return method, password, host, int(port)
 
 
-def ss_plugin_info(link):
-    """Return SIP003 plugin spec for an ss:// link, or None if it has no plugin."""
+def ss_plugin_name(link):
+    """Return the SIP003 plugin name for an ss:// link, or None if it has no plugin."""
     raw = qg(flat_query(urlsplit(link)), "plugin")
     if not raw:
         return None
     raw = unquote(raw)
-    if ";" in raw:
-        name, opts = raw.split(";", 1)   # 'name;opt1;opt2=...' -> name, SS_PLUGIN_OPTIONS
-    else:
-        name, opts = raw, ""
-    _, _, host, port = _ss_creds(link)
-    return {"name": name, "opts": opts, "host": host, "port": port, "local_port": SIP003_LOCAL_PORT}
+    return raw.split(";", 1)[0] if ";" in raw else raw
 
 
 def parse_ss(link):
     method, password, host, port = _ss_creds(link)
-    plug = ss_plugin_info(link)
-    # With a SIP003 plugin, xray talks to the local plugin listener, which forwards
-    # (obfuscated) to the real server. Without one, xray dials the server directly.
-    if plug:
-        addr, oport = "127.0.0.1", SIP003_LOCAL_PORT
-    else:
-        addr, oport = host, port
-
+    # SIP003-plugin Shadowsocks is handled by sing-box, never by xray.
+    if ss_plugin_name(link):
+        die("shadowsocks SIP003 plugin links are handled by sing-box, not xray")
     outbound = {
         "tag": "proxy",
         "protocol": "shadowsocks",
         "settings": {
-            "servers": [{"address": addr, "port": oport, "method": method, "password": password}]
+            "servers": [{"address": host, "port": port, "method": method, "password": password}]
         },
     }
     return outbound, host, port
@@ -424,20 +409,19 @@ def main():
     ap.add_argument("--socks-port", type=int, default=0, help="emit a SOCKS test config on this port instead")
     ap.add_argument("--print-server", action="store_true", help="print 'host<TAB>port' of the server and exit")
     ap.add_argument("--print-plugin", action="store_true",
-                    help="print 'name<TAB>opts<TAB>host<TAB>port<TAB>localport' for an ss:// SIP003 plugin, else nothing")
+                    help="print the SIP003 plugin name for an ss:// link, else nothing")
     args = ap.parse_args()
+
+    if args.print_plugin:
+        if args.link.strip().lower().startswith("ss://"):
+            name = ss_plugin_name(args.link)
+            if name:
+                sys.stdout.write("%s\n" % name)
+        return
 
     if args.print_server:
         _, host, port = parse_link(args.link)
         sys.stdout.write("%s\t%s\n" % (host, port))
-        return
-
-    if args.print_plugin:
-        if args.link.strip().lower().startswith("ss://"):
-            info = ss_plugin_info(args.link)
-            if info:
-                sys.stdout.write("%s\t%s\t%s\t%s\t%s\n" % (
-                    info["name"], info["opts"], info["host"], info["port"], info["local_port"]))
         return
 
     if args.socks_port:

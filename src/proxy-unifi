@@ -30,16 +30,13 @@ SERVICE_NAME="proxy-unifi"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 ONBOOT_DST="/data/on_boot.d/15-proxy-unifi.sh"
 
-# SIP003 plugin support (Shadowsocks)
-PLUGINS_DIR="$ROOT/plugins"
-PLUGIN_ENV="$ETC_DIR/plugin.env"            # systemd EnvironmentFile (SS_* vars); present => plugin active
-PLUGIN_BIN_FILE="$ETC_DIR/plugin.bin"       # one line: absolute path to the plugin binary
+# Legacy SIP003 plugin unit (from when xray ran external plugins). Kept only so
+# uninstall / migration can clean up any leftovers on older installs.
 PLUGIN_SERVICE_NAME="proxy-unifi-plugin"
 PLUGIN_SERVICE_FILE="/etc/systemd/system/${PLUGIN_SERVICE_NAME}.service"
 
 XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/latest/download"
 GEO_BASE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
-V2RAY_PLUGIN_RELEASES="https://github.com/shadowsocks/v2ray-plugin/releases"
 SINGBOX_RELEASES="https://github.com/SagerNet/sing-box/releases"
 
 # defaults (overridable via settings.env)
@@ -150,57 +147,6 @@ arch_slug() {
     esac
 }
 
-# Go-style arch slug used by v2ray-plugin / most SIP003 plugin releases.
-plugin_arch() {
-    case "$(uname -m)" in
-        aarch64|arm64) echo "arm64" ;;
-        x86_64|amd64)  echo "amd64" ;;
-        armv7l|armhf)  echo "arm" ;;
-        *) fatal "unsupported architecture: $(uname -m)" ;;
-    esac
-}
-
-# Map a SIP003 plugin name (as it appears in the link) to its binary filename.
-plugin_binfile() {
-    case "$1" in
-        simple-obfs|obfs-local) echo "obfs-local" ;;
-        v2ray-plugin)           echo "v2ray-plugin" ;;
-        *)                      echo "$1" ;;   # generic: binary named exactly as the plugin
-    esac
-}
-
-# Download the v2ray-plugin binary into $PLUGINS_DIR (latest release, arch-matched).
-cmd_install_plugins() {
-    mkdir -p "$PLUGINS_DIR"
-    _pa="$(plugin_arch)"
-    _tag="$(curl -fsSLI "$V2RAY_PLUGIN_RELEASES/latest" 2>/dev/null | tr -d '\r' \
-            | awk -F'/tag/' 'tolower($0) ~ /^location:/ {print $2}' | tail -1)"
-    [ -n "$_tag" ] || _tag="v1.3.2"   # fallback pin if the redirect can't be read
-    _url="$V2RAY_PLUGIN_RELEASES/download/${_tag}/v2ray-plugin-linux-${_pa}-${_tag}.tar.gz"
-    _tmp="$(mktemp -d)"
-    info "downloading v2ray-plugin ${_tag} (${_pa}) ..."
-    if have curl; then
-        curl -fsSL "$_url" -o "$_tmp/p.tgz" || { rm -rf "$_tmp"; err "v2ray-plugin download failed"; return 1; }
-    elif have wget; then
-        wget -qO "$_tmp/p.tgz" "$_url" || { rm -rf "$_tmp"; err "v2ray-plugin download failed"; return 1; }
-    else
-        rm -rf "$_tmp"; err "need curl or wget to download v2ray-plugin"; return 1
-    fi
-    if have tar; then
-        tar xzf "$_tmp/p.tgz" -C "$_tmp" || { rm -rf "$_tmp"; err "could not extract v2ray-plugin"; return 1; }
-    else
-        rm -rf "$_tmp"; err "need tar to extract v2ray-plugin"; return 1
-    fi
-    if [ -f "$_tmp/v2ray-plugin_linux_${_pa}" ]; then
-        install -m 0755 "$_tmp/v2ray-plugin_linux_${_pa}" "$PLUGINS_DIR/v2ray-plugin.new"
-        mv -f "$PLUGINS_DIR/v2ray-plugin.new" "$PLUGINS_DIR/v2ray-plugin"
-        c_grn "v2ray-plugin installed."
-    else
-        rm -rf "$_tmp"; err "v2ray-plugin archive layout unexpected"; return 1
-    fi
-    rm -rf "$_tmp"
-}
-
 # --------------------------------------------------------------------------
 # Engine selection (xray vs sing-box)
 # --------------------------------------------------------------------------
@@ -214,7 +160,7 @@ engine_for_link() {
             if [ -z "$_pn" ]; then echo xray; return; fi   # plain SS -> xray
             case "$_pn" in
                 obfs-local|simple-obfs|v2ray-plugin) echo singbox ;;  # sing-box runs these in-process
-                *) echo xray ;;                                      # exotic plugin -> xray external runner
+                *) echo "" ;;                                        # other SIP003 plugins: unsupported
             esac
             return ;;
     esac
@@ -311,10 +257,8 @@ cmd_install_binary() {
     if [ -f "$tmp/geosite.dat" ]; then install -m 0644 "$tmp/geosite.dat" "$BIN_DIR/geosite.dat"; fi
     rm -rf "$tmp"
     c_grn "xray-core installed: $("$XRAY" version 2>/dev/null | head -1)"
-    # Pre-stage / refresh the v2ray-plugin SIP003 binary (best-effort).
-    cmd_install_plugins || c_ylw "v2ray-plugin not installed (continuing); install it later with: proxy update"
     # Pre-stage / refresh the sing-box engine (best-effort).
-    cmd_install_singbox || c_ylw "sing-box not installed (continuing); needed only for hysteria2/tuic/ss+plugin links"
+    cmd_install_singbox || c_ylw "sing-box not installed (continuing); needed only for ss+obfs/v2ray-plugin, hysteria2, tuic links"
 }
 
 write_service() {
@@ -324,12 +268,6 @@ write_service() {
     else
         _exec="$XRAY run -config $CONFIG"
     fi
-    # If a SIP003 plugin (xray external runner) is active, order xray after it.
-    _dep=""
-    if [ -f "$PLUGIN_ENV" ]; then
-        _dep="Requires=${PLUGIN_SERVICE_NAME}.service
-After=${PLUGIN_SERVICE_NAME}.service"
-    fi
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=proxy-unifi (WireGuard->proxy bridge)
@@ -337,7 +275,6 @@ After=network-online.target nss-lookup.target
 Wants=network-online.target
 # Don't crash-loop before a link has been imported.
 ConditionPathExists=$CONFIG
-$_dep
 
 [Service]
 Type=simple
@@ -352,92 +289,26 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
+    systemctl daemon-reload 2>/dev/null || true
 }
 
-write_plugin_service() {
-    _pbin="$(cat "$PLUGIN_BIN_FILE")"
-    cat > "$PLUGIN_SERVICE_FILE" <<EOF
-[Unit]
-Description=proxy-unifi SIP003 plugin
-After=network-online.target
-Wants=network-online.target
-ConditionPathExists=$PLUGIN_ENV
-
-[Service]
-Type=simple
-EnvironmentFile=$PLUGIN_ENV
-ExecStart=$_pbin
-Restart=on-failure
-RestartSec=3
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-# Reconcile the systemd units with the current plugin state (PLUGIN_ENV present?).
-apply_plugin_units() {
-    if [ -f "$PLUGIN_ENV" ] && [ -f "$PLUGIN_BIN_FILE" ]; then
-        write_plugin_service
-        write_service
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl enable "$PLUGIN_SERVICE_NAME" >/dev/null 2>&1 || true
-    else
+# Remove any leftover SIP003 plugin unit from older (external-plugin) installs.
+cleanup_legacy_plugin() {
+    if [ -f "$PLUGIN_SERVICE_FILE" ]; then
         systemctl disable --now "$PLUGIN_SERVICE_NAME" 2>/dev/null || true
         rm -f "$PLUGIN_SERVICE_FILE"
-        write_service
         systemctl daemon-reload 2>/dev/null || true
     fi
 }
 
 install_service() {
-    apply_plugin_units
+    cleanup_legacy_plugin
+    write_service
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
 }
 
 # Build + validate a config from the given link and, only on success, swap it
 # into place. Never mutates stored state (link.txt) on failure.
-# Detect a SIP003 plugin in the link and verify its binary is available.
-# Sets PLG_* globals (PLG_ACTIVE=1/0). Fatals if a required plugin binary is missing.
-_plugin_detect() {
-    PLG_ACTIVE=0
-    _spec="$(py "$MKCONFIG" --link "$1" --print-plugin 2>/dev/null || true)"
-    [ -n "$_spec" ] || return 0
-    PLG_NAME="$(printf '%s' "$_spec" | cut -f1)"
-    PLG_OPTS="$(printf '%s' "$_spec" | cut -f2)"
-    PLG_HOST="$(printf '%s' "$_spec" | cut -f3)"
-    PLG_PORT="$(printf '%s' "$_spec" | cut -f4)"
-    PLG_LPORT="$(printf '%s' "$_spec" | cut -f5)"
-    _bf="$(plugin_binfile "$PLG_NAME")"
-    PLG_BIN="$PLUGINS_DIR/$_bf"
-    if [ ! -x "$PLG_BIN" ] && [ "$_bf" = "v2ray-plugin" ]; then
-        cmd_install_plugins || true
-    fi
-    [ -x "$PLG_BIN" ] || fatal "SIP003 plugin '$PLG_NAME' is not installed. Place its binary at: $PLG_BIN"
-    PLG_ACTIVE=1
-}
-
-# Commit plugin state to disk (EnvironmentFile + bin path) and reconcile units.
-_plugin_commit() {
-    if [ "${PLG_ACTIVE:-0}" = "1" ]; then
-        mkdir -p "$ETC_DIR"
-        # systemd EnvironmentFile: literal KEY=VALUE, never shell-sourced -> injection-safe
-        {
-            printf 'SS_LOCAL_HOST=127.0.0.1\n'
-            printf 'SS_LOCAL_PORT=%s\n'  "$PLG_LPORT"
-            printf 'SS_REMOTE_HOST=%s\n' "$PLG_HOST"
-            printf 'SS_REMOTE_PORT=%s\n' "$PLG_PORT"
-            printf 'SS_PLUGIN_OPTIONS=%s\n' "$PLG_OPTS"
-        } > "$PLUGIN_ENV"
-        chmod 600 "$PLUGIN_ENV"
-        printf '%s' "$PLG_BIN" > "$PLUGIN_BIN_FILE"
-    else
-        rm -f "$PLUGIN_ENV" "$PLUGIN_BIN_FILE"
-    fi
-    apply_plugin_units
-}
-
 _build_config() {
     _bl="$1"
     ensure_keys
@@ -449,7 +320,6 @@ _build_config() {
     tmpcfg="$(mktemp)"
     if [ "$_eng" = "singbox" ]; then
         ensure_singbox
-        PLG_ACTIVE=0    # sing-box runs SIP003 plugins in-process; no external xray plugin
         py "$MKSB" \
             --link "$_bl" --port "$WG_PORT" \
             --secret-key "$wg_priv" --peer-pubkey "$unifi_pub" \
@@ -461,8 +331,6 @@ _build_config() {
             }
         fi
     else
-        # verify any (exotic) SIP003 plugin binary BEFORE mutating anything
-        _plugin_detect "$_bl"
         # optional --dns, injected via positional params so it stays properly quoted
         set --
         [ -n "$INNER_DNS" ] && set -- --dns "$INNER_DNS"
@@ -488,7 +356,8 @@ _build_config() {
     mv "$tmpcfg" "$CONFIG"
     chmod 600 "$CONFIG"
     printf '%s' "$_eng" > "$ENGINE_FILE"
-    _plugin_commit
+    # Refresh the systemd unit so ExecStart matches the (possibly changed) engine.
+    [ -f "$SERVICE_FILE" ] && write_service || true
 }
 
 regen_config() {
@@ -573,10 +442,6 @@ cmd_status() {
         if [ -x "$XRAY" ]; then echo "core:      $("$XRAY" version 2>/dev/null | head -1)"; else echo "core:      xray not installed"; fi
     fi
     echo "server:    $(current_server)"
-    if [ -f "$PLUGIN_ENV" ] && [ -f "$PLUGIN_BIN_FILE" ]; then
-        pst="$(systemctl is-active "$PLUGIN_SERVICE_NAME" 2>/dev/null || true)"
-        echo "plugin:    $(basename "$(cat "$PLUGIN_BIN_FILE")") (${pst:-unknown})"
-    fi
     echo "wg listen: ${WG_LISTEN}:${WG_PORT}  mtu=${WG_MTU}"
     if have ss; then
         if ss -lun 2>/dev/null | grep -q ":${WG_PORT}\b"; then c_grn "udp/${WG_PORT}: listening"; else c_ylw "udp/${WG_PORT}: not listening"; fi
