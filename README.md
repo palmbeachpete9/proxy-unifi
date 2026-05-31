@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/main/ins
 
 After the script finishes the installation, run `proxy` for the management menu:
 
-1. **Import / replace proxy link** — paste your link (i.e.: `vless://`). Currently, only single-server links are supported! Subscriptions links are unsupported, planned to be in the future.
+1. **Import / replace proxy link** — paste your link (i.e.: `vless://`). Currently, only single-server links are supported! Subscription links are unsupported, planned to be in the future.
 
 2. **Copy the shown WireGuard VPN Client config** — create a `.conf` file locally on your computer and upload it at:
 
@@ -72,7 +72,7 @@ This package is compatible with UniFi OS 4.x or newer and is known to work on th
 | UniFi Enterprise Fortress Gateway | `EFG` |
 
 **Important notice:**
-Some UniFi OS updates (i.e. UniFi OS 5.1.12 that introduced several CVE patches) may completely wipe the script & its data from onboard memory. Keep your proxy link saved for cases like that.
+Some UniFi OS updates (i.e. UniFi OS 5.1.12 that introduced several CVE patches) may completely wipe the script & its data from onboard memory. Keep your proxy link saved for cases like that, and reinstall proxy-unifi.
 
 ## Proxy engines & protocol selection
 
@@ -103,38 +103,26 @@ Run `proxy` for the interactive menu, or use the direct commands:
 
 | Command | Description |
 |---|---|
-| `proxy` | Main management menu |
+| `proxy` | Main menu |
 | `proxy status` | Engine, configured server, and listener status |
-| `proxy ping [proto]` | Test the link — `proto` = `get`·`head`·`tcp`·`icmp` (default `get`) |
-| `proxy start` · `stop` · `restart` | Control the service |
-| `proxy logs [args]` | Tail service logs (passed to `journalctl`) |
+| `proxy ping [...]` | Test the link — `...` = `get`·`head`·`tcp`·`icmp` (default `get`) |
+| `proxy start` · `stop` · `restart` | Service controls |
+| `proxy logs [args]` | Service logs (passed to `journalctl`) |
 | `proxy help` | Show help |
 
 The menu covers: import/replace link, UniFi WireGuard config,
 regenerate keys, change port/MTU/DNS, ping test + protocol, enable/disable
 autostart, update cores, update geo files, and uninstall.
 
-### Testing the link (`proxy ping`)
-
-`proxy ping` checks the server with a 5 s timeout and prints latency (or `timeout`).
-`get`/`head` measure the real round trip **through the tunnel** (via a throwaway
-loopback SOCKS instance on the active engine); `tcp`/`icmp` hit the server directly.
-
-## Notes & caveats
+## Notes
 
 - **SSH-only management:** there is no web UI and no LAN-facing management port —
   manage it over SSH with `proxy`.
 - **Loopback endpoint:** the UniFi WireGuard VPN Client points at `127.0.0.1:51821`.
   If the UI rejects a loopback endpoint, set `WG_LISTEN` in
   `/data/proxy-unifi/etc/settings.env` to a routable local address and re-import.
-- **MTU** defaults to `1340` (`proxy set mtu 1280` if large transfers stall);
+- **MTU** defaults to `1340` (Change via main menu if large transfers stall);
   **DNS** defaults to `8.8.8.8`.
-- **Routing granularity:** the core sees decrypted IP packets, so do per-client /
-  per-VLAN selection in the UniFi Policy Table; the core just forwards everything
-  out the proxy outbound.
-- **SS + exotic SIP003 plugin** (not obfs/v2ray-plugin): handled by xray with a
-  supervised external plugin process. The binary must be placed in
-  `/data/proxy-unifi/plugins/` (e.g. a self-built `obfs-local` for arm64).
 
 ## Persistence
 
