@@ -37,13 +37,13 @@ The created `.conf` file & Ubiquiti WireGuard config is persistent for the entir
 ## How it works
 
 ```
-  ┌─────────────────────────── UniFi Cloud Gateway ───────────────────────────┐
-  │  VLAN client ─▶ Policy Table route ─▶ WireGuard VPN Client (native UniFi)   │
-  │                              │ encrypted WireGuard over loopback            │
-  │                              ▼  udp 127.0.0.1:51821                          │
-  │                  xray-core  OR  sing-box  (WireGuard inbound)               │
-  │                              │  terminates the tunnel, then routes          │
-  │                              ▼  proxy outbound (your imported link)          │
+  ┌─────────────────────────── UniFi Cloud Gateway ────────────────────────────┐
+  │  VLAN client ─▶ Policy Table route ─▶ WireGuard VPN Client (native UniFi)  │
+  │                              │ encrypted WireGuard over loopback           │
+  │                              ▼  udp 127.0.0.1:51821                        │
+  │                  xray-core  OR  sing-box  (WireGuard inbound)              │
+  │                              │  terminates the tunnel, then routes         │
+  │                              ▼  proxy outbound (your imported link)        │
   └──────────────────────────────┼─────────────────────────────────────────────┘
                                  ▼  out the normal WAN
                             your proxy / VPN server ──▶ Internet
