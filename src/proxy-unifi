@@ -21,7 +21,10 @@ XRAY="$BIN_DIR/xray"
 SBIN="$BIN_DIR/sing-box"
 CONFIG="$ETC_DIR/config.json"
 OUTBOUND_LINK="$ETC_DIR/link.txt"
-ENGINE_FILE="$ETC_DIR/engine"               # active engine: "xray" or "singbox"
+POOL_DIR="$ETC_DIR/pool"                    # xray -confdir dir for a JSON balancer profile
+POOL_SRC="$ETC_DIR/pool.json"               # the imported provider profile (verbatim source)
+ENGINE_FILE="$ETC_DIR/engine"               # active engine: "xray" / "singbox" / "xraypool"
+MKJSON="$BIN_DIR/mkjson.py"
 AUTOSTART_FILE="$ETC_DIR/autostart"         # "enabled" / "disabled" (persisted across boots)
 SETTINGS="$ETC_DIR/settings.env"
 MKCONFIG="$BIN_DIR/mkconfig.py"
@@ -200,13 +203,15 @@ engine_for_link() {
 }
 
 current_engine() {
-    # Trust the engine marker only if it is exactly "xray" or "singbox"; otherwise
-    # infer from the imported link (an empty/corrupt marker must not default to the
+    # Trust the engine marker only if it is one of the known values; otherwise
+    # infer from on-disk state (an empty/corrupt marker must not default to the
     # wrong core, e.g. running a hysteria2 link under xray).
     _ce="$(cat "$ENGINE_FILE" 2>/dev/null || true)"
     case "$_ce" in
-        xray|singbox) echo "$_ce"; return ;;
+        xray|singbox|xraypool) echo "$_ce"; return ;;
     esac
+    # a pool dir present means we're in pool mode
+    if [ -f "$POOL_DIR/99-overlay.json" ]; then echo xraypool; return; fi
     if [ -f "$OUTBOUND_LINK" ]; then
         _ce="$(engine_for_link "$(cat "$OUTBOUND_LINK")")"
         [ -n "$_ce" ] && { echo "$_ce"; return; }
@@ -324,20 +329,19 @@ cmd_install_binary() {
 
 write_service() {
     # ExecStart depends on the active engine. Prefer the recorded engine; if the
-    # engine file was lost (e.g. after a partial restore) fall back to inferring
-    # it from the imported link rather than blindly assuming xray.
-    if [ "$(current_engine)" = "singbox" ]; then
-        _exec="$SBIN run -c $CONFIG"
-    else
-        _exec="$XRAY run -config $CONFIG"
-    fi
+    # engine file was lost (e.g. after a partial restore) fall back to inferring it.
+    case "$(current_engine)" in
+        singbox)  _exec="$SBIN run -c $CONFIG";        _cond="$CONFIG" ;;
+        xraypool) _exec="$XRAY run -confdir $POOL_DIR"; _cond="$POOL_DIR/99-overlay.json" ;;
+        *)        _exec="$XRAY run -config $CONFIG";    _cond="$CONFIG" ;;
+    esac
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=proxy-unifi (WireGuard->proxy bridge)
 After=network-online.target nss-lookup.target
 Wants=network-online.target
-# Don't crash-loop before a link has been imported.
-ConditionPathExists=$CONFIG
+# Don't crash-loop before a link/profile has been imported.
+ConditionPathExists=$_cond
 
 [Service]
 Type=simple
@@ -432,8 +436,66 @@ PYEOF
 }
 
 regen_config() {
-    [ -f "$OUTBOUND_LINK" ] || fatal "no proxy link imported yet. Run 'proxy' and choose option 1."
-    _build_config "$(cat "$OUTBOUND_LINK")"
+    if [ -f "$POOL_SRC" ] && [ "$(current_engine)" = "xraypool" ]; then
+        _build_pool "$POOL_SRC"
+    else
+        [ -f "$OUTBOUND_LINK" ] || fatal "no proxy link imported yet. Run 'proxy' and choose option 1."
+        _build_config "$(cat "$OUTBOUND_LINK")"
+    fi
+}
+
+# Build + validate an Xray JSON *profile* (balancer/pool) into the -confdir POOL_DIR.
+# The provider JSON is kept verbatim (sanitized for platform paths) and a WG-inbound
+# overlay replaces its local entry by tag. Only swaps state in on a clean -test.
+_build_pool() {
+    _pf="$1"
+    [ -x "$XRAY" ] || fatal "xray-core is required for JSON balancer profiles"
+    ensure_keys
+    mkdir -p "$ETC_DIR" || fatal "could not create $ETC_DIR"
+    _stage="$(mktemp -d "$ETC_DIR/.pool.XXXXXX")" || fatal "could not create temp dir"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$_stage'" EXIT INT TERM HUP
+    py "$MKJSON" overlay --profile "$_pf" \
+        --out-provider "$_stage/01-provider.json" \
+        --out-overlay "$_stage/99-overlay.json" \
+        --port "$WG_PORT" \
+        --secret-key-file "$WG_DIR/wg_private.key" \
+        --peer-pubkey-file "$WG_DIR/unifi_public.key" \
+        --address "$XRAY_ADDR" --mtu "$WG_MTU" --loglevel "$LOGLEVEL" \
+        >/dev/null || fatal "could not build pool profile (unsupported or invalid JSON)"
+    "$XRAY" run -test -confdir "$_stage" >/dev/null 2>&1 \
+        || fatal "xray rejected the pool profile (-test failed)"
+    chmod 600 "$_stage"/*.json 2>/dev/null || true
+    # swap the whole pool dir in atomically
+    rm -rf "$POOL_DIR.old" 2>/dev/null || true
+    [ -d "$POOL_DIR" ] && mv "$POOL_DIR" "$POOL_DIR.old"
+    mv "$_stage" "$POOL_DIR" || { [ -d "$POOL_DIR.old" ] && mv "$POOL_DIR.old" "$POOL_DIR"; fatal "could not install pool dir"; }
+    rm -rf "$POOL_DIR.old" 2>/dev/null || true
+    trap - EXIT INT TERM HUP
+    printf 'xraypool' > "$ENGINE_FILE" || fatal "could not write engine marker"
+    # pool mode has no single config.json; clear a stale one so status is accurate
+    rm -f "$CONFIG" 2>/dev/null || true
+    [ -f "$SERVICE_FILE" ] && write_service || true
+}
+
+# Import a JSON balancer/pool profile from a file (or piped content already saved
+# to a temp file). $1 = path to the provider JSON.
+cmd_import_json() {
+    _src="$1"
+    [ -s "$_src" ] || fatal "empty profile"
+    load_settings
+    # build first; only commit POOL_SRC on success (never clobber a working setup)
+    _build_pool "$_src"
+    cp -f "$_src" "$POOL_SRC" || fatal "could not store profile"
+    chmod 600 "$POOL_SRC"
+    # a pool import supersedes any single link + subscription selection
+    rm -f "$OUTBOUND_LINK" 2>/dev/null || true
+    [ "${_FROM_SUB:-0}" = "1" ] || rm -f "$SUB_SELECTED" 2>/dev/null || true
+    save_settings
+    systemctl restart "$SERVICE_NAME" 2>/dev/null || systemctl start "$SERVICE_NAME" 2>/dev/null || true
+    c_grn "Imported balancer profile and applied."
+    echo
+    cmd_wg_config
 }
 
 cmd_import() {
@@ -450,6 +512,8 @@ cmd_import() {
     mkdir -p "$ETC_DIR"
     printf '%s' "$link" > "$OUTBOUND_LINK"
     chmod 600 "$OUTBOUND_LINK"
+    # a single-link import supersedes any active pool profile
+    rm -rf "$POOL_DIR" "$POOL_SRC" 2>/dev/null || true
     save_settings
     # A manual import detaches any subscription selection (so a later 'sub refresh'
     # won't think this hand-picked link came from the subscription). sub_select sets
@@ -659,6 +723,13 @@ _server_hp() {
 }
 
 current_server() {
+    # Pool mode has no single server: summarize the balancer instead.
+    if [ "$(current_engine)" = "xraypool" ] && [ -f "$POOL_SRC" ]; then
+        _pi="$(py "$MKJSON" info --profile "$POOL_SRC" 2>/dev/null)"
+        _m="$(printf '%s' "$_pi" | cut -f1)"; _s="$(printf '%s' "$_pi" | cut -f2)"
+        printf 'balancer pool (%s nodes, %s)\n' "${_m:-?}" "${_s:--}"
+        return
+    fi
     [ -f "$OUTBOUND_LINK" ] || { echo "(none imported)"; return; }
     hp="$(_server_hp)" || { echo "?"; return; }
     [ -n "$hp" ] || { echo "?"; return; }
@@ -919,6 +990,7 @@ menu_import() {
     echo "Import or replace connection link:"
     echo "  1. Paste a single proxy link (vless/vmess/trojan/ss/hysteria2/tuic)"
     echo "  2. Use a subscription (add / list / select / refresh)"
+    echo "  3. Import an Xray JSON balancer/pool profile (from a file)"
     echo "  0. Back"
     printf 'Choice: '
     read -r _c || true
@@ -927,9 +999,33 @@ menu_import() {
         1) printf 'Paste proxy link: '; read -r _l || true
            if [ -n "${_l:-}" ]; then cmd_import "$_l"; else c_ylw "No link entered."; fi ;;
         2) menu_sub ;;
+        3) menu_import_json ;;
         0|"") : ;;
         *) c_red "invalid choice" ;;
     esac
+}
+
+# Import a full Xray JSON profile (balancer / auto-select pool) from a file path.
+menu_import_json() {
+    echo "Provide the Xray JSON profile. Place the file on the gateway (e.g. via"
+    echo "scp) and enter its path, or paste the JSON and end with a line of just EOF."
+    printf 'File path (blank to paste instead): '
+    read -r _p || true
+    if [ -n "${_p:-}" ]; then
+        [ -f "$_p" ] || { c_red "no such file: $_p"; return; }
+        cmd_import_json "$_p"
+        return
+    fi
+    _tmp="$(mktemp "$ETC_DIR/.paste.XXXXXX")" || { c_red "could not create temp file"; return; }
+    # shellcheck disable=SC2064
+    trap "rm -f '$_tmp'" EXIT INT TERM HUP
+    echo "Paste JSON now; finish with a single line containing only: EOF"
+    while IFS= read -r _line; do
+        [ "$_line" = "EOF" ] && break
+        printf '%s\n' "$_line" >> "$_tmp"
+    done
+    if [ -s "$_tmp" ]; then cmd_import_json "$_tmp"; else c_ylw "Nothing pasted."; fi
+    rm -f "$_tmp"; trap - EXIT INT TERM HUP
 }
 
 # Interactive subscription submenu (wraps the cmd_sub actions).

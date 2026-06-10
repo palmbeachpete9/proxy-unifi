@@ -230,16 +230,16 @@ def process_body(raw, headers=None):
     if head[:1] == "<" or "<html" in head or "<!doctype" in head:
         die("the URL returned an HTML page, not a subscription")
     if head[:1] in ("{", "["):
-        die("the URL returned a JSON profile; only base64/plain link-list "
-            "subscriptions are supported")
+        die("the URL returned a JSON profile, not a link-list subscription. "
+            "Save it to a file and import it via 'JSON balancer/pool profile'")
     if "://" not in text:
         dec = _b64(text)
         if not dec or "://" not in dec:
             die("could not decode subscription (not a base64 / plain link list)")
         text = dec
         if dec.lstrip()[:1] in ("{", "["):
-            die("the URL returned a JSON profile; only base64/plain link-list "
-                "subscriptions are supported")
+            die("the URL returned a JSON profile, not a link-list subscription. "
+                "Save it to a file and import it via 'JSON balancer/pool profile'")
     nodes = []
     seen_ids = set()
     for i, line in enumerate(text.splitlines()):
