@@ -26,15 +26,14 @@ Stdlib only (Python 3.7+).
 import argparse
 import base64
 import hashlib
-import http.client
-import ipaddress
 import json
 import os
-import socket
-import ssl
 import sys
-import time
-from urllib.parse import urlsplit, urljoin, unquote
+from urllib.parse import urlsplit, unquote
+# Network-only modules (ssl, http.client, socket, ipaddress, time, urljoin) are
+# imported lazily inside fetch_url()/_https_get()/_public_ips(); the hot local
+# subcommands (render/get/find, used on every menu render) never touch the
+# network and so avoid that import cost.
 
 # ---- limits ---------------------------------------------------------------
 SCHEMA_VERSION = 2         # catalog format version (bump on incompatible change)
@@ -295,10 +294,21 @@ def _idna_host(host):
             die("subscription host is not a valid domain name")
 
 
+def _net():
+    """Import and return the network-only stdlib modules on first use, so the
+    purely-local subcommands never pay for them. Cached on the function object."""
+    if not hasattr(_net, "_m"):
+        import socket, ssl, http.client, ipaddress, time
+        from urllib.parse import urljoin
+        _net._m = (socket, ssl, http.client, ipaddress, time, urljoin)
+    return _net._m
+
+
 def _public_ips(host):
     """All validated public IPs for host (every resolved address), or die. A
     non-global/special-purpose address anywhere in the result set is rejected
     (CGNAT, private, loopback, link-local, reserved, multicast, etc.)."""
+    socket, _ssl, _hc, ipaddress, _t, _uj = _net()
     # PROXY_UNIFI_SUB_ALLOW_PRIVATE=1 disables the SSRF guard (tests only).
     allow_private = os.environ.get("PROXY_UNIFI_SUB_ALLOW_PRIVATE") == "1"
     try:
@@ -322,6 +332,7 @@ def _public_ips(host):
 
 
 def _remaining(deadline):
+    _s, _ssl, _hc, _ip, time, _uj = _net()
     r = deadline - time.monotonic()
     if r <= 0:
         die("subscription request exceeded the time budget")
@@ -332,6 +343,7 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
     """One HTTPS GET. Tries every validated address (mixed IPv4/IPv6 safe). Each
     blocking op uses the remaining overall budget. Returns
     (status, headers, body_or_None, redirect_location)."""
+    socket, ssl, http_client, ipaddress, _t, _uj = _net()
     u = urlsplit(url)
     if (u.scheme or "").lower() != "https":
         die("only https:// subscription URLs are allowed")
@@ -360,7 +372,7 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
 
     try:
         tls.settimeout(_remaining(deadline))
-        conn = http.client.HTTPConnection(sni, port, timeout=_remaining(deadline))
+        conn = http_client.HTTPConnection(sni, port, timeout=_remaining(deadline))
         conn.sock = tls
         path = u.path or "/"
         if u.query:
@@ -384,7 +396,7 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
                 conn.putheader(k, v)
             conn.endheaders()
             resp = conn.getresponse()
-        except (http.client.HTTPException, OSError) as e:
+        except (http_client.HTTPException, OSError) as e:
             die("HTTP request failed: %s" % e)
         status = resp.status
         rheaders = {k.lower(): v for k, v in resp.getheaders()}
@@ -400,7 +412,7 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
                 if not chunk:
                     break
                 body += chunk
-        except (http.client.HTTPException, OSError) as e:
+        except (http_client.HTTPException, OSError) as e:
             die("error reading subscription body: %s" % e)
         if len(body) > MAX_BYTES:
             die("subscription too large (> %d bytes)" % MAX_BYTES)
@@ -413,6 +425,7 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
 
 
 def fetch_url(url, hwid, ua):
+    _s, _ssl, _hc, _ip, time, urljoin = _net()
     deadline = time.monotonic() + DEADLINE
     try:
         origin = _norm_origin(urlsplit(url))
