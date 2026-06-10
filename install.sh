@@ -93,15 +93,31 @@ ensure_unifi_common() {
     have curl || { echo "curl required to bootstrap unifi-common" >&2; return 1; }
     curl -fsSL https://raw.githubusercontent.com/unifi-utilities/unifi-common/main/remote_install.sh | sh
 }
+# D19: fetch every script into a staging dir first, then promote each into the
+# live BIN_DIR with an atomic rename. An interrupted/failed download therefore
+# never leaves a half-written or mixed-version live install; the existing files
+# stay intact. Engine binaries (xray/sing-box) keep their own staged+rename logic.
 install_files() {
     mkdir -p "$BIN_DIR"
-    fetch "proxy-unifi" "$BIN_DIR/proxy-unifi" 0755
-    fetch "mkconfig.py" "$BIN_DIR/mkconfig.py" 0755
-    fetch "mksingbox.py" "$BIN_DIR/mksingbox.py" 0755
-    fetch "mksub.py" "$BIN_DIR/mksub.py" 0755
-    fetch "mkjson.py" "$BIN_DIR/mkjson.py" 0755
-    ln -sf "$BIN_DIR/proxy-unifi" /usr/bin/proxy
-    fetch "on_boot.sh" "$ONBOOT_DST" 0755
+    _stage="$(mktemp -d "$WORKDIR/stage.XXXXXX")" || { echo "could not stage" >&2; return 1; }
+    for f in proxy-unifi mkconfig.py mksingbox.py mksub.py mkjson.py on_boot.sh; do
+        fetch "$f" "$_stage/$f" 0755 || { echo "fetch failed: $f" >&2; return 1; }
+        [ -s "$_stage/$f" ] || { echo "empty file fetched: $f" >&2; return 1; }
+    done
+    # basic sanity: the main script must be a shell script
+    head -1 "$_stage/proxy-unifi" | grep -q '^#!/bin/sh' || { echo "fetched proxy-unifi looks wrong" >&2; return 1; }
+    # promote atomically
+    for f in proxy-unifi mkconfig.py mksingbox.py mksub.py mkjson.py; do
+        mv -f "$_stage/$f" "$BIN_DIR/$f" || return 1
+        chmod 0755 "$BIN_DIR/$f"
+    done
+    mv -f "$_stage/on_boot.sh" "$ONBOOT_DST" || return 1
+    chmod 0755 "$ONBOOT_DST"
+    # the safe symlink is (re)created by 'install-service'; create it here too for
+    # immediate use, but never clobber an unrelated /usr/bin/proxy.
+    if [ ! -e /usr/bin/proxy ] || { [ -L /usr/bin/proxy ] && [ "$(readlink /usr/bin/proxy 2>/dev/null)" = "$BIN_DIR/proxy-unifi" ]; }; then
+        ln -sf "$BIN_DIR/proxy-unifi" /usr/bin/proxy
+    fi
 }
 
 : > "$LOG" 2>/dev/null || true
