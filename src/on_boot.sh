@@ -13,13 +13,13 @@ CLI="$ROOT/bin/proxy-unifi"
 # nothing to do if the package isn't installed
 [ -x "$CLI" ] || exit 0
 
-# expose the management CLI as `proxy` on PATH (re-created each boot, /usr is ephemeral)
-ln -sf "$CLI" /usr/bin/proxy
-
-# re-create the systemd unit (honors the persisted autostart choice internally)
+# re-create the systemd unit + the /usr/bin/proxy symlink (install-service does
+# both, and safely: it won't clobber an unrelated /usr/bin/proxy). /usr is wiped
+# each boot, so this restores it.
 "$CLI" install-service || true
-# Start only if a link is configured AND the user hasn't disabled autostart.
-if [ -f "$ROOT/etc/config.json" ] \
+
+# Start only if a config OR pool profile is present AND autostart isn't disabled.
+if { [ -f "$ROOT/etc/config.json" ] || [ -f "$ROOT/etc/pool/99-overlay.json" ]; } \
    && [ "$(cat "$ROOT/etc/autostart" 2>/dev/null || echo enabled)" != "disabled" ]; then
     systemctl restart proxy-unifi || systemctl start proxy-unifi || true
 fi

@@ -102,6 +102,36 @@ EOF
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# D20: only create/remove /usr/bin/proxy if it is absent or already OUR symlink,
+# never clobbering an unrelated file someone else owns.
+PROXY_LINK="/usr/bin/proxy"
+proxy_link_is_ours() {
+    [ -L "$PROXY_LINK" ] || return 1
+    case "$(readlink "$PROXY_LINK" 2>/dev/null)" in
+        "$BIN_DIR/proxy-unifi") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+install_proxy_link() {
+    if [ -e "$PROXY_LINK" ] && [ ! -L "$PROXY_LINK" ]; then
+        c_ylw "warning: $PROXY_LINK exists and is not a symlink; leaving it untouched."
+        return 0
+    fi
+    if [ -L "$PROXY_LINK" ] && ! proxy_link_is_ours; then
+        c_ylw "warning: $PROXY_LINK points elsewhere; leaving it untouched."
+        return 0
+    fi
+    ln -sf "$BIN_DIR/proxy-unifi" "$PROXY_LINK"
+}
+remove_proxy_link() {
+    # remove only if it is absent-as-file or our own symlink
+    if [ -L "$PROXY_LINK" ] && ! proxy_link_is_ours; then
+        c_ylw "note: $PROXY_LINK points elsewhere; not removing it."
+        return 0
+    fi
+    [ -L "$PROXY_LINK" ] && rm -f "$PROXY_LINK" || true
+}
+
 py() {
     if have python3; then python3 "$@";
     elif have python; then python "$@";
@@ -261,6 +291,26 @@ resolve_latest_tag() {
     fi | awk -F'/tag/' 'tolower($0) ~ /location:/ {print $2}' | awk '{print $1}' | tail -1
 }
 
+# compute the SHA-256 of a file with whatever tool exists; echoes the hex digest
+sha256_of() {
+    if have sha256sum; then sha256sum "$1" | awk '{print $1}'
+    elif have shasum;   then shasum -a 256 "$1" | awk '{print $1}'
+    else py -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$1" 2>/dev/null
+    fi
+}
+
+# Verify $1 (a downloaded file) against the expected sha256 in $2 (a string).
+# Integrity check only (the digest is published next to the file by upstream).
+# Returns 0 on match, 1 on mismatch, 2 if no expected hash / cannot hash.
+verify_sha256() {
+    [ -n "${2:-}" ] || return 2
+    _got="$(sha256_of "$1")"
+    [ -n "$_got" ] || return 2
+    [ "$_got" = "$2" ] && return 0
+    err "checksum mismatch for $(basename "$1") (got $_got, expected $2)"
+    return 1
+}
+
 cmd_install_singbox() {
     mkdir -p "$BIN_DIR"
     have tar || { err "need tar to install sing-box"; return 1; }
@@ -276,10 +326,23 @@ cmd_install_singbox() {
     tar xzf "$_tmp/sb.tgz" -C "$_tmp" || { rm -rf "$_tmp"; err "could not extract sing-box"; return 1; }
     _b="$(find "$_tmp" -name sing-box -type f | head -1)"
     [ -n "$_b" ] || { rm -rf "$_tmp"; err "sing-box binary not found in archive"; return 1; }
+    chmod 0755 "$_b"
+    # verify the staged binary runs
+    "$_b" version >/dev/null 2>&1 || { rm -rf "$_tmp"; err "downloaded sing-box binary did not run"; return 1; }
+    # D15: if sing-box is the active engine and we have a config, validate it
+    # against the NEW binary before switching; keep a backup for rollback.
+    if [ -x "$SBIN" ] && [ "$(current_engine)" = "singbox" ] && [ -f "$CONFIG" ]; then
+        "$_b" check -c "$CONFIG" >/dev/null 2>&1 \
+            || { rm -rf "$_tmp"; err "the new sing-box rejects your current config; keeping the old version"; return 1; }
+    fi
+    [ -x "$SBIN" ] && cp -f "$SBIN" "$SBIN.bak" 2>/dev/null || true
     install -m 0755 "$_b" "$SBIN.new" || { rm -rf "$_tmp"; rm -f "$SBIN.new"; err "could not install sing-box binary"; return 1; }
-    # verify the staged binary actually runs before swapping it in
-    "$SBIN.new" version >/dev/null 2>&1 || { rm -rf "$_tmp"; rm -f "$SBIN.new"; err "downloaded sing-box binary did not run"; return 1; }
     mv -f "$SBIN.new" "$SBIN" || { rm -rf "$_tmp"; err "could not activate sing-box binary"; return 1; }
+    if ! "$SBIN" version >/dev/null 2>&1; then
+        [ -f "$SBIN.bak" ] && mv -f "$SBIN.bak" "$SBIN"
+        rm -rf "$_tmp"; err "new sing-box failed to run; rolled back to the previous version"; return 1
+    fi
+    rm -f "$SBIN.bak" 2>/dev/null || true
     rm -rf "$_tmp"
     c_grn "sing-box installed: $("$SBIN" version 2>/dev/null | head -1)"
 }
@@ -297,14 +360,23 @@ cmd_install_binary() {
     mkdir -p "$BIN_DIR"
     slug="$(arch_slug)"
     url="${XRAY_RELEASE_BASE}/Xray-linux-${slug}.zip"
-    tmp="$(mktemp -d)"
+    tmp="$(mktemp -d)" || fatal "could not create temp dir"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmp'" EXIT INT TERM HUP
     info "downloading xray-core ($slug) ..."
-    if have curl; then
-        curl -fsSL "$url" -o "$tmp/xray.zip" || fatal "download failed: $url"
-    elif have wget; then
-        wget -qO "$tmp/xray.zip" "$url" || fatal "download failed: $url"
+    download_to "$url" "$tmp/xray.zip" || fatal "download failed: $url"
+    # D21: verify the archive against the release's published SHA-256 (.dgst). This
+    # is integrity (catches corruption/truncation/MITM-without-cert), not signing.
+    if download_to "$url.dgst" "$tmp/xray.dgst" 2>/dev/null; then
+        _want="$(awk -F'= ' 'tolower($1) ~ /sha2-256/ {print tolower($2)}' "$tmp/xray.dgst" | tr -d ' \r' | head -1)"
+        verify_sha256 "$tmp/xray.zip" "$_want"
+        case $? in
+            0) info "xray-core checksum verified." ;;
+            1) fatal "xray-core download failed checksum verification (aborting)" ;;
+            2) c_ylw "xray-core checksum could not be computed; continuing on HTTPS trust." ;;
+        esac
     else
-        fatal "need curl or wget to download xray-core"
+        c_ylw "xray-core checksum file unavailable; continuing on HTTPS trust."
     fi
     if have unzip; then
         unzip -oq "$tmp/xray.zip" -d "$tmp" || fatal "unzip failed"
@@ -313,15 +385,33 @@ cmd_install_binary() {
             || fatal "could not extract xray.zip (no unzip and python failed)"
     fi
     [ -f "$tmp/xray" ] || fatal "downloaded archive did not contain an xray binary"
-    # Install via temp + atomic rename. Overwriting the file in place with `install`
-    # would fail with ETXTBSY ("Text file busy") while the service is running; a
-    # rename swaps the inode and leaves the running process on the old one.
-    install -m 0755 "$tmp/xray" "$XRAY.new"
-    mv -f "$XRAY.new" "$XRAY"
+    chmod 0755 "$tmp/xray"
+    "$tmp/xray" version >/dev/null 2>&1 || fatal "downloaded xray binary did not run"
+    # D15: if a config already exists, validate it against the NEW binary before
+    # switching, and keep a backup of the working binary so we can roll back.
+    _had_xray=0; [ -x "$XRAY" ] && _had_xray=1
+    if [ "$_had_xray" = 1 ] && { [ -f "$CONFIG" ] || [ -f "$POOL_DIR/99-overlay.json" ]; }; then
+        if [ -f "$POOL_DIR/99-overlay.json" ]; then
+            "$tmp/xray" run -test -confdir "$POOL_DIR" >/dev/null 2>&1 \
+                || fatal "the new xray-core rejects your current profile; keeping the old version"
+        elif [ -f "$CONFIG" ] && [ "$(current_engine)" != "singbox" ]; then
+            "$tmp/xray" run -test -config "$CONFIG" -format json >/dev/null 2>&1 \
+                || fatal "the new xray-core rejects your current config; keeping the old version"
+        fi
+    fi
+    [ "$_had_xray" = 1 ] && cp -f "$XRAY" "$XRAY.bak" 2>/dev/null || true
+    install -m 0755 "$tmp/xray" "$XRAY.new" || fatal "could not stage xray binary"
+    mv -f "$XRAY.new" "$XRAY" || fatal "could not install xray binary"
+    if ! "$XRAY" version >/dev/null 2>&1; then
+        # roll back to the previous binary
+        [ -f "$XRAY.bak" ] && mv -f "$XRAY.bak" "$XRAY"
+        fatal "new xray-core failed to run; rolled back to the previous version"
+    fi
+    rm -f "$XRAY.bak" 2>/dev/null || true
     # geo data ships inside the xray zip, so it refreshes on every core update.
     if [ -f "$tmp/geoip.dat" ];   then install -m 0644 "$tmp/geoip.dat"   "$BIN_DIR/geoip.dat";   fi
     if [ -f "$tmp/geosite.dat" ]; then install -m 0644 "$tmp/geosite.dat" "$BIN_DIR/geosite.dat"; fi
-    rm -rf "$tmp"
+    rm -rf "$tmp"; trap - EXIT INT TERM HUP
     c_grn "xray-core installed: $("$XRAY" version 2>/dev/null | head -1)"
     # Pre-stage / refresh the sing-box engine (best-effort).
     cmd_install_singbox || c_ylw "sing-box not installed (continuing); needed only for ss+obfs/v2ray-plugin, hysteria2, tuic links"
@@ -370,6 +460,7 @@ cleanup_legacy_plugin() {
 
 install_service() {
     cleanup_legacy_plugin
+    install_proxy_link            # safe (D20): only (re)links our own symlink
     write_service
     # Honor the user's persisted autostart choice across reboots/firmware wipes.
     # Default (no marker) = enabled, matching prior behavior.
@@ -492,8 +583,8 @@ cmd_import_json() {
     rm -f "$OUTBOUND_LINK" 2>/dev/null || true
     [ "${_FROM_SUB:-0}" = "1" ] || rm -f "$SUB_SELECTED" 2>/dev/null || true
     save_settings
-    systemctl restart "$SERVICE_NAME" 2>/dev/null || systemctl start "$SERVICE_NAME" 2>/dev/null || true
-    c_grn "Imported balancer profile and applied."
+    if restart_service; then c_grn "Imported balancer profile and applied."
+    else c_ylw "Imported, but the service did not come up — check 'View logs'."; fi
     echo
     cmd_wg_config
 }
@@ -521,8 +612,8 @@ cmd_import() {
     [ "${_FROM_SUB:-0}" = "1" ] || rm -f "$SUB_SELECTED" 2>/dev/null || true
     # Apply immediately (starts the service even if autostart is off; the unit's
     # ConditionPathExists is now satisfied because config.json exists).
-    systemctl restart "$SERVICE_NAME" 2>/dev/null || systemctl start "$SERVICE_NAME" 2>/dev/null || true
-    c_grn "Imported and applied."
+    if restart_service; then c_grn "Imported and applied."
+    else c_ylw "Imported, but the service did not come up — check 'View logs'."; fi
     echo
     cmd_wg_config
 }
@@ -597,6 +688,23 @@ cmd_logs()    { shift || true; journalctl -u "$SERVICE_NAME" "$@"; }
 cmd_start()   { systemctl start "$SERVICE_NAME"; }
 cmd_stop()    { systemctl stop "$SERVICE_NAME"; }
 cmd_restart() { systemctl restart "$SERVICE_NAME"; }
+
+# Restart the service and confirm it actually came up. Returns nonzero (and does
+# not claim success) if the unit is not active shortly after the restart, so a
+# crash-on-start is reported instead of being masked by '|| true'. A disabled-and-
+# stopped autostart state is treated as "intentionally not running" -> success.
+restart_service() {
+    [ -f "$CONFIG" ] || [ -f "$POOL_DIR/99-overlay.json" ] || return 0   # nothing to run yet
+    systemctl restart "$SERVICE_NAME" 2>/dev/null || systemctl start "$SERVICE_NAME" 2>/dev/null || true
+    _i=0
+    while [ "$_i" -lt 10 ]; do
+        systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && return 0
+        _i=$((_i + 1)); sleep 0.3 2>/dev/null || sleep 1
+    done
+    # not active: only a failure if the unit is supposed to be running
+    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && return 0
+    return 1
+}
 # returns nonzero if the marker could not be persisted (caller must not claim success)
 _save_autostart() { mkdir -p "$ETC_DIR" && printf '%s' "$1" > "$AUTOSTART_FILE"; }
 cmd_enable()  { systemctl enable "$SERVICE_NAME"; _save_autostart enabled; }
@@ -649,10 +757,10 @@ PYEOF
         *) fatal "unknown setting '$key' (port|mtu|dns|keepalive|loglevel|ping)" ;;
     esac
     save_settings
-    if [ -f "$OUTBOUND_LINK" ]; then
+    if [ -f "$OUTBOUND_LINK" ] || [ -f "$POOL_SRC" ]; then
         regen_config
-        systemctl restart "$SERVICE_NAME" 2>/dev/null || true
-        c_grn "Updated $key and reloaded."
+        if restart_service; then c_grn "Updated $key and reloaded."
+        else c_ylw "Updated $key, but the service did not come up — check 'View logs'."; fi
         case "$key" in port|mtu|dns) echo; c_ylw "Update your UniFi VPN Client to match:"; cmd_wg_config ;; esac
     else
         c_grn "Updated $key (will apply when you import a link)."
@@ -695,7 +803,8 @@ cmd_regen_keys() {
 
 cmd_update() {
     cmd_install_binary
-    systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+    if restart_service; then c_grn "Updated and running."
+    else c_ylw "Updated, but the service did not come back up — check 'View logs'."; fi
 }
 
 cmd_geo_update() {
@@ -1220,7 +1329,8 @@ cmd_uninstall() {
     need_root
     systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
     systemctl disable --now "$PLUGIN_SERVICE_NAME" 2>/dev/null || true
-    rm -f "$SERVICE_FILE" "$PLUGIN_SERVICE_FILE" "$ONBOOT_DST" /usr/bin/proxy
+    rm -f "$SERVICE_FILE" "$PLUGIN_SERVICE_FILE" "$ONBOOT_DST"
+    remove_proxy_link
     systemctl daemon-reload 2>/dev/null || true
     c_ylw "Removed service + boot hook. Data kept at $ROOT (delete it manually to purge keys/config)."
     info "Don't forget to delete the WireGuard VPN Client in the UniFi UI."
