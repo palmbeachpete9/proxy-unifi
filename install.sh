@@ -99,6 +99,7 @@ install_files() {
     fetch "mkconfig.py" "$BIN_DIR/mkconfig.py" 0755
     fetch "mksingbox.py" "$BIN_DIR/mksingbox.py" 0755
     fetch "mksub.py" "$BIN_DIR/mksub.py" 0755
+    fetch "mkjson.py" "$BIN_DIR/mkjson.py" 0755
     ln -sf "$BIN_DIR/proxy-unifi" /usr/bin/proxy
     fetch "on_boot.sh" "$ONBOOT_DST" 0755
 }
