@@ -145,12 +145,16 @@ gen_keypair() {
         _priv="$(wg genkey)"
         _pub="$(printf '%s' "$_priv" | wg pubkey)"
     elif have openssl; then
-        _tmp="$(mktemp)"
+        _tmp="$(mktemp)" || fatal "could not create temp file"
+        # remove the key temp on any exit/interrupt, not just the success path
+        # shellcheck disable=SC2064
+        trap "rm -f '$_tmp'" EXIT INT TERM HUP
         openssl genpkey -algorithm X25519 -out "$_tmp" 2>/dev/null \
             || fatal "openssl could not generate an X25519 key"
         _priv="$(openssl pkey -in "$_tmp" -outform DER 2>/dev/null | tail -c 32 | base64)"
         _pub="$(openssl pkey -in "$_tmp" -pubout -outform DER 2>/dev/null | tail -c 32 | base64)"
         rm -f "$_tmp"
+        trap - EXIT INT TERM HUP
     else
         fatal "need either 'wg' or 'openssl' to generate WireGuard keys"
     fi
