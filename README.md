@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/main/ins
 
 After the script finishes the installation, run `proxy` for the management menu:
 
-1. **Import / replace proxy link** — paste your link (i.e.: `vless://`). Currently, only single-server links are supported! Subscription links are unsupported, planned to be in the future.
+1. **Import / replace proxy link** — paste your link (i.e.: `https://`, `vless://`, etc.). Both individual server links and subscription links are supported!
 
 2. **Copy the shown WireGuard VPN Client config** — create a `.conf` file locally on your computer and upload it at:
 
