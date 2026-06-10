@@ -1337,7 +1337,7 @@ cmd_uninstall() {
     remove_proxy_link
     systemctl daemon-reload 2>/dev/null || true
     c_ylw "Removed service + boot hook. Data kept at $ROOT (delete it manually to purge keys/config)."
-    info "Don't forget to delete the WireGuard VPN Client in the UniFi UI."
+    c_ylw "Don't forget to delete the WireGuard VPN Client in the UniFi UI."
 }
 
 usage() {
