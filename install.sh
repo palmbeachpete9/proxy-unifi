@@ -15,7 +15,13 @@ ROOT="/data/proxy-unifi"
 BIN_DIR="$ROOT/bin"
 ONBOOT_DIR="/data/on_boot.d"
 ONBOOT_DST="$ONBOOT_DIR/15-proxy-unifi.sh"
-LOG="/tmp/proxy-unifi-install.log"
+
+# Private mode-700 workspace for the install log; never a predictable, world-
+# writable /tmp pathname (which a symlink could redirect when run as root).
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/proxy-unifi-install.XXXXXX")" || { echo "could not create temp dir" >&2; exit 1; }
+chmod 700 "$WORKDIR" 2>/dev/null || true
+LOG="$WORKDIR/install.log"
+trap 'rm -rf "$WORKDIR"' EXIT INT TERM HUP
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 grn() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -72,7 +78,8 @@ run_step() {
         printf '\r  \033[32m\342\234\223\033[0m  %s  %-40s\n' "$(_bar "$_pct")" "$_label"
     else
         printf '\r  \033[31mx\033[0m  %s  %-40s\n' "$(_bar "$_pct")" "$_label"
-        red "Install step failed: $_label  (see $LOG)"
+        red "Install step failed: $_label"
+        red "--- last log lines ---"
         tail -n 15 "$LOG" >&2 2>/dev/null || true
         exit 1
     fi
