@@ -404,18 +404,38 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
             return status, rheaders, None, rheaders.get("location")
         if status != 200:
             die("HTTP error %s from subscription server" % status)
+        # Set the read timeout ONCE on the underlying socket. Re-setting it on
+        # every iteration corrupts http.client's chunked/buffered reader and
+        # yields "Bad file descriptor", so do it before the read, not inside it.
         try:
-            body = b""
-            while len(body) <= MAX_BYTES:
-                tls.settimeout(_remaining(deadline))
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                body += chunk
+            tls.settimeout(_remaining(deadline))
+        except OSError:
+            pass
+        try:
+            # resp.read() transparently handles chunked transfer-encoding; cap by
+            # reading one byte past the limit.
+            body = resp.read(MAX_BYTES + 1)
         except (http_client.HTTPException, OSError) as e:
             die("error reading subscription body: %s" % e)
         if len(body) > MAX_BYTES:
             die("subscription too large (> %d bytes)" % MAX_BYTES)
+        # transparently decompress gzip/deflate if the server used it
+        enc = (rheaders.get("content-encoding") or "").lower()
+        if "gzip" in enc:
+            import gzip
+            try:
+                body = gzip.decompress(body)
+            except Exception:
+                die("could not decompress gzip subscription body")
+        elif "deflate" in enc:
+            import zlib
+            try:
+                body = zlib.decompress(body)
+            except Exception:
+                try:
+                    body = zlib.decompress(body, -zlib.MAX_WBITS)
+                except Exception:
+                    die("could not decompress deflate subscription body")
         return status, rheaders, body, None
     finally:
         try:

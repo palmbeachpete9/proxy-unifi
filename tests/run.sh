@@ -215,10 +215,61 @@ EOF
 }
 
 # -------------------------------------------------------------------------
+# tier 4: network (local self-signed TLS server; needs openssl). Exercises the
+# real fetch path against the response framings that bit us in the field:
+# chunked transfer-encoding and gzip content-encoding.
+# -------------------------------------------------------------------------
+network_tests() {
+    have openssl || { printf '== network == (skipped: openssl not found)\n'; return; }
+    echo "== network =="
+    _d="$(mktemp -d)"
+    openssl req -x509 -newkey rsa:2048 -keyout "$_d/key.pem" -out "$_d/cert.pem" -days 1 \
+        -nodes -subj '/CN=127.0.0.1' -addext 'subjectAltName=IP:127.0.0.1' >/dev/null 2>&1 \
+        || { bad "network: cert gen"; rm -rf "$_d"; return; }
+    cat > "$_d/srv.py" <<'PYEOF'
+import socket, ssl, sys, base64, gzip
+port, mode = int(sys.argv[1]), sys.argv[2]
+body = base64.b64encode(("vless://u@nl.example.com:443?security=tls&sni=a#NL\n"*3).encode())
+if mode == "chunked":
+    resp = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n"
+            b"profile-update-interval: 6\r\nConnection: close\r\n\r\n"
+            + ("%x\r\n" % len(body)).encode() + body + b"\r\n0\r\n\r\n")
+else:  # gzip
+    gz = gzip.compress(body)
+    resp = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\n"
+            b"Content-Length: %d\r\nConnection: close\r\n\r\n" % len(gz)) + gz
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(sys.argv[3], sys.argv[4])
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port)); s.listen(5)
+sys.stderr.write("ready\n"); sys.stderr.flush()
+while True:
+    c, _ = s.accept()
+    try:
+        t = ctx.wrap_socket(c, server_side=True); t.recv(4096); t.sendall(resp); t.close()
+    except Exception:
+        pass
+PYEOF
+    _fetch() {  # <mode> <port> <name>
+        python3 "$_d/srv.py" "$2" "$1" "$_d/cert.pem" "$_d/key.pem" >/dev/null 2>&1 &
+        _srv=$!; sleep 2
+        printf 'https://127.0.0.1:%s/sub' "$2" > "$_d/url.txt"
+        _out="$(PROXY_UNIFI_SUB_ALLOW_PRIVATE=1 SSL_CERT_FILE="$_d/cert.pem" \
+            python3 "$SRC/mksub.py" fetch --url-file "$_d/url.txt" 2>&1)"
+        kill "$_srv" 2>/dev/null; wait "$_srv" 2>/dev/null
+        if printf '%s' "$_out" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["meta"]["count"]==1 else 1)' 2>/dev/null
+        then ok "$3"; else bad "$3"; fi
+    }
+    _fetch chunked 18581 "fetch chunked transfer-encoding"
+    _fetch gzip    18582 "fetch gzip content-encoding"
+    rm -rf "$_d"
+}
+
+# -------------------------------------------------------------------------
 case "${1:-}" in --download) download_engines || echo "  (engine download failed)";; esac
 static_tests
 parser_tests
 engine_tests
+network_tests
 echo
 echo "== summary: $PASS passed, $FAIL failed =="
 [ "$FAIL" = 0 ]
