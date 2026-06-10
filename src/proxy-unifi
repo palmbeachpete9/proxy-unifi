@@ -22,6 +22,7 @@ SBIN="$BIN_DIR/sing-box"
 CONFIG="$ETC_DIR/config.json"
 OUTBOUND_LINK="$ETC_DIR/link.txt"
 ENGINE_FILE="$ETC_DIR/engine"               # active engine: "xray" or "singbox"
+AUTOSTART_FILE="$ETC_DIR/autostart"         # "enabled" / "disabled" (persisted across boots)
 SETTINGS="$ETC_DIR/settings.env"
 MKCONFIG="$BIN_DIR/mkconfig.py"
 MKSB="$BIN_DIR/mksingbox.py"
@@ -135,13 +136,34 @@ ensure_keys() {
     if [ -f "$WG_DIR/xray_public.key" ] && [ ! -f "$WG_DIR/wg_public.key" ]; then
         mv "$WG_DIR/xray_public.key" "$WG_DIR/wg_public.key"
     fi
-    if [ ! -f "$WG_DIR/wg_private.key" ] || [ ! -f "$WG_DIR/unifi_private.key" ]; then
-        info "generating WireGuard keypairs (local + UniFi side)..."
-        # split "PRIV PUB" without word-splitting/globbing (base64 is glob-safe, but be strict)
-        _kp="$(gen_keypair)"; printf '%s' "${_kp% *}" > "$WG_DIR/wg_private.key";  printf '%s' "${_kp#* }" > "$WG_DIR/wg_public.key"
-        _kp="$(gen_keypair)"; printf '%s' "${_kp% *}" > "$WG_DIR/unifi_private.key"; printf '%s' "${_kp#* }" > "$WG_DIR/unifi_public.key"
-        chmod 600 "$WG_DIR"/*.key
+    # Each keypair is repaired independently so a missing/lost file never destroys
+    # a still-valid pair. If a private key exists but its public is missing, derive
+    # the public from the private (when 'wg' is available) instead of regenerating.
+    _ensure_pair wg
+    _ensure_pair unifi
+    chmod 600 "$WG_DIR"/*.key 2>/dev/null || true
+}
+
+# _ensure_pair <prefix>: guarantee $WG_DIR/<prefix>_private.key + _public.key exist
+# and are consistent, generating/deriving only what is missing.
+_ensure_pair() {
+    _pp="$WG_DIR/$1_private.key"; _pub="$WG_DIR/$1_public.key"
+    if [ -s "$_pp" ] && [ -s "$_pub" ]; then
+        return 0                                   # both present -> keep as-is
     fi
+    if [ -s "$_pp" ] && [ ! -s "$_pub" ] && have wg; then
+        # derive the missing public key from the existing private (no rotation)
+        if wg pubkey < "$_pp" > "$_pub.tmp" 2>/dev/null && [ -s "$_pub.tmp" ]; then
+            mv -f "$_pub.tmp" "$_pub"; chmod 600 "$_pub"
+            return 0
+        fi
+        rm -f "$_pub.tmp"
+    fi
+    # otherwise (re)generate the whole pair
+    info "generating WireGuard keypair: $1 ..."
+    _kp="$(gen_keypair)"
+    printf '%s' "${_kp% *}" > "$_pp"; printf '%s' "${_kp#* }" > "$_pub"
+    chmod 600 "$_pp" "$_pub"
 }
 
 arch_slug() {
@@ -198,28 +220,48 @@ sb_arch() {
     esac
 }
 
+# Download <url> to <dest> using whichever of curl/wget exists. Returns nonzero on
+# failure (and removes a partial file). One place, so tag-resolution and the
+# tarball download use the same available tool.
+download_to() {
+    _d_url="$1"; _d_dst="$2"
+    if have curl; then
+        curl -fsSL "$_d_url" -o "$_d_dst" || { rm -f "$_d_dst"; return 1; }
+    elif have wget; then
+        wget -qO "$_d_dst" "$_d_url" || { rm -f "$_d_dst"; return 1; }
+    else
+        return 1
+    fi
+}
+
+# Resolve the latest tag from a .../releases/latest redirect with the available tool.
+resolve_latest_tag() {
+    if have curl; then
+        curl -fsSLI "$1/latest" 2>/dev/null | tr -d '\r'
+    elif have wget; then
+        wget -qS --max-redirect=0 "$1/latest" -O /dev/null 2>&1 | tr -d '\r'
+    fi | awk -F'/tag/' 'tolower($0) ~ /location:/ {print $2}' | awk '{print $1}' | tail -1
+}
+
 cmd_install_singbox() {
     mkdir -p "$BIN_DIR"
+    have tar || { err "need tar to install sing-box"; return 1; }
+    { have curl || have wget; } || { err "need curl or wget to download sing-box"; return 1; }
     _sa="$(sb_arch)"
-    _tag="$(curl -fsSLI "$SINGBOX_RELEASES/latest" 2>/dev/null | tr -d '\r' \
-            | awk -F'/tag/' 'tolower($0) ~ /^location:/ {print $2}' | tail -1)"
+    _tag="$(resolve_latest_tag "$SINGBOX_RELEASES")"
     [ -n "$_tag" ] || { err "could not resolve sing-box latest version"; return 1; }
     _ver="${_tag#v}"
     _url="$SINGBOX_RELEASES/download/${_tag}/sing-box-${_ver}-linux-${_sa}.tar.gz"
     _tmp="$(mktemp -d)"
     info "downloading sing-box ${_tag} (${_sa}) ..."
-    if have curl; then
-        curl -fsSL "$_url" -o "$_tmp/sb.tgz" || { rm -rf "$_tmp"; err "sing-box download failed"; return 1; }
-    elif have wget; then
-        wget -qO "$_tmp/sb.tgz" "$_url" || { rm -rf "$_tmp"; err "sing-box download failed"; return 1; }
-    else
-        rm -rf "$_tmp"; err "need curl or wget to download sing-box"; return 1
-    fi
-    have tar || { rm -rf "$_tmp"; err "need tar to extract sing-box"; return 1; }
+    download_to "$_url" "$_tmp/sb.tgz" || { rm -rf "$_tmp"; err "sing-box download failed"; return 1; }
     tar xzf "$_tmp/sb.tgz" -C "$_tmp" || { rm -rf "$_tmp"; err "could not extract sing-box"; return 1; }
     _b="$(find "$_tmp" -name sing-box -type f | head -1)"
     [ -n "$_b" ] || { rm -rf "$_tmp"; err "sing-box binary not found in archive"; return 1; }
-    install -m 0755 "$_b" "$SBIN.new" && mv -f "$SBIN.new" "$SBIN"
+    install -m 0755 "$_b" "$SBIN.new" || { rm -rf "$_tmp"; rm -f "$SBIN.new"; err "could not install sing-box binary"; return 1; }
+    # verify the staged binary actually runs before swapping it in
+    "$SBIN.new" version >/dev/null 2>&1 || { rm -rf "$_tmp"; rm -f "$SBIN.new"; err "downloaded sing-box binary did not run"; return 1; }
+    mv -f "$SBIN.new" "$SBIN" || { rm -rf "$_tmp"; err "could not activate sing-box binary"; return 1; }
     rm -rf "$_tmp"
     c_grn "sing-box installed: $("$SBIN" version 2>/dev/null | head -1)"
 }
@@ -268,8 +310,10 @@ cmd_install_binary() {
 }
 
 write_service() {
-    # ExecStart depends on the active engine (xray vs sing-box).
-    if [ "$(cat "$ENGINE_FILE" 2>/dev/null || echo xray)" = "singbox" ]; then
+    # ExecStart depends on the active engine. Prefer the recorded engine; if the
+    # engine file was lost (e.g. after a partial restore) fall back to inferring
+    # it from the imported link rather than blindly assuming xray.
+    if [ "$(current_engine)" = "singbox" ]; then
         _exec="$SBIN run -c $CONFIG"
     else
         _exec="$XRAY run -config $CONFIG"
@@ -310,7 +354,13 @@ cleanup_legacy_plugin() {
 install_service() {
     cleanup_legacy_plugin
     write_service
-    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    # Honor the user's persisted autostart choice across reboots/firmware wipes.
+    # Default (no marker) = enabled, matching prior behavior.
+    if [ -f "$AUTOSTART_FILE" ] && [ "$(cat "$AUTOSTART_FILE")" = "disabled" ]; then
+        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    else
+        systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
 }
 
 # Build + validate a config from the given link and, only on success, swap it
@@ -462,8 +512,9 @@ cmd_logs()    { shift || true; journalctl -u "$SERVICE_NAME" "$@"; }
 cmd_start()   { systemctl start "$SERVICE_NAME"; }
 cmd_stop()    { systemctl stop "$SERVICE_NAME"; }
 cmd_restart() { systemctl restart "$SERVICE_NAME"; }
-cmd_enable()  { systemctl enable "$SERVICE_NAME"; }
-cmd_disable() { systemctl disable "$SERVICE_NAME"; }   # autostart only; use 'stop' to stop now
+_save_autostart() { mkdir -p "$ETC_DIR"; printf '%s' "$1" > "$AUTOSTART_FILE"; }
+cmd_enable()  { systemctl enable "$SERVICE_NAME"; _save_autostart enabled; }
+cmd_disable() { systemctl disable "$SERVICE_NAME"; _save_autostart disabled; }   # autostart only; use 'stop' to stop now
 
 cmd_config()  { [ -f "$CONFIG" ] || fatal "no config generated yet"; cat "$CONFIG"; }
 
@@ -588,19 +639,33 @@ current_server() {
 # --------------------------------------------------------------------------
 _ms_from_seconds() { py -c "print('%.0f'%(float('${1:-0}')*1000))" 2>/dev/null || echo "?"; }
 
+# ask the OS for a free loopback TCP port (avoids a fixed-port collision)
+_free_port() {
+    py -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()' 2>/dev/null \
+        || echo 21080
+}
+
+_ping_cleanup() {
+    [ -n "${_pid:-}" ] && { kill "$_pid" 2>/dev/null || true; wait "$_pid" 2>/dev/null || true; }
+    [ -n "${_cfg:-}" ] && rm -f "$_cfg"
+    _pid=""; _cfg=""
+}
+
 ping_proxy() {   # $1 = get|head
     _m="$1"; _link="$(cat "$OUTBOUND_LINK")"; _e="$(current_engine)"
-    _port=21080
-    _cfg="$(mktemp)"
+    _port="$(_free_port)"
+    _cfg="$(mktemp)"; _pid=""
+    # ensure the spawned engine + temp config are cleaned up even on Ctrl-C / error
+    trap '_ping_cleanup' EXIT INT TERM HUP
     if [ "$_e" = "singbox" ]; then
-        [ -x "$SBIN" ] || { err "sing-box not installed"; return 1; }
+        [ -x "$SBIN" ] || { err "sing-box not installed"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
         py "$MKSB" --link "$_link" --socks-port "$_port" > "$_cfg" 2>/dev/null \
-            || { rm -f "$_cfg"; err "could not build test config"; return 1; }
+            || { err "could not build test config"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
         "$SBIN" run -c "$_cfg" >/dev/null 2>&1 &
     else
-        [ -x "$XRAY" ] || { err "xray binary not installed"; return 1; }
+        [ -x "$XRAY" ] || { err "xray binary not installed"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
         py "$MKCONFIG" --link "$_link" --socks-port "$_port" > "$_cfg" 2>/dev/null \
-            || { rm -f "$_cfg"; err "could not build test config"; return 1; }
+            || { err "could not build test config"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
         # -format json: mktemp names have no extension for xray to infer the format from.
         "$XRAY" run -config "$_cfg" -format json >/dev/null 2>&1 &
     fi
@@ -618,8 +683,8 @@ except Exception: sys.exit(1)' >/dev/null 2>&1; then break; fi
     # LC_ALL=C so curl prints time_total with a '.' decimal regardless of locale
     _out="$(LC_ALL=C curl -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time "$PING_TIMEOUT" \
              "$@" --proxy "socks5h://127.0.0.1:${_port}" "$PING_URL" 2>/dev/null)" || _out=""
-    kill "$_pid" 2>/dev/null || true; wait "$_pid" 2>/dev/null || true
-    rm -f "$_cfg"
+    _ping_cleanup
+    trap - EXIT INT TERM HUP
     if [ -z "$_out" ]; then c_red "${_label}: timeout (>${PING_TIMEOUT}s)"; return 1; fi
     _code="${_out%% *}"; _ms="$(_ms_from_seconds "${_out##* }")"
     case "$_code" in
@@ -741,13 +806,13 @@ menu_restart() {
     else c_red "Failed to restart - is a link imported? Check 'View logs'."; fi
 }
 menu_enable() {
-    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then c_ylw "Autostart is already enabled."
-    elif systemctl enable "$SERVICE_NAME" >/dev/null 2>&1;       then c_grn "Autostart enabled."
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then _save_autostart enabled; c_ylw "Autostart is already enabled."
+    elif systemctl enable "$SERVICE_NAME" >/dev/null 2>&1;       then _save_autostart enabled; c_grn "Autostart enabled."
     else c_red "Failed to enable autostart (is the service installed?)."; fi
 }
 menu_disable() {
-    if ! systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then c_ylw "Autostart is already disabled."
-    elif systemctl disable "$SERVICE_NAME" >/dev/null 2>&1;        then c_ylw "Autostart disabled (service keeps running until stopped)."
+    if ! systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then _save_autostart disabled; c_ylw "Autostart is already disabled."
+    elif systemctl disable "$SERVICE_NAME" >/dev/null 2>&1;        then _save_autostart disabled; c_ylw "Autostart disabled (service keeps running until stopped)."
     else c_red "Failed to disable autostart."; fi
 }
 
@@ -860,32 +925,53 @@ sub_hwid() {
     cat "$SUB_HWID_FILE"
 }
 
-# Fetch the subscription URL into a fresh catalog (validated, atomic swap).
-sub_fetch() {
-    [ -s "$SUB_URL_FILE" ] || fatal "no subscription added. Use: proxy sub add <https url>"
-    _url="$(cat "$SUB_URL_FILE")"
-    _hwid="$(sub_hwid)"
-    _tmp="$(mktemp)"
-    if py "$MKSUB" fetch --url "$_url" --hwid "$_hwid" --ua "proxy-unifi (UniFi OS)" > "$_tmp" 2>/tmp/sub.err; then
-        mkdir -p "$SUB_DIR"; chmod 700 "$SUB_DIR"
-        mv -f "$_tmp" "$SUB_CATALOG"; chmod 600 "$SUB_CATALOG"
-        rm -f /tmp/sub.err
+# Fetch a given URL into a candidate catalog file (does NOT touch stored state).
+# Secrets (URL, HWID) are passed via mode-600 files, never on the command line.
+# Temp files live under $SUB_DIR (same filesystem as $SUB_CATALOG -> atomic mv);
+# stderr goes to a private temp, never a shared /tmp path.
+# Args: <url> <dest-catalog-file>. Returns 0 and writes dest on success.
+sub_fetch_to() {
+    _f_url="$1"; _f_dest="$2"
+    mkdir -p "$SUB_DIR"; chmod 700 "$SUB_DIR"
+    _f_urlf="$(mktemp "$SUB_DIR/.url.XXXXXX")"
+    _f_err="$(mktemp "$SUB_DIR/.err.XXXXXX")"
+    _f_cat="$(mktemp "$SUB_DIR/.cat.XXXXXX")"
+    printf '%s' "$_f_url" > "$_f_urlf"; chmod 600 "$_f_urlf"
+    sub_hwid >/dev/null
+    if py "$MKSUB" fetch --url-file "$_f_urlf" --hwid-file "$SUB_HWID_FILE" \
+            --ua "proxy-unifi (UniFi OS)" > "$_f_cat" 2>"$_f_err"; then
+        chmod 600 "$_f_cat"; mv -f "$_f_cat" "$_f_dest"
+        rm -f "$_f_urlf" "$_f_err"
         return 0
     fi
-    rm -f "$_tmp"
-    err "$(head -1 /tmp/sub.err 2>/dev/null | sed 's/^mksub: error: //')"
-    rm -f /tmp/sub.err
+    err "$(head -1 "$_f_err" 2>/dev/null | sed 's/^mksub: error: //')"
+    rm -f "$_f_urlf" "$_f_err" "$_f_cat"
     return 1
+}
+
+# Refresh the stored subscription into its catalog (atomic).
+sub_fetch() {
+    [ -s "$SUB_URL_FILE" ] || fatal "no subscription added. Use: proxy sub add <https url>"
+    sub_fetch_to "$(cat "$SUB_URL_FILE")" "$SUB_CATALOG"
 }
 
 sub_add() {
     [ -n "${1:-}" ] || fatal "usage: proxy sub add <https subscription url>"
     case "$1" in https://*) : ;; *) fatal "subscription URL must start with https://" ;; esac
     mkdir -p "$SUB_DIR"; chmod 700 "$SUB_DIR"
+    c_grn "Fetching subscription..."
+    # Fetch to a candidate catalog FIRST; only commit the URL + catalog (and clear
+    # any previous selection) once we have a valid non-empty result. A failed add
+    # therefore never replaces a working subscription with a broken one.
+    _cand="$(mktemp "$SUB_DIR/.newcat.XXXXXX")"
+    if ! sub_fetch_to "$1" "$_cand"; then
+        rm -f "$_cand"
+        fatal "subscription not added (fetch/parse failed)"
+    fi
     printf '%s' "$1" > "$SUB_URL_FILE"; chmod 600 "$SUB_URL_FILE"
-    sub_hwid >/dev/null
-    c_grn "Subscription saved. Fetching nodes..."
-    sub_fetch || { c_ylw "Saved the URL, but the fetch failed (see error above). Retry: proxy sub refresh"; return 1; }
+    mv -f "$_cand" "$SUB_CATALOG"; chmod 600 "$SUB_CATALOG"
+    rm -f "$SUB_SELECTED"            # a new subscription invalidates the old selection
+    c_grn "Subscription added."
     sub_list
 }
 

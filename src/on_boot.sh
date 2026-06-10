@@ -16,8 +16,10 @@ CLI="$ROOT/bin/proxy-unifi"
 # expose the management CLI as `proxy` on PATH (re-created each boot, /usr is ephemeral)
 ln -sf "$CLI" /usr/bin/proxy
 
-# re-create + enable the systemd unit, then start (only if a link is configured)
+# re-create the systemd unit (honors the persisted autostart choice internally)
 "$CLI" install-service || true
-if [ -f "$ROOT/etc/config.json" ]; then
+# Start only if a link is configured AND the user hasn't disabled autostart.
+if [ -f "$ROOT/etc/config.json" ] \
+   && [ "$(cat "$ROOT/etc/autostart" 2>/dev/null || echo enabled)" != "disabled" ]; then
     systemctl restart proxy-unifi || systemctl start proxy-unifi || true
 fi

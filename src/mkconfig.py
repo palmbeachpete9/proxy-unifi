@@ -42,6 +42,15 @@ def _b64decode_any(s):
     return None
 
 
+def safe_urlsplit(link):
+    """urlsplit that dies cleanly instead of raising on a malformed URL
+    (e.g. an unterminated bracketed IPv6 host)."""
+    try:
+        return urlsplit(link)
+    except ValueError:
+        die("malformed link (could not parse URL)")
+
+
 def host_port(u):
     """(hostname, port) from a urlsplit result. urlsplit raises ValueError for a
     non-numeric/out-of-range port instead of returning None, so catch it and die
@@ -65,16 +74,24 @@ def qg(q, *names, default=""):
 
 
 def build_stream(q, security, net, host):
-    """Build streamSettings shared by VLESS and Trojan."""
-    if net == "h2":
-        net = "http"
+    """Build streamSettings shared by VLESS and Trojan.
+
+    Transports/options removed by current Xray are rejected up front with a clear
+    message (instead of emitting a config the core would reject): legacy http/h2,
+    quic, and mKCP. 'allowInsecure' was removed by Xray, so it is silently dropped
+    (it only disabled certificate verification, which we don't want anyway)."""
+    if net in ("http", "h2"):
+        die("legacy HTTP/2 (h2) transport was removed by Xray; not supported")
+    if net == "quic":
+        die("QUIC transport was removed by Xray; not supported")
+    if net == "kcp":
+        die("mKCP transport was removed by Xray; not supported")
     stream = {"network": net, "security": security}
 
     # ---- security layer -------------------------------------------------
     sni = qg(q, "sni", "peer", "host") or host
     fp = qg(q, "fp", "fingerprint")
     alpn = qg(q, "alpn")
-    allow_insecure = qg(q, "allowInsecure", "insecure") in ("1", "true", "True")
 
     if security == "tls":
         tls = {"serverName": sni}
@@ -82,8 +99,6 @@ def build_stream(q, security, net, host):
             tls["fingerprint"] = fp
         if alpn:
             tls["alpn"] = [a for a in alpn.split(",") if a]
-        if allow_insecure:
-            tls["allowInsecure"] = True
         stream["tlsSettings"] = tls
     elif security == "reality":
         stream["realitySettings"] = {
@@ -122,12 +137,6 @@ def build_stream(q, security, net, host):
         if host_hdr:
             hu["host"] = host_hdr
         stream["httpupgradeSettings"] = hu
-    elif net == "http":
-        h = {"path": path or "/"}
-        hosts = [x for x in host_hdr.split(",") if x]
-        if hosts:
-            h["host"] = hosts
-        stream["httpSettings"] = h
     elif net == "grpc":
         grpc = {"serviceName": qg(q, "serviceName", "path", default="")}
         mode = qg(q, "mode")
@@ -143,18 +152,6 @@ def build_stream(q, security, net, host):
         if mode:
             xh["mode"] = mode
         stream["xhttpSettings"] = xh
-    elif net == "kcp":
-        kcp = {"header": {"type": header_type or "none"}}
-        seed = qg(q, "seed")
-        if seed:
-            kcp["seed"] = seed
-        stream["kcpSettings"] = kcp
-    elif net == "quic":
-        stream["quicSettings"] = {
-            "security": qg(q, "quicSecurity", default="none"),
-            "key": qg(q, "key", default=""),
-            "header": {"type": header_type or "none"},
-        }
     else:
         die("unsupported transport type '%s'" % net)
 
@@ -162,7 +159,7 @@ def build_stream(q, security, net, host):
 
 
 def parse_vless(link):
-    u = urlsplit(link)
+    u = safe_urlsplit(link)
     uuid = unquote(u.username or "")
     host, port = host_port(u)
     if not uuid:
@@ -190,7 +187,7 @@ def parse_vless(link):
 
 
 def parse_trojan(link):
-    u = urlsplit(link)
+    u = safe_urlsplit(link)
     password = unquote(u.username or "")
     host, port = host_port(u)
     if not password:
@@ -218,7 +215,7 @@ def parse_trojan(link):
 
 def _ss_creds(link):
     """Decode (method, password, host, port) from an ss:// link (no plugin logic)."""
-    u = urlsplit(link)
+    u = safe_urlsplit(link)
     host, port = host_port(u)
     method = password = None
 
@@ -280,12 +277,19 @@ def parse_vmess(link):
         v = json.loads(dec)
     except Exception:
         die("vmess link is not valid base64-encoded JSON")
+    if not isinstance(v, dict):
+        die("vmess link JSON must be an object")
 
     host = str(v.get("add", "") or "")
-    port = v.get("port")
     uid = str(v.get("id", "") or "")
-    if not host or not port or not uid:
-        die("vmess link is missing add/port/id")
+    try:
+        port = int(v.get("port"))
+    except (TypeError, ValueError):
+        die("vmess link has an invalid port")
+    if not (0 < port < 65536):
+        die("vmess link port out of range (1-65535)")
+    if not host or not uid:
+        die("vmess link is missing add/id")
 
     net = str(v.get("net", "tcp") or "tcp")
     tls = str(v.get("tls", "") or "")
@@ -308,18 +312,22 @@ def parse_vmess(link):
         q["serviceName"] = str(v["path"])   # grpc carries serviceName in "path"
     stream = build_stream(q, security, net, host)
 
+    try:
+        aid = int(v.get("aid", 0) or 0)
+    except (TypeError, ValueError):
+        die("vmess link has an invalid alterId (aid)")
     user = {
         "id": uid,
-        "alterId": int(v.get("aid", 0) or 0),
+        "alterId": aid,
         "security": str(v.get("scy", "auto") or "auto"),
     }
     outbound = {
         "tag": "proxy",
         "protocol": "vmess",
-        "settings": {"vnext": [{"address": host, "port": int(port), "users": [user]}]},
+        "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
         "streamSettings": stream,
     }
-    return outbound, host, int(port)
+    return outbound, host, port
 
 
 def parse_link(link):

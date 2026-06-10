@@ -49,6 +49,14 @@ def qg(q, *names, default=""):
     return default
 
 
+def safe_urlsplit(link):
+    """urlsplit that dies cleanly on a malformed URL (e.g. bad bracketed host)."""
+    try:
+        return urlsplit(link)
+    except ValueError:
+        die("malformed link (could not parse URL)")
+
+
 def host_port(u):
     """(hostname, port) from a urlsplit result, dying cleanly on a bad port
     (urlsplit raises ValueError instead of returning None for non-numeric ports)."""
@@ -87,7 +95,7 @@ def plugin_alias(name):
 # Per-protocol outbound builders -> (outbound dict, host, port)
 # --------------------------------------------------------------------------
 def parse_ss(link):
-    u = urlsplit(link)
+    u = safe_urlsplit(link)
     host, port = host_port(u)
     method = password = None
     if u.username is not None and host and port:
@@ -120,13 +128,15 @@ def parse_ss(link):
 
 
 def parse_hysteria2(link):
-    u = urlsplit(link)
+    u = safe_urlsplit(link)
     host, port = host_port(u)
+    if port is None:
+        port = 443                       # hysteria2 default port
     auth = unquote(u.username or "")
     if u.password:                       # hysteria2://user:pass@ -> password is after ':'
         auth = auth + ":" + unquote(u.password) if auth else unquote(u.password)
-    if not host or not port:
-        die("hysteria2 link is missing host/port")
+    if not host:
+        die("hysteria2 link is missing host")
     q = flat_query(u)
     sni = qg(q, "sni", "peer") or host
     out = {"type": "hysteria2", "tag": "proxy", "server": host, "server_port": int(port),
@@ -138,7 +148,7 @@ def parse_hysteria2(link):
 
 
 def parse_tuic(link):
-    u = urlsplit(link)
+    u = safe_urlsplit(link)
     host, port = host_port(u)
     uuid = unquote(u.username or "")
     password = unquote(u.password or "")
