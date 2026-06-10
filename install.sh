@@ -132,20 +132,18 @@ cat <<'EOF'
 
 Run: "proxy"
 
-  ...for the management menu. Then:
+...for the management menu. Then:
 
-    1. Import your proxy link (VLESS/VMess/Trojan/SS/Hysteria2/TUIC) - option "1"
+1. Import your proxy link (VLESS/VMess/Trojan/SS/Hysteria2/TUIC) - option "1"
 
 2. Copy shown WireGuard settings into a .conf file on your PC / Mac. Then, go to:
-
-                    unifi.ui.com -> Settings -> VPN -> VPN Client -> Create New -> Type: WireGuard
-
+unifi.ui.com -> Settings -> VPN -> VPN Client -> Create New -> Type: WireGuard
 ...and use the created .conf for "Upload Configuration File"
 
-    3. Route selected traffic through the created VPN profile in Policy Engine, utilising native UniFi UI and its functionality.
+3. Route selected traffic through the created VPN profile in Policy Engine, utilising native UniFi UI and its functionality.
 
 4. Success!
 
-  proxy status     # quick health check
-  proxy help       # direct commands
+proxy status     # quick health check
+proxy help       # direct commands
 EOF
