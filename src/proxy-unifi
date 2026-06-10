@@ -25,6 +25,12 @@ ENGINE_FILE="$ETC_DIR/engine"               # active engine: "xray" or "singbox"
 SETTINGS="$ETC_DIR/settings.env"
 MKCONFIG="$BIN_DIR/mkconfig.py"
 MKSB="$BIN_DIR/mksingbox.py"
+MKSUB="$BIN_DIR/mksub.py"
+SUB_DIR="$ETC_DIR/subscription"
+SUB_URL_FILE="$SUB_DIR/url.txt"             # subscription URL (mode 600)
+SUB_CATALOG="$SUB_DIR/catalog.json"         # cached parsed nodes
+SUB_HWID_FILE="$SUB_DIR/hwid"               # stable per-install device id
+SUB_SELECTED="$SUB_DIR/selected"            # id of the node currently activated
 SERVICE_NAME="proxy-unifi"
 # (no RUN_DIR: xray runs under systemd, no pidfile needed)
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -380,6 +386,10 @@ cmd_import() {
     printf '%s' "$link" > "$OUTBOUND_LINK"
     chmod 600 "$OUTBOUND_LINK"
     save_settings
+    # A manual import detaches any subscription selection (so a later 'sub refresh'
+    # won't think this hand-picked link came from the subscription). sub_select sets
+    # _FROM_SUB=1 to keep its own marker.
+    [ "${_FROM_SUB:-0}" = "1" ] || rm -f "$SUB_SELECTED" 2>/dev/null || true
     # Apply immediately (starts the service even if autostart is off; the unit's
     # ConditionPathExists is now satisfied because config.json exists).
     systemctl restart "$SERVICE_NAME" 2>/dev/null || systemctl start "$SERVICE_NAME" 2>/dev/null || true
@@ -682,30 +692,31 @@ print_menu() {
     ml "  0. Exit Script"
     printf '│%s│\n' "$HR"
     ml "  1. Import / replace proxy link"
-    ml "  2. Show current server & config"
-    ml "  3. Show UniFi WireGuard VPN Client config"
-    ml "  4. Regenerate WireGuard keys"
+    ml "  2. Subscription (add / list / select / refresh)"
+    ml "  3. Show current server & config"
+    ml "  4. Show UniFi WireGuard VPN Client config"
+    ml "  5. Regenerate WireGuard keys"
     printf '│%s│\n' "$HR"
-    ml "  5. Change WireGuard port"
-    ml "  6. Change tunnel MTU"
-    ml "  7. Change tunnel DNS"
+    ml "  6. Change WireGuard port"
+    ml "  7. Change tunnel MTU"
+    ml "  8. Change tunnel DNS"
     printf '│%s│\n' "$HR"
-    ml "  8. Ping test"
-    ml "  9. Change test algorithm"
+    ml "  9. Ping test"
+    ml " 10. Change test algorithm"
     printf '│%s│\n' "$HR"
-    ml " 10. Start"
-    ml " 11. Stop"
-    ml " 12. Restart"
-    ml " 13. Check status"
-    ml " 14. View logs"
+    ml " 11. Start"
+    ml " 12. Stop"
+    ml " 13. Restart"
+    ml " 14. Check status"
+    ml " 15. View logs"
     printf '│%s│\n' "$HR"
-    ml " 15. Enable autostart"
-    ml " 16. Disable autostart"
+    ml " 16. Enable autostart"
+    ml " 17. Disable autostart"
     printf '│%s│\n' "$HR"
-    ml " 17. Update xray-core"
-    ml " 18. Update geo files"
-    ml " 19. Version info"
-    ml " 20. Uninstall"
+    ml " 18. Update xray-core"
+    ml " 19. Update geo files"
+    ml " 20. Version info"
+    ml " 21. Uninstall"
     printf '╚%s╝\n' "$HR"
     printf '\n'
     printf 'Service:    %s\n' "$svc_d"
@@ -765,45 +776,199 @@ cmd_menu() {
     while true; do
         clear 2>/dev/null || true
         print_menu
-        printf '\nPlease enter your selection [0-20]: '
+        printf '\nPlease enter your selection [0-21]: '
         read -r sel || exit 0
         echo
         case "$sel" in
             0)  exit 0 ;;
             1)  ( printf 'Paste proxy link (vless/vmess/trojan/ss/hysteria2/tuic): '; read -r _l || true
                   if [ -n "${_l:-}" ]; then cmd_import "$_l"; else c_ylw "No link entered."; fi ) ;;
-            2)  ( cmd_config ) ;;
-            3)  ( cmd_wg_config ) ;;
-            4)  ( printf 'Regenerate keys? This breaks the current UniFi VPN Client until you re-paste the new config. [y/N]: '
+            2)  ( menu_sub ) ;;
+            3)  ( cmd_config ) ;;
+            4)  ( cmd_wg_config ) ;;
+            5)  ( printf 'Regenerate keys? This breaks the current UniFi VPN Client until you re-paste the new config. [y/N]: '
                   read -r _c || true
                   if [ "${_c:-}" = "y" ]; then cmd_regen_keys; else c_ylw "Cancelled."; fi ) ;;
-            5)  ( printf 'New WireGuard UDP port [%s]: ' "$WG_PORT"; read -r _v || true
+            6)  ( printf 'New WireGuard UDP port [%s]: ' "$WG_PORT"; read -r _v || true
                   if [ -n "${_v:-}" ]; then cmd_set port "$_v"; else c_ylw "Unchanged."; fi ) ;;
-            6)  ( printf 'New tunnel MTU [%s]: ' "$WG_MTU"; read -r _v || true
+            7)  ( printf 'New tunnel MTU [%s]: ' "$WG_MTU"; read -r _v || true
                   if [ -n "${_v:-}" ]; then cmd_set mtu "$_v"; else c_ylw "Unchanged."; fi ) ;;
-            7)  ( printf 'Tunnel DNS (comma-separated, empty to reset to 8.8.8.8) [%s]: ' "$INNER_DNS"; read -r _v || true
+            8)  ( printf 'Tunnel DNS (comma-separated, empty to reset to 8.8.8.8) [%s]: ' "$INNER_DNS"; read -r _v || true
                   cmd_set dns "${_v:-}" ) ;;
-            8)  ( cmd_ping ) ;;
-            9)  ( menu_set_ping ) ;;
-            10) ( menu_start ) ;;
-            11) ( menu_stop ) ;;
-            12) ( menu_restart ) ;;
-            13) ( cmd_status ) ;;
-            14) ( printf 'Lines to show [100]: '; read -r _n || true
+            9)  ( cmd_ping ) ;;
+            10) ( menu_set_ping ) ;;
+            11) ( menu_start ) ;;
+            12) ( menu_stop ) ;;
+            13) ( menu_restart ) ;;
+            14) ( cmd_status ) ;;
+            15) ( printf 'Lines to show [100]: '; read -r _n || true
                   case "${_n:-}" in ""|*[!0-9]*) _n=100 ;; esac
                   cmd_logs logs -n "$_n" --no-pager ) ;;
-            15) ( menu_enable ) ;;
-            16) ( menu_disable ) ;;
-            17) ( cmd_update ) ;;
-            18) ( cmd_geo_update ) ;;
-            19) ( if [ -x "$XRAY" ]; then "$XRAY" version | head -1; else c_ylw "xray-core: not installed"; fi
+            16) ( menu_enable ) ;;
+            17) ( menu_disable ) ;;
+            18) ( cmd_update ) ;;
+            19) ( cmd_geo_update ) ;;
+            20) ( if [ -x "$XRAY" ]; then "$XRAY" version | head -1; else c_ylw "xray-core: not installed"; fi
                   echo "proxy-unifi CLI 1.0.0" ) ;;
-            20) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
+            21) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
                 if [ "${_c:-}" = "y" ]; then ( cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
             *)  c_red "Invalid selection." ;;
         esac
         pause
     done
+}
+
+# Interactive subscription submenu (wraps the cmd_sub actions).
+menu_sub() {
+    if [ -s "$SUB_URL_FILE" ]; then sub_status; echo; fi
+    echo "Subscription:"
+    echo "  1. Add / replace subscription URL"
+    echo "  2. List nodes"
+    echo "  3. Select node"
+    echo "  4. Refresh"
+    echo "  5. Remove"
+    echo "  0. Back"
+    printf 'Choice: '
+    read -r _s || true
+    echo
+    case "${_s:-0}" in
+        1) printf 'Subscription URL (https): '; read -r _u || true
+           if [ -n "${_u:-}" ]; then sub_add "$_u"; else c_ylw "Cancelled."; fi ;;
+        2) sub_list ;;
+        3) sub_list; echo; printf 'Node number to select: '; read -r _n || true
+           if [ -n "${_n:-}" ]; then sub_select "$_n"; else c_ylw "Cancelled."; fi ;;
+        4) sub_refresh ;;
+        5) printf 'Remove the subscription? [y/N]: '; read -r _c || true
+           if [ "${_c:-}" = "y" ]; then sub_remove; else c_ylw "Cancelled."; fi ;;
+        0|"") : ;;
+        *) c_red "invalid choice" ;;
+    esac
+}
+
+# --------------------------------------------------------------------------
+# Subscriptions (Base64 / plain link-list; single subscription, manual refresh)
+# --------------------------------------------------------------------------
+sub_hwid() {
+    # stable random UUID per install; NOT derived from any hardware identifier
+    if [ ! -s "$SUB_HWID_FILE" ]; then
+        mkdir -p "$SUB_DIR"; chmod 700 "$SUB_DIR"
+        _id="$(py -c 'import uuid;print(uuid.uuid4())' 2>/dev/null)"
+        [ -n "$_id" ] || _id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)"
+        [ -n "$_id" ] || fatal "could not generate an HWID"
+        printf '%s' "$_id" > "$SUB_HWID_FILE"; chmod 600 "$SUB_HWID_FILE"
+    fi
+    cat "$SUB_HWID_FILE"
+}
+
+# Fetch the subscription URL into a fresh catalog (validated, atomic swap).
+sub_fetch() {
+    [ -s "$SUB_URL_FILE" ] || fatal "no subscription added. Use: proxy sub add <https url>"
+    _url="$(cat "$SUB_URL_FILE")"
+    _hwid="$(sub_hwid)"
+    _tmp="$(mktemp)"
+    if py "$MKSUB" fetch --url "$_url" --hwid "$_hwid" --ua "proxy-unifi (UniFi OS)" > "$_tmp" 2>/tmp/sub.err; then
+        mkdir -p "$SUB_DIR"; chmod 700 "$SUB_DIR"
+        mv -f "$_tmp" "$SUB_CATALOG"; chmod 600 "$SUB_CATALOG"
+        rm -f /tmp/sub.err
+        return 0
+    fi
+    rm -f "$_tmp"
+    err "$(head -1 /tmp/sub.err 2>/dev/null | sed 's/^mksub: error: //')"
+    rm -f /tmp/sub.err
+    return 1
+}
+
+sub_add() {
+    [ -n "${1:-}" ] || fatal "usage: proxy sub add <https subscription url>"
+    case "$1" in https://*) : ;; *) fatal "subscription URL must start with https://" ;; esac
+    mkdir -p "$SUB_DIR"; chmod 700 "$SUB_DIR"
+    printf '%s' "$1" > "$SUB_URL_FILE"; chmod 600 "$SUB_URL_FILE"
+    sub_hwid >/dev/null
+    c_grn "Subscription saved. Fetching nodes..."
+    sub_fetch || { c_ylw "Saved the URL, but the fetch failed (see error above). Retry: proxy sub refresh"; return 1; }
+    sub_list
+}
+
+sub_list() {
+    [ -f "$SUB_CATALOG" ] || fatal "no subscription catalog yet. Use: proxy sub add <url> (or refresh)"
+    py "$MKSUB" render --file "$SUB_CATALOG"
+    _sel="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
+    [ -n "$_sel" ] && { echo; info "currently selected node id: $_sel"; } || true
+}
+
+sub_select() {
+    [ -n "${1:-}" ] || fatal "usage: proxy sub select <number>"
+    case "$1" in ""|*[!0-9]*) fatal "select takes a node NUMBER from 'proxy sub list'";; esac
+    [ -f "$SUB_CATALOG" ] || fatal "no catalog. Run: proxy sub refresh"
+    _row="$(py "$MKSUB" get --file "$SUB_CATALOG" --index "$1" 2>/dev/null)" \
+        || fatal "no node #$1 in the subscription"
+    _id="$(printf '%s' "$_row" | cut -f1)"
+    _ok="$(printf '%s' "$_row" | cut -f2)"
+    _reason="$(printf '%s' "$_row" | cut -f3)"
+    _link="$(printf '%s' "$_row" | cut -f5-)"
+    [ "$_ok" = "1" ] || fatal "node #$1 is unsupported${_reason:+ ($_reason)}"
+    # reuse the hardened single-link path: builds, validates, applies (or fatals
+    # without touching the running config on failure). _FROM_SUB keeps the marker.
+    _FROM_SUB=1 cmd_import "$_link"
+    mkdir -p "$SUB_DIR"; printf '%s' "$_id" > "$SUB_SELECTED"; chmod 600 "$SUB_SELECTED"
+    c_grn "Selected subscription node #$1 (id $_id)."
+}
+
+# Refresh the catalog. The active tunnel is NEVER changed automatically: a node's
+# id is the hash of its canonical config, so if the selected id is still present
+# the config is identical (only the label could differ). If it is gone, the
+# provider changed or removed that node -- we keep the working tunnel and ask the
+# user to re-select, rather than silently activating a different config.
+sub_refresh() {
+    sub_fetch || { err "refresh failed; keeping the current catalog and tunnel"; return 1; }
+    c_grn "Catalog refreshed."
+    _sel="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
+    [ -n "$_sel" ] || { sub_list; return 0; }
+    if py "$MKSUB" find --file "$SUB_CATALOG" --id "$_sel" >/dev/null 2>&1; then
+        info "selected node (id $_sel) is unchanged."
+    else
+        c_ylw "Selected node (id $_sel) changed or was removed by the provider."
+        c_ylw "The active tunnel is unchanged. Run 'proxy sub list' and re-select to apply."
+    fi
+}
+
+sub_remove() {
+    rm -f "$SUB_URL_FILE" "$SUB_CATALOG" "$SUB_SELECTED"
+    c_ylw "Subscription removed (HWID kept). The active tunnel is unchanged."
+    info "To also stop proxying, import a different link or run: proxy stop"
+}
+
+sub_status() {
+    if [ ! -s "$SUB_URL_FILE" ]; then echo "subscription: (none)"; return; fi
+    echo "subscription: configured"
+    if [ -f "$SUB_CATALOG" ]; then
+        py - "$SUB_CATALOG" <<'PYEOF' 2>/dev/null || true
+import json,sys
+c=json.load(open(sys.argv[1]))
+m=c.get("meta",{})
+print("nodes:        %s (%s supported)" % (m.get("count","?"), m.get("supported","?")))
+if "interval_hours" in m: print("provider hint: refresh every %sh" % m["interval_hours"])
+if "userinfo" in m: print("userinfo:     %s" % m["userinfo"])
+PYEOF
+    else
+        echo "nodes:        (not fetched yet; run: proxy sub refresh)"
+    fi
+    _sel="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
+    echo "selected:     ${_sel:-(none)}"
+    echo "hwid:         $([ -s "$SUB_HWID_FILE" ] && echo set || echo unset)"
+}
+
+cmd_sub() {
+    _action="${1:-}"; shift 2>/dev/null || true
+    case "$_action" in
+        add)     sub_add "${1:-}" ;;
+        list|nodes) sub_list ;;
+        select)  sub_select "${1:-}" ;;
+        refresh) sub_refresh ;;
+        remove)  sub_remove ;;
+        status)  sub_status ;;
+        *) fatal "usage: proxy sub <add|list|select|refresh|remove|status>" ;;
+    esac
 }
 
 cmd_uninstall() {
@@ -829,6 +994,7 @@ Direct commands (for scripting / quick ops):
   proxy restart      Restart the service
   proxy status       Show engine / server / listener status
   proxy ping [proto] Test the proxy link; proto = get|head|tcp|icmp (default: get)
+  proxy sub <...>    Subscriptions: add|list|select|refresh|remove|status
   proxy logs [args]  Tail service logs (passes args to journalctl)
   proxy help         This help
 
@@ -850,6 +1016,7 @@ case "$cmd" in
     restart)      need_root; cmd_restart ;;
     status)       cmd_status ;;
     ping)         cmd_ping "$@" ;;
+    sub)          need_root; cmd_sub "$@" ;;
     logs)         cmd_logs logs "$@" ;;
     -h|--help|help) usage ;;
     # internal / hidden (used by installer, boot hook, and the menu)
