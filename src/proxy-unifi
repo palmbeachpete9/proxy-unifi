@@ -1071,19 +1071,19 @@ usage() {
     cat <<EOF
 proxy - multi-core proxy client (xray-core + sing-box) for UniFi gateways
 
-Run 'proxy' with no arguments for the interactive management menu
-(import links, keys, WireGuard config, updates, uninstall, etc.).
+Run 'proxy' with no arguments for the interactive management menu — it is the
+full interface: import links, subscriptions, WireGuard config, keys, port/MTU/DNS,
+ping test, autostart, updates, and uninstall.
 
-Direct commands (for scripting / quick ops):
+Direct commands (quick ops / scripting):
   proxy start        Start the service
   proxy stop         Stop the service
   proxy restart      Restart the service
   proxy status       Show engine / server / listener status
-  proxy ping [proto] Test the proxy link; proto = get|head|tcp|icmp (default: get)
-  proxy sub <...>    Subscriptions: add|list|select|refresh|remove|status
   proxy logs [args]  Tail service logs (passes args to journalctl)
   proxy help         This help
 
+Everything else lives in the menu (run 'proxy').
 Data lives in $ROOT and survives reboots/firmware upgrades via unifi-common.
 EOF
 }
@@ -1094,30 +1094,17 @@ EOF
 load_settings
 cmd="${1:-}"; [ $# -ge 1 ] && shift || true
 case "$cmd" in
-    # interactive menu (default)
+    # interactive menu (default) — the menu is the full interface for everything:
+    # import, subscriptions, keys, port/MTU/DNS, ping, autostart, update, uninstall.
     "")           need_root; cmd_menu ;;
-    # kept direct commands
+    # kept direct commands (quick ops / scripting)
     start)        need_root; cmd_start ;;
     stop)         need_root; cmd_stop ;;
     restart)      need_root; cmd_restart ;;
     status)       cmd_status ;;
-    ping)         cmd_ping "$@" ;;
-    sub)          need_root; cmd_sub "$@" ;;
     logs)         cmd_logs logs "$@" ;;
     -h|--help|help) usage ;;
-    # internal / hidden (used by installer, boot hook, and the menu)
-    menu)            need_root; cmd_menu ;;
-    import)          need_root; cmd_import "$@" ;;
-    wg-config|wg)    cmd_wg_config ;;
-    config)          cmd_config ;;
-    set)             need_root; [ $# -ge 2 ] || fatal "usage: proxy set <key> <value>"; cmd_set "$1" "$2" ;;
-    regen-keys)      need_root; cmd_regen_keys ;;
-    enable)          need_root; cmd_enable ;;
-    disable)         need_root; cmd_disable ;;
-    update)          need_root; cmd_update ;;
-    geo-update)      need_root; cmd_geo_update ;;
-    version)         [ -x "$XRAY" ] && "$XRAY" version | head -1; echo "proxy-unifi CLI 1.0.0" ;;
-    uninstall)       cmd_uninstall ;;
+    # internal hooks (used only by install.sh and the boot hook, not user-facing)
     install-binary)  need_root; cmd_install_binary ;;
     install-service) need_root; install_service ;;
     *) err "unknown command: $cmd"; echo; usage; exit 1 ;;
