@@ -61,6 +61,51 @@ def host_port(u):
         die("invalid port in link (must be 1-65535)")
 
 
+def safe_port(value):
+    """Parse a port string/int into 1..65535, dying cleanly on anything else."""
+    try:
+        p = int(value)
+    except (TypeError, ValueError):
+        die("invalid port in link (must be a number 1-65535)")
+    if not (0 < p < 65536):
+        die("port out of range in link (1-65535)")
+    return p
+
+
+# Host chars allowed without further IDNA processing: letters/digits/.-_:[] and %
+# (for zone ids). Control bytes, ESC/OSC, whitespace, and a leading '-' are rejected
+# so a hostile server address can't inject terminal sequences or look like a CLI flag.
+_HOST_OK = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:[]%")
+
+
+def valid_host(host):
+    """Return host if it is a safe IP literal or hostname, else die. Always rejects
+    control/whitespace/non-printable characters and a leading hyphen; non-ASCII is
+    allowed only if it is a real IDNA-encodable domain name."""
+    if not host:
+        die("link is missing a server host")
+    if len(host) > 255:
+        die("server host is too long")
+    if host[0] == "-":
+        die("invalid server host (starts with '-')")
+    has_nonascii = False
+    for ch in host:
+        o = ord(ch)
+        if o < 0x20 or o == 0x7f or ch in " \t\r\n":
+            die("invalid server host (control/whitespace characters)")
+        if o > 0x7f:
+            has_nonascii = True
+        elif ch not in _HOST_OK:
+            die("invalid server host (unsafe characters)")
+    if has_nonascii:
+        # non-ASCII present: accept only a real IDNA-encodable domain name
+        try:
+            host.encode("idna")
+        except Exception:
+            die("invalid server host (not a valid domain name)")
+    return host
+
+
 def flat_query(u):
     raw = parse_qs(u.query, keep_blank_values=True)
     return {k: v[0] for k, v in raw.items()}
@@ -76,22 +121,30 @@ def qg(q, *names, default=""):
 def build_stream(q, security, net, host):
     """Build streamSettings shared by VLESS and Trojan.
 
-    Transports/options removed by current Xray are rejected up front with a clear
-    message (instead of emitting a config the core would reject): legacy http/h2,
-    quic, and mKCP. 'allowInsecure' was removed by Xray, so it is silently dropped
-    (it only disabled certificate verification, which we don't want anyway)."""
+    Transports removed by current Xray are rejected up front with a clear message
+    (legacy HTTP/2, QUIC). mKCP is still supported, but its removed header/seed
+    options are rejected. 'allowInsecure' was removed by Xray and has no safe
+    equivalent, so a link that requests it is rejected rather than silently made
+    secure (which would change the link's intended TLS behavior)."""
     if net in ("http", "h2"):
         die("legacy HTTP/2 (h2) transport was removed by Xray; not supported")
     if net == "quic":
         die("QUIC transport was removed by Xray; not supported")
-    if net == "kcp":
-        die("mKCP transport was removed by Xray; not supported")
     stream = {"network": net, "security": security}
 
     # ---- security layer -------------------------------------------------
     sni = qg(q, "sni", "peer", "host") or host
     fp = qg(q, "fp", "fingerprint")
     alpn = qg(q, "alpn")
+    if qg(q, "allowInsecure", "insecure") in ("1", "true", "True"):
+        die("'allowInsecure' was removed by Xray and cannot be honored; "
+            "this link is not supported (it asks to skip certificate verification)")
+    # Security-relevant TLS/REALITY fields we don't map: reject rather than silently
+    # drop, so the link's intended security isn't quietly weakened.
+    for _fld, _desc in (("ech", "ECH"), ("pcs", "post-quantum cert signature"),
+                        ("pqv", "REALITY post-quantum verify")):
+        if qg(q, _fld):
+            die("share-link option '%s' (%s) is not supported by this build" % (_fld, _desc))
 
     if security == "tls":
         tls = {"serverName": sni}
@@ -152,6 +205,13 @@ def build_stream(q, security, net, host):
         if mode:
             xh["mode"] = mode
         stream["xhttpSettings"] = xh
+    elif net == "kcp":
+        # mKCP is still supported, but its header/seed options were removed by Xray.
+        if qg(q, "seed"):
+            die("mKCP 'seed' was removed by Xray; this link is not supported")
+        if header_type not in ("", "none"):
+            die("mKCP header obfuscation was removed by Xray; this link is not supported")
+        stream["kcpSettings"] = {}
     else:
         die("unsupported transport type '%s'" % net)
 
@@ -166,6 +226,7 @@ def parse_vless(link):
         die("vless link is missing the UUID")
     if not host or not port:
         die("vless link is missing the server host/port")
+    host = valid_host(host); port = safe_port(port)
     q = flat_query(u)
 
     user = {"id": uuid, "encryption": qg(q, "encryption", default="none") or "none"}
@@ -180,10 +241,10 @@ def parse_vless(link):
     outbound = {
         "tag": "proxy",
         "protocol": "vless",
-        "settings": {"vnext": [{"address": host, "port": int(port), "users": [user]}]},
+        "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
         "streamSettings": stream,
     }
-    return outbound, host, int(port)
+    return outbound, host, port
 
 
 def parse_trojan(link):
@@ -194,6 +255,7 @@ def parse_trojan(link):
         die("trojan link is missing the password")
     if not host or not port:
         die("trojan link is missing the server host/port")
+    host = valid_host(host); port = safe_port(port)
     q = flat_query(u)
 
     net = qg(q, "type", "net", default="tcp") or "tcp"
@@ -202,7 +264,7 @@ def parse_trojan(link):
 
     # Note: xray removed the "flow" field for Trojan, so it is intentionally not
     # emitted here even if the link carries one.
-    server = {"address": host, "port": int(port), "password": password}
+    server = {"address": host, "port": port, "password": password}
 
     outbound = {
         "tag": "proxy",
@@ -210,7 +272,7 @@ def parse_trojan(link):
         "settings": {"servers": [server]},
         "streamSettings": stream,
     }
-    return outbound, host, int(port)
+    return outbound, host, port
 
 
 def _ss_creds(link):
@@ -235,11 +297,11 @@ def _ss_creds(link):
             creds, hostport = dec.rsplit("@", 1)
             method, password = creds.split(":", 1)
             host, p = hostport.rsplit(":", 1)
-            port = int(p)
+            port = p
 
     if not method or not password or not host or not port:
         die("could not parse shadowsocks link")
-    return method, password, host, int(port)
+    return method, password, valid_host(host), safe_port(port)
 
 
 def ss_plugin_name(link):
@@ -266,13 +328,45 @@ def parse_ss(link):
     return outbound, host, port
 
 
+def _vmess_outbound(host, port, uid, aid, scy, security, net, q):
+    host = valid_host(host); port = safe_port(port)
+    if not uid:
+        die("vmess link is missing the UUID")
+    stream = build_stream(q, security, net, host)
+    user = {"id": uid, "alterId": aid, "security": scy or "auto"}
+    outbound = {
+        "tag": "proxy",
+        "protocol": "vmess",
+        "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
+        "streamSettings": stream,
+    }
+    return outbound, host, port
+
+
 def parse_vmess(link):
-    # Standard (v2rayN) form: vmess://base64(json). Decode and map the fields.
-    body = link[len("vmess://"):]
-    body = body.split("#", 1)[0]
+    # Two forms: legacy base64(JSON), and the current URI form vmess://uuid@host:port?...
+    body = link[len("vmess://"):].split("#", 1)[0]
+    if "@" in body:
+        # URI form (VMess AEAD), same field set as VLESS.
+        u = safe_urlsplit(link)
+        uid = unquote(u.username or "")
+        host, port = host_port(u)
+        if not host or not port:
+            die("vmess link is missing the server host/port")
+        q = flat_query(u)
+        net = qg(q, "type", "net", default="tcp") or "tcp"
+        security = qg(q, "security", default="none") or "none"
+        try:
+            aid = int(qg(q, "aid", default="0") or "0")
+        except ValueError:
+            die("vmess link has an invalid alterId (aid)")
+        scy = qg(q, "scy", "encryption", default="auto") or "auto"
+        return _vmess_outbound(host, port, uid, aid, scy, security, net, q)
+
+    # legacy base64(JSON)
     dec = _b64decode_any(body)
     if not dec:
-        die("could not decode vmess link (expected base64-encoded JSON)")
+        die("could not decode vmess link (expected base64-encoded JSON or URI form)")
     try:
         v = json.loads(dec)
     except Exception:
@@ -282,16 +376,8 @@ def parse_vmess(link):
 
     host = str(v.get("add", "") or "")
     uid = str(v.get("id", "") or "")
-    try:
-        port = int(v.get("port"))
-    except (TypeError, ValueError):
-        die("vmess link has an invalid port")
-    if not (0 < port < 65536):
-        die("vmess link port out of range (1-65535)")
-    if not host or not uid:
-        die("vmess link is missing add/id")
-
-    net = str(v.get("net", "tcp") or "tcp")
+    if not host:
+        die("vmess link is missing the server address")
     tls = str(v.get("tls", "") or "")
     if tls == "reality":
         security = "reality"
@@ -299,8 +385,8 @@ def parse_vmess(link):
         security = "tls"
     else:
         security = "none"
+    net = str(v.get("net", "tcp") or "tcp")
 
-    # translate vmess fields into the same dict shape build_stream() consumes
     q = {}
     for src, dst in (("sni", "sni"), ("host", "host"), ("fp", "fp"),
                      ("alpn", "alpn"), ("type", "headerType"),
@@ -310,24 +396,12 @@ def parse_vmess(link):
     if v.get("path") not in (None, ""):
         q["path"] = str(v["path"])
         q["serviceName"] = str(v["path"])   # grpc carries serviceName in "path"
-    stream = build_stream(q, security, net, host)
-
     try:
         aid = int(v.get("aid", 0) or 0)
     except (TypeError, ValueError):
         die("vmess link has an invalid alterId (aid)")
-    user = {
-        "id": uid,
-        "alterId": aid,
-        "security": str(v.get("scy", "auto") or "auto"),
-    }
-    outbound = {
-        "tag": "proxy",
-        "protocol": "vmess",
-        "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
-        "streamSettings": stream,
-    }
-    return outbound, host, port
+    return _vmess_outbound(host, v.get("port"), uid, aid,
+                           str(v.get("scy", "auto") or "auto"), security, net, q)
 
 
 def parse_link(link):
@@ -413,7 +487,7 @@ def build_config(args):
 
 def main():
     ap = argparse.ArgumentParser(description="Build Xray config for the UniFi WireGuard bridge")
-    ap.add_argument("--link", required=True, help="proxy share link (vless:// / vmess:// / trojan:// / ss://)")
+    ap.add_argument("--link", default="", help="proxy share link (vless:// / vmess:// / trojan:// / ss://)")
     ap.add_argument("--listen", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=0, help="UDP port for the WireGuard inbound")
     ap.add_argument("--secret-key", default="", help="Xray (server) WireGuard private key, base64")
@@ -428,7 +502,30 @@ def main():
     ap.add_argument("--print-server", action="store_true", help="print 'host<TAB>port' of the server and exit")
     ap.add_argument("--print-plugin", action="store_true",
                     help="print the SIP003 plugin name for an ss:// link, else nothing")
+    ap.add_argument("--input-file", default="",
+                    help="JSON file with secret inputs (link/secret_key/peer_pubkey) so they "
+                         "are not exposed in argv; values here override the matching flags")
     args = ap.parse_args()
+
+    # Secret inputs (proxy link + WireGuard private key) are read from a mode-600
+    # file instead of argv to keep them out of the process list, and to avoid the
+    # ARG_MAX limit on very long links.
+    if args.input_file:
+        try:
+            with open(args.input_file, "r", encoding="utf-8") as fh:
+                _inp = json.load(fh)
+        except Exception as e:
+            die("could not read --input-file: %s" % e)
+        if not isinstance(_inp, dict):
+            die("--input-file must contain a JSON object")
+        if "link" in _inp:
+            args.link = str(_inp["link"])
+        if "secret_key" in _inp:
+            args.secret_key = str(_inp["secret_key"])
+        if "peer_pubkey" in _inp:
+            args.peer_pubkey = str(_inp["peer_pubkey"])
+    if not args.link:
+        die("no link provided (use --link or --input-file)")
 
     if args.print_plugin:
         if args.link.strip().lower().startswith("ss://"):

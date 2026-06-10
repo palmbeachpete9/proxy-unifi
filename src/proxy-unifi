@@ -145,19 +145,23 @@ ensure_keys() {
 }
 
 # _ensure_pair <prefix>: guarantee $WG_DIR/<prefix>_private.key + _public.key exist
-# and are consistent, generating/deriving only what is missing.
+# and are CONSISTENT (public is actually derived from private), repairing only the
+# public half when possible and never rotating a valid private key needlessly.
 _ensure_pair() {
     _pp="$WG_DIR/$1_private.key"; _pub="$WG_DIR/$1_public.key"
-    if [ -s "$_pp" ] && [ -s "$_pub" ]; then
-        return 0                                   # both present -> keep as-is
-    fi
-    if [ -s "$_pp" ] && [ ! -s "$_pub" ] && have wg; then
-        # derive the missing public key from the existing private (no rotation)
-        if wg pubkey < "$_pp" > "$_pub.tmp" 2>/dev/null && [ -s "$_pub.tmp" ]; then
-            mv -f "$_pub.tmp" "$_pub"; chmod 600 "$_pub"
+    if [ -s "$_pp" ] && have wg; then
+        # derive the correct public key from the existing private key
+        _derived="$(wg pubkey < "$_pp" 2>/dev/null)"
+        if [ -n "$_derived" ]; then
+            if [ ! -s "$_pub" ] || [ "$_derived" != "$(cat "$_pub" 2>/dev/null)" ]; then
+                # repair only the public half to match the (kept) private key
+                printf '%s' "$_derived" > "$_pub"; chmod 600 "$_pub"
+            fi
             return 0
         fi
-        rm -f "$_pub.tmp"
+        # private key is unreadable/invalid by wg -> fall through and regenerate
+    elif [ -s "$_pp" ] && [ -s "$_pub" ]; then
+        return 0                                   # no 'wg' to verify; trust both
     fi
     # otherwise (re)generate the whole pair
     info "generating WireGuard keypair: $1 ..."
@@ -196,9 +200,18 @@ engine_for_link() {
 }
 
 current_engine() {
-    if [ -f "$ENGINE_FILE" ]; then cat "$ENGINE_FILE"
-    elif [ -f "$OUTBOUND_LINK" ]; then engine_for_link "$(cat "$OUTBOUND_LINK")"
-    else echo xray; fi
+    # Trust the engine marker only if it is exactly "xray" or "singbox"; otherwise
+    # infer from the imported link (an empty/corrupt marker must not default to the
+    # wrong core, e.g. running a hysteria2 link under xray).
+    _ce="$(cat "$ENGINE_FILE" 2>/dev/null || true)"
+    case "$_ce" in
+        xray|singbox) echo "$_ce"; return ;;
+    esac
+    if [ -f "$OUTBOUND_LINK" ]; then
+        _ce="$(engine_for_link "$(cat "$OUTBOUND_LINK")")"
+        [ -n "$_ce" ] && { echo "$_ce"; return; }
+    fi
+    echo xray
 }
 
 # map our (xray-style) loglevel to sing-box's vocabulary
@@ -365,53 +378,55 @@ install_service() {
 
 # Build + validate a config from the given link and, only on success, swap it
 # into place. Never mutates stored state (link.txt) on failure.
+# Secrets (the proxy link + WireGuard private key) are passed to the generator
+# through a mode-600 JSON file, never argv (process-list safety + no ARG_MAX).
 _build_config() {
     _bl="$1"
     ensure_keys
     _eng="$(engine_for_link "$_bl")"
     [ -n "$_eng" ] || fatal "unsupported link (expected vless/vmess/trojan/ss/hysteria2/tuic)"
-    wg_priv="$(cat "$WG_DIR/wg_private.key")"
-    unifi_pub="$(cat "$WG_DIR/unifi_public.key")"
-    mkdir -p "$ETC_DIR"
-    tmpcfg="$(mktemp)"
+    wg_priv="$(cat "$WG_DIR/wg_private.key")" || fatal "could not read WireGuard key"
+    unifi_pub="$(cat "$WG_DIR/unifi_public.key")" || fatal "could not read WireGuard key"
+    mkdir -p "$ETC_DIR" || fatal "could not create $ETC_DIR"
+    tmpcfg="$(mktemp "$ETC_DIR/.cfg.XXXXXX")" || fatal "could not create temp file"
+    _inf="$(mktemp "$ETC_DIR/.in.XXXXXX")" || { rm -f "$tmpcfg"; fatal "could not create temp file"; }
+    # shellcheck disable=SC2064
+    trap "rm -f '$tmpcfg' '$_inf'" EXIT INT TERM HUP
+    chmod 600 "$_inf"
+    # JSON input doc with the secret-bearing fields
+    py - "$_inf" "$_bl" "$wg_priv" "$unifi_pub" <<'PYEOF' || fatal "could not stage generator input"
+import json,sys
+open(sys.argv[1],"w").write(json.dumps({"link":sys.argv[2],"secret_key":sys.argv[3],"peer_pubkey":sys.argv[4]}))
+PYEOF
     if [ "$_eng" = "singbox" ]; then
         ensure_singbox
-        py "$MKSB" \
-            --link "$_bl" --port "$WG_PORT" \
-            --secret-key "$wg_priv" --peer-pubkey "$unifi_pub" \
+        py "$MKSB" --input-file "$_inf" --port "$WG_PORT" \
             --address "$XRAY_ADDR" --mtu "$WG_MTU" --loglevel "$(sb_loglevel)" \
-            > "$tmpcfg" || { rm -f "$tmpcfg"; fatal "config generation failed (check the link)"; }
+            > "$tmpcfg" || fatal "config generation failed (check the link)"
         if [ -x "$SBIN" ]; then
-            "$SBIN" check -c "$tmpcfg" >/dev/null 2>&1 || {
-                rm -f "$tmpcfg"; fatal "sing-box rejected the generated config"
-            }
+            "$SBIN" check -c "$tmpcfg" >/dev/null 2>&1 || fatal "sing-box rejected the generated config"
         fi
     else
-        # optional --dns, injected via positional params so it stays properly quoted
         set --
         [ -n "$INNER_DNS" ] && set -- --dns "$INNER_DNS"
-        py "$MKCONFIG" \
-            --link "$_bl" \
-            --listen "$WG_LISTEN" \
-            --port "$WG_PORT" \
-            --secret-key "$wg_priv" \
-            --peer-pubkey "$unifi_pub" \
-            --address "$XRAY_ADDR" \
-            --mtu "$WG_MTU" \
-            --keepalive "$WG_KEEPALIVE" \
-            --loglevel "$LOGLEVEL" \
+        py "$MKCONFIG" --input-file "$_inf" \
+            --listen "$WG_LISTEN" --port "$WG_PORT" \
+            --address "$XRAY_ADDR" --mtu "$WG_MTU" \
+            --keepalive "$WG_KEEPALIVE" --loglevel "$LOGLEVEL" \
             "$@" \
-            > "$tmpcfg" || { rm -f "$tmpcfg"; fatal "config generation failed (check the link)"; }
+            > "$tmpcfg" || fatal "config generation failed (check the link)"
         # -format json is required because xray infers format from the extension.
         if [ -x "$XRAY" ]; then
-            "$XRAY" run -test -config "$tmpcfg" -format json >/dev/null 2>&1 || {
-                rm -f "$tmpcfg"; fatal "xray rejected the generated config (-test failed)"
-            }
+            "$XRAY" run -test -config "$tmpcfg" -format json >/dev/null 2>&1 \
+                || fatal "xray rejected the generated config (-test failed)"
         fi
     fi
-    mv "$tmpcfg" "$CONFIG"
+    rm -f "$_inf"
+    [ -s "$tmpcfg" ] || fatal "generated config is empty"
+    mv -f "$tmpcfg" "$CONFIG" || fatal "could not install config"
     chmod 600 "$CONFIG"
-    printf '%s' "$_eng" > "$ENGINE_FILE"
+    trap - EXIT INT TERM HUP
+    printf '%s' "$_eng" > "$ENGINE_FILE" || fatal "could not write engine marker"
     # Refresh the systemd unit so ExecStart matches the (possibly changed) engine.
     [ -f "$SERVICE_FILE" ] && write_service || true
 }
@@ -502,7 +517,13 @@ cmd_status() {
         if [ -x "$XRAY" ]; then echo "core:      $("$XRAY" version 2>/dev/null | head -1)"; else echo "core:      xray not installed"; fi
     fi
     echo "server:    $(current_server)"
-    echo "wg listen: ${WG_LISTEN}:${WG_PORT}  mtu=${WG_MTU}"
+    # sing-box has no listen-address option, so it binds the WG port on all
+    # interfaces; report that honestly rather than implying loopback-only.
+    if [ "$_eng" = "singbox" ]; then
+        echo "wg listen: 0.0.0.0:${WG_PORT} (all interfaces; WG-key gated)  mtu=${WG_MTU}"
+    else
+        echo "wg listen: ${WG_LISTEN}:${WG_PORT}  mtu=${WG_MTU}"
+    fi
     if have ss; then
         if ss -lun 2>/dev/null | grep -q ":${WG_PORT}\b"; then c_grn "udp/${WG_PORT}: listening"; else c_ylw "udp/${WG_PORT}: not listening"; fi
     fi
@@ -512,7 +533,8 @@ cmd_logs()    { shift || true; journalctl -u "$SERVICE_NAME" "$@"; }
 cmd_start()   { systemctl start "$SERVICE_NAME"; }
 cmd_stop()    { systemctl stop "$SERVICE_NAME"; }
 cmd_restart() { systemctl restart "$SERVICE_NAME"; }
-_save_autostart() { mkdir -p "$ETC_DIR"; printf '%s' "$1" > "$AUTOSTART_FILE"; }
+# returns nonzero if the marker could not be persisted (caller must not claim success)
+_save_autostart() { mkdir -p "$ETC_DIR" && printf '%s' "$1" > "$AUTOSTART_FILE"; }
 cmd_enable()  { systemctl enable "$SERVICE_NAME"; _save_autostart enabled; }
 cmd_disable() { systemctl disable "$SERVICE_NAME"; _save_autostart disabled; }   # autostart only; use 'stop' to stop now
 
@@ -545,9 +567,18 @@ cmd_set() {
         dns)
             val="$(printf '%s' "$val" | tr -d ' ')"            # comma-separated, no spaces
             [ -z "$val" ] && val="8.8.8.8"                      # empty -> reset to default
-            # settings.env is sourced by the shell, so reject anything that isn't a
-            # plain DNS server/URL char (blocks shell-metachar injection).
-            case "$val" in *[!A-Za-z0-9.:/_,+-]*) fatal "invalid DNS value (allowed: letters, digits, . : / _ , + -)";; esac
+            # The value is rendered into the UniFi WireGuard client's "DNS =" field,
+            # which must be IP addresses (not DoH URLs / hostnames). Validate each
+            # comma-separated entry as an IPv4/IPv6 literal; this also blocks any
+            # shell-metachar injection (settings.env is sourced).
+            py - "$val" <<'PYEOF' || fatal "DNS must be a comma-separated list of IP addresses (e.g. 8.8.8.8,1.1.1.1)"
+import ipaddress, sys
+items = [x for x in sys.argv[1].split(",") if x]
+if not items:
+    sys.exit(1)
+for x in items:
+    ipaddress.ip_address(x)
+PYEOF
             INNER_DNS="$val" ;;
         loglevel)
             case "$val" in debug|info|warning|error|none) LOGLEVEL="$val" ;; *) fatal "loglevel must be debug|info|warning|error|none";; esac ;;
@@ -715,7 +746,8 @@ ping_icmp() {
     _hp="$(_server_hp)"
     _h="$(printf '%s' "$_hp" | cut -f1)"
     [ -n "$_h" ] || { err "could not parse server from link"; return 1; }
-    _out="$(ping -c 1 -W "$PING_TIMEOUT" "$_h" 2>/dev/null)" || { c_red "ICMP ${_h}: timeout (>${PING_TIMEOUT}s)"; return 1; }
+    # '--' so a server host starting with '-' can't be read as a ping option
+    _out="$(ping -c 1 -W "$PING_TIMEOUT" -- "$_h" 2>/dev/null)" || { c_red "ICMP ${_h}: timeout (>${PING_TIMEOUT}s)"; return 1; }
     _ms="$(printf '%s\n' "$_out" | sed -n 's/.*time=\([0-9.]*\).*/\1/p' | head -1)"
     if [ -n "$_ms" ]; then c_grn "ICMP ${_h}: ${_ms} ms"; else c_red "ICMP ${_h}: no reply (host may block ICMP)"; fi
 }
@@ -805,13 +837,15 @@ menu_restart() {
     else c_red "Failed to restart - is a link imported? Check 'View logs'."; fi
 }
 menu_enable() {
-    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then _save_autostart enabled; c_ylw "Autostart is already enabled."
-    elif systemctl enable "$SERVICE_NAME" >/dev/null 2>&1;       then _save_autostart enabled; c_grn "Autostart enabled."
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null || systemctl enable "$SERVICE_NAME" >/dev/null 2>&1; then
+        if _save_autostart enabled; then c_grn "Autostart enabled."
+        else c_red "Enabled, but could not persist the autostart marker."; fi
     else c_red "Failed to enable autostart (is the service installed?)."; fi
 }
 menu_disable() {
-    if ! systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then _save_autostart disabled; c_ylw "Autostart is already disabled."
-    elif systemctl disable "$SERVICE_NAME" >/dev/null 2>&1;        then _save_autostart disabled; c_ylw "Autostart disabled (service keeps running until stopped)."
+    if ! systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null || systemctl disable "$SERVICE_NAME" >/dev/null 2>&1; then
+        if _save_autostart disabled; then c_ylw "Autostart disabled (service keeps running until stopped)."
+        else c_red "Disabled, but could not persist the autostart marker."; fi
     else c_red "Failed to disable autostart."; fi
 }
 
@@ -945,62 +979,80 @@ sub_hwid() {
 # Temp files live under $SUB_DIR (same filesystem as $SUB_CATALOG -> atomic mv);
 # stderr goes to a private temp, never a shared /tmp path.
 # Args: <url> <dest-catalog-file>. Returns 0 and writes dest on success.
+# remove any stale temp files from a previously interrupted fetch
+sub_clean_temps() { rm -f "$SUB_DIR"/.url.* "$SUB_DIR"/.err.* "$SUB_DIR"/.cat.* "$SUB_DIR"/.newcat.* 2>/dev/null || true; }
+
 sub_fetch_to() {
     _f_url="$1"; _f_dest="$2"
-    mkdir -p "$SUB_DIR"; chmod 700 "$SUB_DIR"
-    _f_urlf="$(mktemp "$SUB_DIR/.url.XXXXXX")"
-    _f_err="$(mktemp "$SUB_DIR/.err.XXXXXX")"
-    _f_cat="$(mktemp "$SUB_DIR/.cat.XXXXXX")"
-    printf '%s' "$_f_url" > "$_f_urlf"; chmod 600 "$_f_urlf"
-    sub_hwid >/dev/null
+    mkdir -p "$SUB_DIR" || { err "could not create $SUB_DIR"; return 1; }
+    chmod 700 "$SUB_DIR" 2>/dev/null || true
+    sub_clean_temps
+    _f_urlf="$(mktemp "$SUB_DIR/.url.XXXXXX")" || { err "could not create temp file"; return 1; }
+    _f_err="$(mktemp "$SUB_DIR/.err.XXXXXX")"  || { rm -f "$_f_urlf"; err "could not create temp file"; return 1; }
+    _f_cat="$(mktemp "$SUB_DIR/.cat.XXXXXX")"  || { rm -f "$_f_urlf" "$_f_err"; err "could not create temp file"; return 1; }
+    # token-bearing temp files must never survive an interrupt
+    # shellcheck disable=SC2064
+    trap "rm -f '$_f_urlf' '$_f_err' '$_f_cat'" EXIT INT TERM HUP
+    chmod 600 "$_f_urlf"
+    printf '%s' "$_f_url" > "$_f_urlf" || { trap - EXIT INT TERM HUP; rm -f "$_f_urlf" "$_f_err" "$_f_cat"; err "could not stage URL"; return 1; }
+    sub_hwid >/dev/null || { trap - EXIT INT TERM HUP; rm -f "$_f_urlf" "$_f_err" "$_f_cat"; err "could not prepare HWID"; return 1; }
     if py "$MKSUB" fetch --url-file "$_f_urlf" --hwid-file "$SUB_HWID_FILE" \
-            --ua "proxy-unifi (UniFi OS)" > "$_f_cat" 2>"$_f_err"; then
-        chmod 600 "$_f_cat"; mv -f "$_f_cat" "$_f_dest"
-        rm -f "$_f_urlf" "$_f_err"
-        return 0
+            --ua "proxy-unifi (UniFi OS)" > "$_f_cat" 2>"$_f_err" && [ -s "$_f_cat" ]; then
+        chmod 600 "$_f_cat"
+        if mv -f "$_f_cat" "$_f_dest"; then
+            rm -f "$_f_urlf" "$_f_err"
+            trap - EXIT INT TERM HUP
+            return 0
+        fi
+        err "could not write catalog"
+    else
+        err "$(head -1 "$_f_err" 2>/dev/null | sed 's/^mksub: error: //')"
     fi
-    err "$(head -1 "$_f_err" 2>/dev/null | sed 's/^mksub: error: //')"
     rm -f "$_f_urlf" "$_f_err" "$_f_cat"
+    trap - EXIT INT TERM HUP
     return 1
 }
 
 # Refresh the stored subscription into its catalog (atomic).
 sub_fetch() {
-    [ -s "$SUB_URL_FILE" ] || fatal "no subscription added. Use: proxy sub add <https url>"
+    [ -s "$SUB_URL_FILE" ] || fatal "no subscription configured (menu -> Import or replace -> subscription)"
     sub_fetch_to "$(cat "$SUB_URL_FILE")" "$SUB_CATALOG"
 }
 
 sub_add() {
-    [ -n "${1:-}" ] || fatal "usage: proxy sub add <https subscription url>"
+    [ -n "${1:-}" ] || fatal "a subscription URL is required"
     case "$1" in https://*) : ;; *) fatal "subscription URL must start with https://" ;; esac
     mkdir -p "$SUB_DIR"; chmod 700 "$SUB_DIR"
     c_grn "Fetching subscription..."
     # Fetch to a candidate catalog FIRST; only commit the URL + catalog (and clear
     # any previous selection) once we have a valid non-empty result. A failed add
     # therefore never replaces a working subscription with a broken one.
-    _cand="$(mktemp "$SUB_DIR/.newcat.XXXXXX")"
+    _cand="$(mktemp "$SUB_DIR/.newcat.XXXXXX")" || fatal "could not create temp file"
     if ! sub_fetch_to "$1" "$_cand"; then
         rm -f "$_cand"
         fatal "subscription not added (fetch/parse failed)"
     fi
-    printf '%s' "$1" > "$SUB_URL_FILE"; chmod 600 "$SUB_URL_FILE"
-    mv -f "$_cand" "$SUB_CATALOG"; chmod 600 "$SUB_CATALOG"
+    # commit URL + catalog only after a valid candidate exists; check every write
+    printf '%s' "$1" > "$SUB_URL_FILE" || { rm -f "$_cand"; fatal "could not store subscription URL"; }
+    chmod 600 "$SUB_URL_FILE"
+    mv -f "$_cand" "$SUB_CATALOG" || { rm -f "$_cand"; fatal "could not store catalog"; }
+    chmod 600 "$SUB_CATALOG"
     rm -f "$SUB_SELECTED"            # a new subscription invalidates the old selection
     c_grn "Subscription added."
     sub_list
 }
 
 sub_list() {
-    [ -f "$SUB_CATALOG" ] || fatal "no subscription catalog yet. Use: proxy sub add <url> (or refresh)"
+    [ -f "$SUB_CATALOG" ] || fatal "no subscription catalog yet (menu -> Import or replace -> subscription -> Refresh)"
     py "$MKSUB" render --file "$SUB_CATALOG"
     _sel="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
     [ -n "$_sel" ] && { echo; info "currently selected node id: $_sel"; } || true
 }
 
 sub_select() {
-    [ -n "${1:-}" ] || fatal "usage: proxy sub select <number>"
-    case "$1" in ""|*[!0-9]*) fatal "select takes a node NUMBER from 'proxy sub list'";; esac
-    [ -f "$SUB_CATALOG" ] || fatal "no catalog. Run: proxy sub refresh"
+    [ -n "${1:-}" ] || fatal "a node number is required"
+    case "$1" in ""|*[!0-9]*) fatal "select takes a node NUMBER from the subscription list";; esac
+    [ -f "$SUB_CATALOG" ] || fatal "no catalog yet (refresh the subscription first)"
     _row="$(py "$MKSUB" get --file "$SUB_CATALOG" --index "$1" 2>/dev/null)" \
         || fatal "no node #$1 in the subscription"
     _id="$(printf '%s' "$_row" | cut -f1)"
@@ -1008,10 +1060,18 @@ sub_select() {
     _reason="$(printf '%s' "$_row" | cut -f3)"
     _link="$(printf '%s' "$_row" | cut -f5-)"
     [ "$_ok" = "1" ] || fatal "node #$1 is unsupported${_reason:+ ($_reason)}"
+    # Verify the link we are about to activate still resolves to the catalog id
+    # (guards against any transport mangling the link between get and activation).
+    if ! py "$MKSUB" find --file "$SUB_CATALOG" --id "$_id" >/dev/null 2>&1; then
+        fatal "selected node could not be confirmed in the catalog; refresh and retry"
+    fi
     # reuse the hardened single-link path: builds, validates, applies (or fatals
     # without touching the running config on failure). _FROM_SUB keeps the marker.
     _FROM_SUB=1 cmd_import "$_link"
-    mkdir -p "$SUB_DIR"; printf '%s' "$_id" > "$SUB_SELECTED"; chmod 600 "$SUB_SELECTED"
+    # record the selection only after a successful import; check the write
+    mkdir -p "$SUB_DIR" || fatal "could not record selection"
+    printf '%s' "$_id" > "$SUB_SELECTED" || fatal "could not record selection marker"
+    chmod 600 "$SUB_SELECTED" 2>/dev/null || true
     c_grn "Selected subscription node #$1 (id $_id)."
 }
 
@@ -1029,14 +1089,14 @@ sub_refresh() {
         info "selected node (id $_sel) is unchanged."
     else
         c_ylw "Selected node (id $_sel) changed or was removed by the provider."
-        c_ylw "The active tunnel is unchanged. Run 'proxy sub list' and re-select to apply."
+        c_ylw "The active tunnel is unchanged. Re-open the subscription menu and re-select to apply."
     fi
 }
 
 sub_remove() {
     rm -f "$SUB_URL_FILE" "$SUB_CATALOG" "$SUB_SELECTED"
     c_ylw "Subscription removed (HWID kept). The active tunnel is unchanged."
-    info "To also stop proxying, import a different link or run: proxy stop"
+    info "To also stop proxying, use the menu (Stop) or import a different link."
 }
 
 sub_status() {
@@ -1052,25 +1112,13 @@ if "interval_hours" in m: print("provider hint: refresh every %sh" % m["interval
 if "userinfo" in m: print("userinfo:     %s" % m["userinfo"])
 PYEOF
     else
-        echo "nodes:        (not fetched yet; run: proxy sub refresh)"
+        echo "nodes:        (not fetched yet; refresh from the subscription menu)"
     fi
     _sel="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
     echo "selected:     ${_sel:-(none)}"
     echo "hwid:         $([ -s "$SUB_HWID_FILE" ] && echo set || echo unset)"
 }
 
-cmd_sub() {
-    _action="${1:-}"; shift 2>/dev/null || true
-    case "$_action" in
-        add)     sub_add "${1:-}" ;;
-        list|nodes) sub_list ;;
-        select)  sub_select "${1:-}" ;;
-        refresh) sub_refresh ;;
-        remove)  sub_remove ;;
-        status)  sub_status ;;
-        *) fatal "usage: proxy sub <add|list|select|refresh|remove|status>" ;;
-    esac
-}
 
 cmd_uninstall() {
     need_root

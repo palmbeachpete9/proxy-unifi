@@ -37,9 +37,11 @@ import time
 from urllib.parse import urlsplit, urljoin, unquote
 
 # ---- limits ---------------------------------------------------------------
+SCHEMA_VERSION = 2         # catalog format version (bump on incompatible change)
 MAX_BYTES = 2000000        # 2 MB response cap
 MAX_NODES = 1000           # accepted-node cap
 MAX_LINES = 100000         # input-line scan cap (independent of accepted nodes)
+MAX_LINK = 8000            # per-link byte/char cap (avoids ARG_MAX at activation)
 MAX_REDIRECTS = 3
 TIMEOUT = 15               # per-operation socket timeout (seconds)
 DEADLINE = 30              # overall wall-clock budget for a fetch (seconds)
@@ -113,9 +115,9 @@ def _host_port(u):
 
 
 def _server_of(link, scheme):
-    if scheme == "vmess":
-        body = link[len("vmess://"):].split("#", 1)[0]
-        dec = _b64(body)
+    if scheme == "vmess" and "@" not in link[len("vmess://"):].split("#", 1)[0]:
+        # legacy base64(JSON) form
+        dec = _b64(link[len("vmess://"):].split("#", 1)[0])
         if not dec:
             return ""
         try:
@@ -126,6 +128,7 @@ def _server_of(link, scheme):
             return ""
         h, p = str(v.get("add", "")), v.get("port", "")
         return "%s:%s" % (h, p) if h else ""
+    # URI form (vless/vmess-AEAD/trojan/ss/hysteria2/tuic)
     try:
         u = urlsplit(link)
         h, p = _host_port(u)
@@ -182,9 +185,18 @@ def node_from_link(link):
     link = link.strip()
     if "://" not in link:
         return None
+    # reject control bytes / NUL so the stored link can't differ from what the
+    # shell later activates (shell command-substitution silently drops NUL).
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in link):
+        return None
+    if len(link) > MAX_LINK:
+        return None
     scheme = link.split("://", 1)[0].lower()
     if scheme not in SUPPORTED:
         return None
+    # normalize the scheme casing so the stored/activated link matches what the
+    # (case-sensitive) shell import accepts.
+    link = scheme + link[len(scheme):]
     node = {"scheme": scheme, "link": link, "label": "", "server": "",
             "recognized": True, "engine": "", "reason": ""}
     try:
@@ -249,13 +261,16 @@ def process_body(raw, headers=None):
         die("subscription has no supported nodes (all unrecognized)")
     meta = {"count": len(nodes), "supported": supported}
     if headers:
-        iv = headers.get("profile-update-interval")
-        if iv and str(iv).strip().isdigit():
-            meta["interval_hours"] = int(str(iv).strip())
+        iv = str(headers.get("profile-update-interval", "")).strip()
+        # bound the header (length + range) before int() to avoid a giant-int DoS
+        if iv and len(iv) <= 6 and iv.isdigit():
+            hours = int(iv)
+            if 1 <= hours <= 8760:        # clamp to 1h..1y
+                meta["interval_hours"] = hours
         ui = headers.get("subscription-userinfo")
         if ui:
             meta["userinfo"] = clean(str(ui), 200)
-    return {"meta": meta, "nodes": nodes}
+    return {"schema": SCHEMA_VERSION, "meta": meta, "nodes": nodes}
 
 
 # ---- network (SSRF-safe, DNS-rebinding-safe) ------------------------------
@@ -268,31 +283,55 @@ def _norm_origin(u):
     return (scheme, host, port)
 
 
+def _idna_host(host):
+    """ASCII host suitable for a Host header / SNI; encode IDN names, else die."""
+    try:
+        host.encode("ascii")
+        return host
+    except UnicodeEncodeError:
+        try:
+            return host.encode("idna").decode("ascii")
+        except Exception:
+            die("subscription host is not a valid domain name")
+
+
 def _public_ips(host):
+    """All validated public IPs for host (every resolved address), or die. A
+    non-global/special-purpose address anywhere in the result set is rejected
+    (CGNAT, private, loopback, link-local, reserved, multicast, etc.)."""
     # PROXY_UNIFI_SUB_ALLOW_PRIVATE=1 disables the SSRF guard (tests only).
     allow_private = os.environ.get("PROXY_UNIFI_SUB_ALLOW_PRIVATE") == "1"
     try:
         infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
     except Exception as e:
         die("could not resolve host: %s" % e)
-    ips = []
+    out = []
+    seen = set()
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if not allow_private and (
-                ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        fam, addr = info[0], info[4][0]
+        if addr in seen:
+            continue
+        seen.add(addr)
+        ip = ipaddress.ip_address(addr)
+        if not allow_private and not ip.is_global:
             die("refusing to fetch: %s resolves to a non-public address" % host)
-        ips.append(info[4][0])
-    if not ips:
+        out.append((fam, addr))
+    if not out:
         die("host did not resolve to any address")
-    return ips
+    return out
+
+
+def _remaining(deadline):
+    r = deadline - time.monotonic()
+    if r <= 0:
+        die("subscription request exceeded the time budget")
+    return min(r, TIMEOUT)
 
 
 def _https_get(url, send_hwid, hwid, ua, deadline):
-    """One HTTPS GET, connecting to a pinned validated IP (no second DNS lookup).
-    Returns (status, headers, body_bytes_or_None, redirect_location)."""
-    if time.monotonic() > deadline:
-        die("subscription request exceeded the time budget")
+    """One HTTPS GET. Tries every validated address (mixed IPv4/IPv6 safe). Each
+    blocking op uses the remaining overall budget. Returns
+    (status, headers, body_or_None, redirect_location)."""
     u = urlsplit(url)
     if (u.scheme or "").lower() != "https":
         die("only https:// subscription URLs are allowed")
@@ -300,30 +339,43 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
     if not host:
         die("subscription URL has no host")
     port = u.port or 443
-    ip = _public_ips(host)[0]          # pin the connection to a validated IP
+    sni = _idna_host(host)
     ctx = ssl.create_default_context()
+
+    # connect+TLS to the first address that works (within the shared deadline)
     tls = None
+    last_err = "no address"
+    for fam, addr in _public_ips(host):
+        try:
+            raw = socket.create_connection((addr, port), timeout=_remaining(deadline))
+        except OSError as e:
+            last_err = str(e); continue
+        try:
+            tls = ctx.wrap_socket(raw, server_hostname=sni)
+            break
+        except (ssl.SSLError, OSError) as e:
+            raw.close(); tls = None; last_err = str(e); continue
+    if tls is None:
+        die("could not connect to subscription host: %s" % last_err)
+
     try:
-        raw = socket.create_connection((ip, port), timeout=TIMEOUT)
-    except OSError as e:
-        die("could not connect: %s" % e)
-    try:
-        # verify the cert against the real hostname (SNI), not the pinned IP
-        tls = ctx.wrap_socket(raw, server_hostname=host)
-    except ssl.SSLError as e:
-        raw.close()
-        die("TLS error: %s" % e)
-    except OSError as e:
-        raw.close()
-        die("TLS connection failed: %s" % e)
-    try:
-        # drive http.client directly over the established TLS socket
-        conn = http.client.HTTPConnection(host, port, timeout=TIMEOUT)
+        tls.settimeout(_remaining(deadline))
+        conn = http.client.HTTPConnection(sni, port, timeout=_remaining(deadline))
         conn.sock = tls
         path = u.path or "/"
         if u.query:
             path += "?" + u.query
-        hdrs = {"Host": host, "User-Agent": ua, "Accept": "*/*", "Connection": "close"}
+        # RFC-correct Host header: include port if non-default, bracket IPv6
+        hostport = sni
+        try:
+            ip = ipaddress.ip_address(host)
+            if ip.version == 6:
+                hostport = "[%s]" % host
+        except ValueError:
+            pass
+        if port != 443:
+            hostport = "%s:%d" % (hostport, port)
+        hdrs = {"Host": hostport, "User-Agent": ua, "Accept": "*/*", "Connection": "close"}
         if send_hwid and hwid:
             hdrs["x-hwid"] = hwid
         try:
@@ -343,8 +395,7 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
         try:
             body = b""
             while len(body) <= MAX_BYTES:
-                if time.monotonic() > deadline:
-                    die("subscription download exceeded the time budget")
+                tls.settimeout(_remaining(deadline))
                 chunk = resp.read(65536)
                 if not chunk:
                     break
@@ -409,6 +460,48 @@ def cmd_fetch(args):
     sys.stdout.write("\n")
 
 
+_HEX64 = set("0123456789abcdef")
+
+
+def _validate_node(nd):
+    """Validate one catalog node's shape, or die. Returns the node."""
+    if not isinstance(nd, dict):
+        die("catalog has a malformed node (not an object)")
+    nid = nd.get("id")
+    if not (isinstance(nid, str) and len(nid) == 64 and all(c in _HEX64 for c in nid)):
+        die("catalog node has an invalid id")
+    if not isinstance(nd.get("n"), int) or nd["n"] < 1:
+        die("catalog node has an invalid index")
+    if not isinstance(nd.get("recognized"), bool):
+        die("catalog node has an invalid 'recognized' flag")
+    sch = nd.get("scheme")
+    if not isinstance(sch, str) or sch not in SUPPORTED:
+        die("catalog node has an invalid scheme")
+    link = nd.get("link")
+    if not isinstance(link, str) or "://" not in link or len(link) > MAX_LINK:
+        die("catalog node has an invalid link")
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in link):
+        die("catalog node link contains control characters")
+    for f in ("label", "server", "reason", "engine"):
+        if not isinstance(nd.get(f, ""), str):
+            die("catalog node field '%s' is not a string" % f)
+    return nd
+
+
+def _migrate(cat):
+    """Bring an older catalog up to the current schema, or return None if it
+    cannot be migrated safely (caller then forces a refresh)."""
+    nodes = cat.get("nodes")
+    if not isinstance(nodes, list):
+        return None
+    # schema 1 (pre-versioning): had 'supported' instead of 'recognized', short
+    # 8-char ids, and no 'schema' key. We can't reconstruct full-hash ids from the
+    # old short ones, so a stored selection won't match -> force a refresh.
+    if cat.get("schema") != SCHEMA_VERSION:
+        return None
+    return cat
+
+
 def _load(path):
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -417,6 +510,17 @@ def _load(path):
         die("could not read catalog: %s" % e)
     if not isinstance(cat, dict) or not isinstance(cat.get("nodes"), list):
         die("catalog is malformed")
+    if _migrate(cat) is None:
+        die("subscription catalog is from an older version; run a refresh "
+            "(menu -> Import or replace -> subscription -> Refresh)")
+    seen_n = set(); seen_id = set()
+    for nd in cat["nodes"]:
+        _validate_node(nd)
+        if nd["n"] in seen_n:
+            die("catalog has a duplicate node index")
+        if nd["id"] in seen_id:
+            die("catalog has a duplicate node id")
+        seen_n.add(nd["n"]); seen_id.add(nd["id"])
     return cat
 
 
