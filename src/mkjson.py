@@ -119,6 +119,18 @@ def sanitize_provider(cfg):
     config (a copy of the provider's, inbounds left as-is for the overlay to
     replace by tag)."""
     out = json.loads(json.dumps(cfg))   # deep copy
+    # SECURITY: the provider's local entry inbound is replaced by our loopback
+    # WireGuard inbound (the overlay supplies it, carrying the primary tag). Drop
+    # ALL provider inbounds so a hostile/compromised profile cannot smuggle extra
+    # listeners -- an open socks/http relay or a dokodemo-door to the LAN /
+    # cloud-metadata -- that the by-tag overlay merge would otherwise leave running
+    # as root. Routing rules key off balancerTag/outboundTag, not the dropped
+    # inbounds, so balancer/observatory resolution is unaffected.
+    out.pop("inbounds", None)
+    # Strip service blocks that can open control surfaces or outbound bridges even
+    # without an inbound (api/stats/metrics/policy control planes; reverse tunnels).
+    for k in ("api", "stats", "metrics", "policy", "reverse"):
+        out.pop(k, None)
     log = out.get("log")
     if isinstance(log, dict):
         # absolute access/error log paths from a desktop export won't exist on
