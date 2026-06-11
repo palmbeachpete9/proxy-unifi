@@ -1205,8 +1205,12 @@ sub_fetch_to() {
     chmod 600 "$_f_urlf"
     printf '%s' "$_f_url" > "$_f_urlf" || { trap - EXIT INT TERM HUP; rm -f "$_f_urlf" "$_f_err" "$_f_cat"; err "could not stage URL"; return 1; }
     sub_hwid >/dev/null || { trap - EXIT INT TERM HUP; rm -f "$_f_urlf" "$_f_err" "$_f_cat"; err "could not prepare HWID"; return 1; }
+    # HWID-gated providers (Remnawave) only serve real configs to a recognized
+    # client UA; an honest "proxy-unifi" UA gets the "App not supported"
+    # placeholder. Identify as Happ (on the HWID-only allowlist) -- mksub's
+    # default, so we no longer override it here.
     if py "$MKSUB" fetch --url-file "$_f_urlf" --hwid-file "$SUB_HWID_FILE" \
-            --ua "proxy-unifi (UniFi OS)" > "$_f_cat" 2>"$_f_err" && [ -s "$_f_cat" ]; then
+            > "$_f_cat" 2>"$_f_err" && [ -s "$_f_cat" ]; then
         chmod 600 "$_f_cat"
         if mv -f "$_f_cat" "$_f_dest"; then
             rm -f "$_f_urlf" "$_f_err"
