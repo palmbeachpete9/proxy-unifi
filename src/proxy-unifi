@@ -1267,16 +1267,27 @@ sub_select() {
     _id="$(printf '%s' "$_row" | cut -f1)"
     _ok="$(printf '%s' "$_row" | cut -f2)"
     _reason="$(printf '%s' "$_row" | cut -f3)"
+    _kind="$(printf '%s' "$_row" | cut -f4)"
     _link="$(printf '%s' "$_row" | cut -f5-)"
     [ "$_ok" = "1" ] || fatal "node #$1 is unsupported${_reason:+ ($_reason)}"
-    # Verify the link we are about to activate still resolves to the catalog id
-    # (guards against any transport mangling the link between get and activation).
-    if ! py "$MKSUB" find --file "$SUB_CATALOG" --id "$_id" >/dev/null 2>&1; then
-        fatal "selected node could not be confirmed in the catalog; refresh and retry"
+    if [ "$_kind" = "pool" ]; then
+        # JSON balancer/pool profile: extract its raw JSON and import via the
+        # -confdir balancer path (builds + validates + applies, state-safe).
+        _pf="$(mktemp "$ETC_DIR/.subpool.XXXXXX")" || fatal "could not create temp file"
+        # shellcheck disable=SC2064
+        trap "rm -f '$_pf'" EXIT INT TERM HUP
+        py "$MKSUB" profile --file "$SUB_CATALOG" --id "$_id" > "$_pf" 2>/dev/null \
+            || { rm -f "$_pf"; trap - EXIT INT TERM HUP; fatal "could not extract the selected profile"; }
+        _FROM_SUB=1 cmd_import_json "$_pf"
+        rm -f "$_pf"; trap - EXIT INT TERM HUP
+    else
+        # single share link: reuse the hardened single-link path. Verify it still
+        # resolves to the catalog id first (guards against transport mangling).
+        if ! py "$MKSUB" find --file "$SUB_CATALOG" --id "$_id" >/dev/null 2>&1; then
+            fatal "selected node could not be confirmed in the catalog; refresh and retry"
+        fi
+        _FROM_SUB=1 cmd_import "$_link"
     fi
-    # reuse the hardened single-link path: builds, validates, applies (or fatals
-    # without touching the running config on failure). _FROM_SUB keeps the marker.
-    _FROM_SUB=1 cmd_import "$_link"
     # record the selection only after a successful import; check the write
     mkdir -p "$SUB_DIR" || fatal "could not record selection"
     printf '%s' "$_id" > "$SUB_SELECTED" || fatal "could not record selection marker"

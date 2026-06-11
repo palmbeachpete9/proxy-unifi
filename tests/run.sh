@@ -110,12 +110,33 @@ assert mksub.node_from_link("vless://u@h:443?x=" + "a"*9000) is None
 # label sanitization keeps unicode, drops ESC
 got = mksub.clean("Ru \x1b[31mX")
 assert "\x1b" not in got and "Нидерланды" in mksub.clean("Нидерланды 🇳🇱"), got
-# empty / json / html bodies rejected
+# empty / html / no-outbounds-json bodies rejected
 for b in [b"", base64.b64encode(b"nothing here"), b"<html></html>", base64.b64encode(b'{"x":1}')]:
     try:
         mksub.process_body(b); raise AssertionError("accepted bad body")
     except SystemExit:
         pass
+# JSON balancer profile feed (Remnawave/Happ) parses into selectable pool nodes
+prof = {"remarks": "DE Auto", "outbounds": [
+            {"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{"address": "a.example.com", "port": 443}]}},
+            {"protocol": "vless", "tag": "proxy-2", "settings": {"vnext": [{"address": "b.example.com", "port": 443}]}},
+            {"protocol": "blackhole", "tag": "block"}],
+        "routing": {"balancers": [{"tag": "B", "selector": ["proxy"], "strategy": {"type": "leastLoad"}}],
+                    "rules": [{"type": "field", "network": "tcp,udp", "balancerTag": "B"}]}}
+pcat = mksub.process_body(json.dumps([prof]).encode())
+assert pcat["meta"]["format"] == "json" and pcat["meta"]["count"] == 1, pcat
+pn = pcat["nodes"][0]
+assert pn["kind"] == "pool" and pn["recognized"] and pn["members"] == 2 and pn["strategy"] == "leastLoad", pn
+assert json.loads(pn["profile"])["remarks"] == "DE Auto"
+# a 0.0.0.0 placeholder profile (App-not-supported / device-limit) is rejected
+ph = {"remarks": "App not supported", "outbounds": [
+          {"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{"address": "0.0.0.0", "port": 1}]}}]}
+try:
+    mksub.process_body(json.dumps([ph]).encode()); raise AssertionError("accepted placeholder")
+except SystemExit:
+    pass
+# a 0.0.0.0 placeholder LINK is also flagged unsupported
+assert mksub.node_from_link("vless://u@0.0.0.0:1#x")["recognized"] is False
 # CGNAT blocked by SSRF guard
 import socket
 g = socket.getaddrinfo

@@ -214,6 +214,12 @@ def node_from_link(link):
         if node["recognized"] and not node["server"]:
             node["recognized"] = False
             node["reason"] = "could not parse server host/port"
+        # providers return a 0.0.0.0 placeholder ("App not supported" /
+        # "Limit of devices reached") to unauthorized clients -- flag it clearly
+        # instead of offering a dead node.
+        if node["recognized"] and node["server"].split(":", 1)[0] in ("0.0.0.0", "127.0.0.1"):
+            node["recognized"] = False
+            node["reason"] = "provider placeholder (%s)" % (clean(node["label"], 40) or "not authorized")
     except Exception:
         node["recognized"] = False
         node["reason"] = "unparseable node"
@@ -223,22 +229,125 @@ def node_from_link(link):
     return node
 
 
+def _meta_from_headers(headers):
+    meta = {}
+    if headers:
+        iv = str(headers.get("profile-update-interval", "")).strip()
+        if iv and len(iv) <= 6 and iv.isdigit():
+            hours = int(iv)
+            if 1 <= hours <= 8760:
+                meta["interval_hours"] = hours
+        ui = headers.get("subscription-userinfo")
+        if ui:
+            meta["userinfo"] = clean(str(ui), 200)
+    return meta
+
+
+def _process_json(text, headers):
+    """A JSON subscription: one Xray balancer/pool profile (object) or several
+    (array), as Remnawave serves to recognized HWID clients. Each profile becomes
+    a selectable 'pool' catalog node carrying its own raw JSON."""
+    try:
+        data = json.loads(text)
+    except Exception:
+        die("subscription JSON could not be parsed")
+    profiles = data if isinstance(data, list) else [data]
+    nodes = []
+    seen = set()
+    for prof in profiles:
+        if len(nodes) >= MAX_NODES:
+            break
+        if not isinstance(prof, dict):
+            continue
+        raw_json = json.dumps(prof, ensure_ascii=False, separators=(",", ":"))
+        if len(raw_json) > 200000:        # cap a single profile (sanity)
+            continue
+        nid = hashlib.sha256(raw_json.encode("utf-8", "replace")).hexdigest()
+        if nid in seen:
+            continue
+        seen.add(nid)
+        label = prof.get("remarks") if isinstance(prof.get("remarks"), str) else ""
+        # classify + count balancer members; reject profiles we can't host
+        recognized, reason, members, strat, servers = _classify_profile(prof)
+        nodes.append({
+            "kind": "pool", "scheme": "json", "label": label,
+            "server": ("%d nodes, %s" % (members, strat)) if members else "profile",
+            "recognized": recognized, "engine": "xraypool", "reason": reason,
+            "members": members, "strategy": strat,
+            "id": nid, "profile": raw_json,
+        })
+    for n, nd in enumerate(nodes, 1):
+        nd["n"] = n
+    if not nodes:
+        die("subscription JSON contained no usable profiles")
+    if sum(1 for x in nodes if x["recognized"]) == 0:
+        die("subscription JSON has no supported profiles")
+    meta = {"count": len(nodes), "supported": sum(1 for x in nodes if x["recognized"]),
+            "format": "json"}
+    meta.update(_meta_from_headers(headers))
+    return {"schema": SCHEMA_VERSION, "meta": meta, "nodes": nodes}
+
+
+def _classify_profile(prof):
+    """(recognized, reason, members, strategy, servers) for an Xray JSON profile.
+    A profile is unrecognized if it has no outbounds, or its only proxy server is
+    the provider's 'App not supported' 0.0.0.0 placeholder, or it relies on
+    source/SOCKS-auth routing a WireGuard inbound can't reproduce."""
+    outs = prof.get("outbounds")
+    if not isinstance(outs, list) or not outs:
+        return False, "no outbounds", 0, "", []
+    servers = []
+    for o in outs:
+        if not isinstance(o, dict):
+            continue
+        vn = o.get("settings", {}).get("vnext") if isinstance(o.get("settings"), dict) else None
+        if isinstance(vn, list):
+            for v in vn:
+                if isinstance(v, dict) and v.get("address"):
+                    servers.append(str(v["address"]))
+        elif o.get("server"):
+            servers.append(str(o["server"]))
+    real = [s for s in servers if s not in ("0.0.0.0", "127.0.0.1", "", "1")]
+    if not real:
+        return False, "provider placeholder (app not authorized)", 0, "", servers
+    # source/user routing can't be reproduced by a WireGuard inbound
+    routing = prof.get("routing", {})
+    rules = routing.get("rules", []) if isinstance(routing, dict) else []
+    for r in rules:
+        if isinstance(r, dict) and (r.get("user") or r.get("source") or r.get("sourcePort")):
+            return False, "routing needs source/user identity", 0, "", servers
+    bals = routing.get("balancers") if isinstance(routing, dict) else None
+    members, strat = 0, ""
+    if isinstance(bals, list) and bals and isinstance(bals[0], dict):
+        sels = bals[0].get("selector") or []
+        tags = [str(o.get("tag", "")) for o in outs if isinstance(o, dict)]
+        members = sum(1 for t in tags if any(t.startswith(s) for s in sels))
+        st = bals[0].get("strategy")
+        if isinstance(st, dict):
+            strat = str(st.get("type", "") or "")
+    else:
+        members = len(real)
+    return True, "", members, strat or "single", real
+
+
 def process_body(raw, headers=None):
     text = raw.decode("utf-8", "replace").strip()
     head = text[:200].lstrip().lower()
     if head[:1] == "<" or "<html" in head or "<!doctype" in head:
         die("the URL returned an HTML page, not a subscription")
+    # JSON profile(s) -- a Remnawave/Happ-style Xray balancer feed (object or array).
     if head[:1] in ("{", "["):
-        die("the URL returned a JSON profile, not a link-list subscription. "
-            "Save it to a file and import it via 'JSON balancer/pool profile'")
+        return _process_json(text, headers)
     if "://" not in text:
         dec = _b64(text)
         if not dec or "://" not in dec:
+            # base64 may also wrap a JSON profile feed
+            if dec and dec.lstrip()[:1] in ("{", "["):
+                return _process_json(dec, headers)
             die("could not decode subscription (not a base64 / plain link list)")
         text = dec
         if dec.lstrip()[:1] in ("{", "["):
-            die("the URL returned a JSON profile, not a link-list subscription. "
-                "Save it to a file and import it via 'JSON balancer/pool profile'")
+            return _process_json(dec, headers)
     nodes = []
     seen_ids = set()
     for i, line in enumerate(text.splitlines()):
@@ -258,17 +367,8 @@ def process_body(raw, headers=None):
         die("subscription contained no proxy links")
     if supported == 0:
         die("subscription has no supported nodes (all unrecognized)")
-    meta = {"count": len(nodes), "supported": supported}
-    if headers:
-        iv = str(headers.get("profile-update-interval", "")).strip()
-        # bound the header (length + range) before int() to avoid a giant-int DoS
-        if iv and len(iv) <= 6 and iv.isdigit():
-            hours = int(iv)
-            if 1 <= hours <= 8760:        # clamp to 1h..1y
-                meta["interval_hours"] = hours
-        ui = headers.get("subscription-userinfo")
-        if ui:
-            meta["userinfo"] = clean(str(ui), 200)
+    meta = {"count": len(nodes), "supported": supported, "format": "links"}
+    meta.update(_meta_from_headers(headers))
     return {"schema": SCHEMA_VERSION, "meta": meta, "nodes": nodes}
 
 
@@ -508,13 +608,19 @@ def _validate_node(nd):
     if not isinstance(nd.get("recognized"), bool):
         die("catalog node has an invalid 'recognized' flag")
     sch = nd.get("scheme")
-    if not isinstance(sch, str) or sch not in SUPPORTED:
-        die("catalog node has an invalid scheme")
-    link = nd.get("link")
-    if not isinstance(link, str) or "://" not in link or len(link) > MAX_LINK:
-        die("catalog node has an invalid link")
-    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in link):
-        die("catalog node link contains control characters")
+    if nd.get("kind") == "pool" or sch == "json":
+        # a JSON balancer/pool profile node: validate it carries raw profile JSON
+        prof = nd.get("profile")
+        if not isinstance(prof, str) or not prof.strip() or len(prof) > 200000:
+            die("catalog pool node has an invalid profile")
+    else:
+        if not isinstance(sch, str) or sch not in SUPPORTED:
+            die("catalog node has an invalid scheme")
+        link = nd.get("link")
+        if not isinstance(link, str) or "://" not in link or len(link) > MAX_LINK:
+            die("catalog node has an invalid link")
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in link):
+            die("catalog node link contains control characters")
     for f in ("label", "server", "reason", "engine"):
         if not isinstance(nd.get(f, ""), str):
             die("catalog node field '%s' is not a string" % f)
@@ -582,16 +688,34 @@ def cmd_get(args):
     if not match:
         die("no node #%d in subscription" % args.index)
     nd = match[0]
+    kind = "pool" if (nd.get("kind") == "pool" or nd.get("scheme") == "json") else "link"
+    # for a link node field 5 is the link; for a pool node it is the kind marker
+    payload = "" if kind == "pool" else nd.get("link", "")
     sys.stdout.write("%s\t%s\t%s\t%s\t%s\n" % (
         nd.get("id", ""), "1" if nd.get("recognized") else "0",
-        clean(nd.get("reason", ""), 60), nd.get("scheme", ""), nd.get("link", "")))
+        clean(nd.get("reason", ""), 60), kind, payload))
 
 
 def cmd_find(args):
     for nd in _load(args.file).get("nodes", []):
         if nd.get("id") == args.id and nd.get("recognized"):
-            sys.stdout.write(nd.get("link", "") + "\n")
+            if nd.get("kind") == "pool" or nd.get("scheme") == "json":
+                sys.stdout.write("pool\n")    # caller must use 'profile' to get JSON
+            else:
+                sys.stdout.write(nd.get("link", "") + "\n")
             return
+    sys.exit(1)
+
+
+def cmd_profile(args):
+    """Write the raw JSON profile of a pool node (by id) to stdout, for the shell
+    to import via the balancer/-confdir path."""
+    for nd in _load(args.file).get("nodes", []):
+        if nd.get("id") == args.id and (nd.get("kind") == "pool" or nd.get("scheme") == "json"):
+            prof = nd.get("profile")
+            if isinstance(prof, str) and prof.strip():
+                sys.stdout.write(prof)
+                return
     sys.exit(1)
 
 
@@ -605,7 +729,10 @@ def main():
     f.add_argument("--url-file", default="")
     f.add_argument("--hwid", default="")
     f.add_argument("--hwid-file", default="")
-    f.add_argument("--ua", default="proxy-unifi (UniFi OS)")
+    # Default UA mimics a recognized client: HWID-gated providers (Remnawave)
+    # only serve the real config to allowlisted clients, returning an
+    # "App not supported" placeholder to anything else.
+    f.add_argument("--ua", default="Happ/1.0")
     f.add_argument("--body-file", default="")
     f.set_defaults(fn=cmd_fetch)
 
@@ -622,6 +749,11 @@ def main():
     n.add_argument("--file", required=True)
     n.add_argument("--id", required=True)
     n.set_defaults(fn=cmd_find)
+
+    p = sub.add_parser("profile")
+    p.add_argument("--file", required=True)
+    p.add_argument("--id", required=True)
+    p.set_defaults(fn=cmd_profile)
 
     args = ap.parse_args()
     if not getattr(args, "fn", None):
