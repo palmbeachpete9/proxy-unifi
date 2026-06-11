@@ -714,7 +714,18 @@ _save_autostart() { mkdir -p "$ETC_DIR" && printf '%s' "$1" > "$AUTOSTART_FILE";
 cmd_enable()  { systemctl enable "$SERVICE_NAME"; _save_autostart enabled; }
 cmd_disable() { systemctl disable "$SERVICE_NAME"; _save_autostart disabled; }   # autostart only; use 'stop' to stop now
 
-cmd_config()  { [ -f "$CONFIG" ] || fatal "no config generated yet"; cat "$CONFIG"; }
+cmd_config()  {
+    # A balancer/pool profile runs from a -confdir, not a single config.json;
+    # show the confdir parts so this works in pool mode too.
+    if [ "$(current_engine)" = "xraypool" ] && [ -d "$POOL_DIR" ]; then
+        for _f in "$POOL_DIR"/*.json; do
+            [ -f "$_f" ] || continue
+            printf '===== %s =====\n' "$(basename "$_f")"; cat "$_f"; printf '\n'
+        done
+        return
+    fi
+    [ -f "$CONFIG" ] || fatal "no config generated yet"; cat "$CONFIG"
+}
 
 cmd_set() {
     load_settings
@@ -867,17 +878,27 @@ _ping_cleanup() {
 }
 
 ping_proxy() {   # $1 = get|head
-    _m="$1"; _link="$(cat "$OUTBOUND_LINK")"; _e="$(current_engine)"
+    _m="$1"; _e="$(current_engine)"
     _port="$(_free_port)"
     _cfg="$(mktemp)"; _pid=""
     # ensure the spawned engine + temp config are cleaned up even on Ctrl-C / error
     trap '_ping_cleanup' EXIT INT TERM HUP
-    if [ "$_e" = "singbox" ]; then
+    if [ "$_e" = "xraypool" ]; then
+        # balancer/pool: expose the provider's outbounds through a local SOCKS
+        # inbound so we measure latency through the same balancer xray uses live.
+        [ -x "$XRAY" ] || { err "xray binary not installed"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
+        [ -f "$POOL_SRC" ] || { err "no pool profile on disk"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
+        py "$MKJSON" socksconfig --profile "$POOL_SRC" --socks-port "$_port" > "$_cfg" 2>/dev/null \
+            || { err "could not build test config"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
+        "$XRAY" run -config "$_cfg" -format json >/dev/null 2>&1 &
+    elif [ "$_e" = "singbox" ]; then
+        _link="$(cat "$OUTBOUND_LINK")"
         [ -x "$SBIN" ] || { err "sing-box not installed"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
         py "$MKSB" --link "$_link" --socks-port "$_port" > "$_cfg" 2>/dev/null \
             || { err "could not build test config"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
         "$SBIN" run -c "$_cfg" >/dev/null 2>&1 &
     else
+        _link="$(cat "$OUTBOUND_LINK")"
         [ -x "$XRAY" ] || { err "xray binary not installed"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
         py "$MKCONFIG" --link "$_link" --socks-port "$_port" > "$_cfg" 2>/dev/null \
             || { err "could not build test config"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
@@ -908,8 +929,18 @@ except Exception: sys.exit(1)' >/dev/null 2>&1; then break; fi
     esac
 }
 
+# host<TAB>port of the server to probe directly: the link's server, or (in pool
+# mode, which has no single link) the first reachable server in the profile.
+_ping_target_hp() {
+    if [ "$(current_engine)" = "xraypool" ] && [ -f "$POOL_SRC" ]; then
+        py "$MKJSON" firstserver --profile "$POOL_SRC" 2>/dev/null
+    else
+        _server_hp
+    fi
+}
+
 ping_tcp() {
-    _hp="$(_server_hp)"
+    _hp="$(_ping_target_hp)"
     _h="$(printf '%s' "$_hp" | cut -f1)"; _p="$(printf '%s' "$_hp" | cut -f2)"
     [ -n "$_h" ] || { err "could not parse server from link"; return 1; }
     _ms="$(py - "$_h" "$_p" "$PING_TIMEOUT" <<'PYEOF'
@@ -927,7 +958,7 @@ PYEOF
 }
 
 ping_icmp() {
-    _hp="$(_server_hp)"
+    _hp="$(_ping_target_hp)"
     _h="$(printf '%s' "$_hp" | cut -f1)"
     [ -n "$_h" ] || { err "could not parse server from link"; return 1; }
     # '--' so a server host starting with '-' can't be read as a ping option
@@ -938,8 +969,10 @@ ping_icmp() {
 
 cmd_ping() {
     load_settings
-    if [ ! -f "$OUTBOUND_LINK" ]; then
-        c_ylw "No proxy link imported. Import one first (run 'proxy' -> option 1)."
+    # pool mode keeps its config in $POOL_DIR (no single link file); a plain
+    # link keeps $OUTBOUND_LINK. Either is pingable.
+    if [ ! -f "$OUTBOUND_LINK" ] && [ "$(current_engine)" != "xraypool" ]; then
+        c_ylw "No proxy imported yet. Import a link, subscription, or JSON profile first (menu option 1-3)."
         return 1
     fi
     _mode="${1:-$PING_MODE}"
@@ -971,14 +1004,14 @@ print_menu() {
     printf '┌%s┐\n' "$HR"
     ml "  0. Exit menu"
     printf '├%s┤\n' "$HR"
-    ml "  1. Import or replace connection link"
-    ml "  2. Show current server & config"
-    ml "  3. Show UniFi WireGuard VPN Client config"
-    ml "  4. Regenerate WireGuard keys"
+    ml "  1. Manage a single-server proxy link"
+    ml "  2. Manage a multi-server subscription"
+    ml "  3. Import an Xray JSON profile (from a file)"
+    ml "  4. Show current server & config"
     printf '├%s┤\n' "$HR"
-    ml "  5. Change WireGuard port"
-    ml "  6. Change tunnel MTU"
-    ml "  7. Change tunnel DNS"
+    ml "  5. Show UniFi WireGuard VPN Client config"
+    ml "  6. Regenerate WireGuard keys"
+    ml "  7. Change WireGuard settings"
     printf '├%s┤\n' "$HR"
     ml "  8. Ping test"
     ml "  9. Change test algorithm"
@@ -1062,18 +1095,16 @@ cmd_menu() {
         echo
         case "$sel" in
             0)  exit 0 ;;
-            1)  ( menu_import ) ;;
-            2)  ( cmd_config ) ;;
-            3)  ( cmd_wg_config ) ;;
-            4)  ( printf 'Regenerate keys? This breaks the current UniFi VPN Client until you re-paste the new config. [y/N]: '
+            1)  ( printf 'Paste proxy link (vless/vmess/trojan/ss/hysteria2/tuic): '; read -r _l || true
+                  if [ -n "${_l:-}" ]; then cmd_import "$_l"; else c_ylw "No link entered."; fi ) ;;
+            2)  ( menu_sub ) ;;
+            3)  ( menu_import_json ) ;;
+            4)  ( cmd_config ) ;;
+            5)  ( cmd_wg_config ) ;;
+            6)  ( printf 'Regenerate keys? This breaks the current UniFi VPN Client until you re-paste the new config. [y/N]: '
                   read -r _c || true
                   if [ "${_c:-}" = "y" ]; then cmd_regen_keys; else c_ylw "Cancelled."; fi ) ;;
-            5)  ( printf 'New WireGuard UDP port [%s]: ' "$WG_PORT"; read -r _v || true
-                  if [ -n "${_v:-}" ]; then cmd_set port "$_v"; else c_ylw "Unchanged."; fi ) ;;
-            6)  ( printf 'New tunnel MTU [%s]: ' "$WG_MTU"; read -r _v || true
-                  if [ -n "${_v:-}" ]; then cmd_set mtu "$_v"; else c_ylw "Unchanged."; fi ) ;;
-            7)  ( printf 'Tunnel DNS (comma-separated, empty to reset to 8.8.8.8) [%s]: ' "$INNER_DNS"; read -r _v || true
-                  cmd_set dns "${_v:-}" ) ;;
+            7)  ( menu_wg_settings ) ;;
             8)  ( cmd_ping ) ;;
             9)  ( menu_set_ping ) ;;
             10) ( menu_start ) ;;
@@ -1088,6 +1119,7 @@ cmd_menu() {
             17) ( cmd_update ) ;;
             18) ( cmd_geo_update ) ;;
             19) ( if [ -x "$XRAY" ]; then "$XRAY" version | head -1; else c_ylw "xray-core: not installed"; fi
+                  if [ -x "$SBIN" ]; then "$SBIN" version 2>/dev/null | head -1; else c_ylw "sing-box: not installed"; fi
                   echo "proxy-unifi CLI 1.0.0" ) ;;
             20) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
                 if [ "${_c:-}" = "y" ]; then ( cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
@@ -1097,22 +1129,24 @@ cmd_menu() {
     done
 }
 
-# Import-or-replace entry point: a direct share link, or a subscription.
-menu_import() {
-    echo "Import or replace connection link:"
-    echo "  1. Import a single-server proxy link (vless://, trojan://, hysteria2://, etc.)"
-    echo "  2. Import a multi-server subscription (add / list / select / refresh)"
-    echo "  3. Import an Xray JSON profile (from a file)"
-    echo "  0. Back"
-    printf 'Choice: '
-    read -r _c || true
+# WireGuard tunnel parameters, grouped under one menu entry.
+menu_wg_settings() {
+    load_settings
+    echo "Change WireGuard settings:"
+    echo "  1. Port            (current: $WG_PORT)"
+    echo "  2. MTU             (current: $WG_MTU)"
+    echo "  3. DNS resolvers   (current: $INNER_DNS)"
+    printf 'Please select a setting for modification [1-3]: '
+    read -r _w || true
     echo
-    case "${_c:-0}" in
-        1) printf 'Paste proxy link: '; read -r _l || true
-           if [ -n "${_l:-}" ]; then cmd_import "$_l"; else c_ylw "No link entered."; fi ;;
-        2) menu_sub ;;
-        3) menu_import_json ;;
-        0|"") : ;;
+    case "${_w:-}" in
+        1) printf 'New WireGuard UDP port [%s]: ' "$WG_PORT"; read -r _v || true
+           if [ -n "${_v:-}" ]; then cmd_set port "$_v"; else c_ylw "Unchanged."; fi ;;
+        2) printf 'New tunnel MTU [%s]: ' "$WG_MTU"; read -r _v || true
+           if [ -n "${_v:-}" ]; then cmd_set mtu "$_v"; else c_ylw "Unchanged."; fi ;;
+        3) printf 'Tunnel DNS (comma-separated, empty to reset to 8.8.8.8) [%s]: ' "$INNER_DNS"; read -r _v || true
+           cmd_set dns "${_v:-}" ;;
+        0|"") c_ylw "Cancelled." ;;
         *) c_red "invalid choice" ;;
     esac
 }
@@ -1227,7 +1261,7 @@ sub_fetch_to() {
 
 # Refresh the stored subscription into its catalog (atomic).
 sub_fetch() {
-    [ -s "$SUB_URL_FILE" ] || fatal "no subscription configured (menu -> Import or replace -> subscription)"
+    [ -s "$SUB_URL_FILE" ] || fatal "no subscription configured (menu -> Manage a multi-server subscription)"
     sub_fetch_to "$(cat "$SUB_URL_FILE")" "$SUB_CATALOG"
 }
 
@@ -1255,10 +1289,9 @@ sub_add() {
 }
 
 sub_list() {
-    [ -f "$SUB_CATALOG" ] || fatal "no subscription catalog yet (menu -> Import or replace -> subscription -> Refresh)"
-    py "$MKSUB" render --file "$SUB_CATALOG"
+    [ -f "$SUB_CATALOG" ] || fatal "no subscription catalog yet (menu -> Manage a multi-server subscription -> Refresh)"
     _sel="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
-    [ -n "$_sel" ] && { echo; info "currently selected node id: $_sel"; } || true
+    py "$MKSUB" render --file "$SUB_CATALOG" --selected "$_sel"
 }
 
 sub_select() {

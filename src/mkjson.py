@@ -186,6 +186,51 @@ def cmd_overlay(args):
                      % (primary_tag, members, strat or "-"))
 
 
+def _outbound_server(ob):
+    """Best-effort (host, port) of a proxy outbound (vnext/servers shapes)."""
+    if not isinstance(ob, dict):
+        return (None, None)
+    if ob.get("protocol") in ("blackhole", "freedom", "dns", "loopback"):
+        return (None, None)
+    s = ob.get("settings") or {}
+    for key in ("vnext", "servers"):
+        arr = s.get(key)
+        if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+            a, p = arr[0].get("address"), arr[0].get("port")
+            if a and p:
+                return (str(a), str(p))
+    return (None, None)
+
+
+def cmd_firstserver(args):
+    """Print 'host\\tport' of the first reachable proxy server in the profile,
+    so the shell's TCP/ICMP ping has a concrete host to probe in pool mode."""
+    cfg = _load(args.profile)
+    for ob in cfg.get("outbounds", []):
+        host, port = _outbound_server(ob)
+        if host:
+            sys.stdout.write("%s\t%s\n" % (host, port))
+            return
+    sys.exit(1)
+
+
+def cmd_socksconfig(args):
+    """Emit a complete runnable Xray config that exposes the profile's
+    balancer/outbounds through a local SOCKS inbound -- used by the ping test
+    so 'via proxy' latency can be measured for a pool the same way as a link."""
+    cfg = _load(args.profile)
+    idx, ib = _primary_inbound(cfg)
+    primary_tag = str(ib.get("tag", "") or "socks") if isinstance(ib, dict) else "socks"
+    sniffing = ib.get("sniffing") if isinstance(ib, dict) else None
+    out = sanitize_provider(cfg)
+    inbound = {"tag": primary_tag, "listen": "127.0.0.1", "port": args.socks_port,
+               "protocol": "socks", "settings": {"udp": True}}
+    if isinstance(sniffing, dict):
+        inbound["sniffing"] = sniffing
+    out["inbounds"] = [inbound]
+    sys.stdout.write(json.dumps(out, ensure_ascii=False))
+
+
 def cmd_info(args):
     cfg = _load(args.profile)
     validate_profile(cfg)
@@ -220,6 +265,15 @@ def main():
     f = sub.add_parser("info")
     f.add_argument("--profile", required=True)
     f.set_defaults(fn=cmd_info)
+
+    s = sub.add_parser("socksconfig")
+    s.add_argument("--profile", required=True)
+    s.add_argument("--socks-port", type=int, required=True)
+    s.set_defaults(fn=cmd_socksconfig)
+
+    fs = sub.add_parser("firstserver")
+    fs.add_argument("--profile", required=True)
+    fs.set_defaults(fn=cmd_firstserver)
 
     args = ap.parse_args()
     if not getattr(args, "fn", None):
