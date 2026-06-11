@@ -669,14 +669,19 @@ def cmd_render(args):
     if not nodes:
         print("(no nodes in subscription)")
         return
+    selected = getattr(args, "selected", "") or ""
     for nd in nodes:
-        mark = " " if nd.get("recognized") else "x"
+        if not nd.get("recognized"):
+            mark = "x"
+        elif selected and nd.get("id") == selected:
+            mark = "*"
+        else:
+            mark = " "
         label = clean(nd.get("label", ""), LABEL_MAX) or "(no label)"
         server = clean(nd.get("server", "?"), 40)
         scheme = clean(nd.get("scheme", "?"), 12)
-        idshort = clean(nd.get("id", ""), 8)[:8]
-        line = "%3d. [%s] %-9s %-24s %s  %s" % (
-            nd.get("n", 0), mark, scheme, server, idshort, label)
+        line = "%3d. [%s] %-9s %-24s %s" % (
+            nd.get("n", 0), mark, scheme, server, label)
         if not nd.get("recognized") and nd.get("reason"):
             line += "  (%s)" % clean(nd["reason"], 40)
         print(line)
@@ -738,6 +743,7 @@ def main():
 
     r = sub.add_parser("render")
     r.add_argument("--file", required=True)
+    r.add_argument("--selected", default="")   # id of the active node -> "[*]"
     r.set_defaults(fn=cmd_render)
 
     g = sub.add_parser("get")
