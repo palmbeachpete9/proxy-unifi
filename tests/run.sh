@@ -172,6 +172,19 @@ m, strat, tag = mkjson._balancer_info(prof)
 assert m == 2 and strat == "leastPing" and tag == "B", (m, strat, tag)
 clean = mkjson.sanitize_provider(prof)
 assert "access" not in clean["log"]      # platform path stripped
+# SECURITY: a hostile profile's extra inbounds (open relay / dokodemo to LAN) and
+# control-plane blocks must be dropped, leaving the overlay as the sole inbound.
+evil = json.loads(json.dumps(prof))
+evil["inbounds"].append({"tag": "EVIL", "protocol": "socks", "listen": "0.0.0.0", "port": 1080})
+evil["inbounds"].append({"tag": "DOKO", "protocol": "dokodemo-door", "listen": "0.0.0.0", "port": 1234,
+                         "settings": {"address": "169.254.169.254", "port": 80}})
+evil["api"] = {"tag": "api", "services": ["HandlerService"]}
+evil["reverse"] = {"bridges": [{"tag": "br", "domain": "x"}]}
+sc = mkjson.sanitize_provider(evil)
+assert "inbounds" not in sc, "provider inbounds must be stripped"
+for k in ("api", "stats", "metrics", "policy", "reverse"):
+    assert k not in sc, "%s must be stripped" % k
+assert sc["outbounds"] == evil["outbounds"] and sc["routing"] == evil["routing"]  # resolution intact
 # source/user routing must be rejected
 bad = json.loads(json.dumps(prof))
 bad["routing"]["rules"].append({"type": "field", "source": ["10.0.0.0/8"], "outboundTag": "direct"})
@@ -223,14 +236,16 @@ engine_tests() {
     gs "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?sni=h" && ok "singbox tuic" || bad "singbox tuic"
     # balancer pool: build overlay + validate merged confdir
     printf '%s' "$XP" > "$_d/sk"; printf '%s' "$UP" > "$_d/pk"
+    # profile carries a hostile extra inbound on 0.0.0.0; sanitizer must drop it.
     cat > "$_d/profile.json" <<EOF
-{"log":{"loglevel":"warning"},"inbounds":[{"tag":"socks","protocol":"socks","listen":"127.0.0.1","port":10808,"settings":{"udp":true},"sniffing":{"enabled":true,"destOverride":["tls"]}}],"outbounds":[{"protocol":"freedom","tag":"proxy"},{"protocol":"freedom","tag":"proxy-2"},{"protocol":"blackhole","tag":"block"}],"routing":{"balancers":[{"tag":"B","selector":["proxy"],"strategy":{"type":"leastPing"},"fallbackTag":"block"}],"rules":[{"type":"field","network":"tcp,udp","balancerTag":"B"}]},"burstObservatory":{"subjectSelector":["proxy"],"pingConfig":{"destination":"https://www.gstatic.com/generate_204","interval":"1m","timeout":"3s"}}}
+{"log":{"loglevel":"warning"},"inbounds":[{"tag":"socks","protocol":"socks","listen":"127.0.0.1","port":10808,"settings":{"udp":true},"sniffing":{"enabled":true,"destOverride":["tls"]}},{"tag":"EVIL","protocol":"socks","listen":"0.0.0.0","port":1080,"settings":{"udp":true}}],"outbounds":[{"protocol":"freedom","tag":"proxy"},{"protocol":"freedom","tag":"proxy-2"},{"protocol":"blackhole","tag":"block"}],"routing":{"balancers":[{"tag":"B","selector":["proxy"],"strategy":{"type":"leastPing"},"fallbackTag":"block"}],"rules":[{"type":"field","network":"tcp,udp","balancerTag":"B"}]},"burstObservatory":{"subjectSelector":["proxy"],"pingConfig":{"destination":"https://www.gstatic.com/generate_204","interval":"1m","timeout":"3s"}}}
 EOF
     mkdir -p "$_d/pool"
     if python3 "$SRC/mkjson.py" overlay --profile "$_d/profile.json" \
          --out-provider "$_d/pool/01-provider.json" --out-overlay "$_d/pool/99-overlay.json" \
          --port 51821 --secret-key-file "$_d/sk" --peer-pubkey-file "$_d/pk" >/dev/null 2>&1 \
-       && "$XR" run -test -confdir "$_d/pool" >/dev/null 2>&1
+       && "$XR" run -test -confdir "$_d/pool" >/dev/null 2>&1 \
+       && ! grep -q '0\.0\.0\.0' "$_d/pool/01-provider.json"
     then ok "xray balancer pool (-confdir)"; else bad "xray balancer pool (-confdir)"; fi
     rm -rf "$_d"
 }

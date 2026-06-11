@@ -391,8 +391,24 @@ cmd_install_binary() {
     if have unzip; then
         unzip -oq "$tmp/xray.zip" -d "$tmp" || fatal "unzip failed"
     else
-        py -c "import zipfile,sys; zipfile.ZipFile('$tmp/xray.zip').extractall('$tmp')" \
-            || fatal "could not extract xray.zip (no unzip and python failed)"
+        # zipfile.extractall() is zip-slip-vulnerable (a '../' or absolute member
+        # would write outside $tmp, as root). Validate every member name against the
+        # destination before writing, and extract members individually.
+        py - "$tmp/xray.zip" "$tmp" <<'PYEOF' || fatal "could not extract xray.zip (no unzip and python failed)"
+import os, sys, zipfile
+src, dest = sys.argv[1], os.path.realpath(sys.argv[2])
+with zipfile.ZipFile(src) as z:
+    for name in z.namelist():
+        if name.endswith("/"):
+            continue
+        target = os.path.realpath(os.path.join(dest, name))
+        if target != dest and not target.startswith(dest + os.sep):
+            sys.stderr.write("refusing unsafe zip member: %s\n" % name)
+            sys.exit(1)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with z.open(name) as fh, open(target, "wb") as out:
+            out.write(fh.read())
+PYEOF
     fi
     [ -f "$tmp/xray" ] || fatal "downloaded archive did not contain an xray binary"
     chmod 0755 "$tmp/xray"
