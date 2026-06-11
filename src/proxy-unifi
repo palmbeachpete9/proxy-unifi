@@ -969,8 +969,7 @@ print_menu() {
 
     printf '\n'
     printf '╔%s╗\n' "$HR"
-    ml "  proxy-unifi : multi-core proxy client"
-    ml "  0. Exit Script"
+    ml "  0. script"
     printf '│%s│\n' "$HR"
     ml "  1. Import or replace connection link"
     ml "  2. Show current server & config"
@@ -1101,9 +1100,9 @@ cmd_menu() {
 # Import-or-replace entry point: a direct share link, or a subscription.
 menu_import() {
     echo "Import or replace connection link:"
-    echo "  1. Paste a single proxy link (vless/vmess/trojan/ss/hysteria2/tuic)"
-    echo "  2. Use a subscription (add / list / select / refresh)"
-    echo "  3. Import an Xray JSON balancer/pool profile (from a file)"
+    echo "  1. Import a single-server proxy link (vless://, trojan://, hysteria2://, etc.)"
+    echo "  2. Import a multi-server subscription (add / list / select / refresh)"
+    echo "  3. Import an Xray JSON profile (from a file)"
     echo "  0. Back"
     printf 'Choice: '
     read -r _c || true
