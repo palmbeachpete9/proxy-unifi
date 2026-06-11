@@ -969,7 +969,7 @@ print_menu() {
 
     printf '\n'
     printf '┌%s┐\n' "$HR"
-    ml "  0. Exit script"
+    ml "  0. Exit menu"
     printf '├%s┤\n' "$HR"
     ml "  1. Import or replace connection link"
     ml "  2. Show current server & config"
