@@ -51,8 +51,8 @@ The created `.conf` file & Ubiquiti WireGuard config is persistent for the entir
   │                              │  terminates the tunnel, then routes         │
   │                              ▼  proxy outbound (your imported link)        │
   └──────────────────────────────┼─────────────────────────────────────────────┘
-                                 ▼  out the normal WAN
-                            your proxy / VPN server ──▶ Internet
+                                 ▼  out via WAN
+                            your proxy server ──▶ Internet
 ```
 
 The gateway's own WireGuard VPN Client does a real WireGuard handshake with the
