@@ -59,6 +59,10 @@ XRAY_ADDR="10.7.0.1/32"
 UNIFI_ADDR="10.7.0.2/32"
 INNER_DNS="8.8.8.8"
 LOGLEVEL="warning"
+# Experimental: 1 = let xray's WG inbound use a kernel TUN for the decrypted side
+# (may raise throughput on slower CPUs) instead of the userspace netstack. Default
+# 0 (unchanged behavior). xray engine only; sing-box is unaffected.
+KERNEL_TUN="0"
 PING_MODE="get"
 PING_URL="https://www.gstatic.com/generate_204"
 PING_TIMEOUT="5"
@@ -95,6 +99,7 @@ XRAY_ADDR="$XRAY_ADDR"
 UNIFI_ADDR="$UNIFI_ADDR"
 INNER_DNS="$INNER_DNS"
 LOGLEVEL="$LOGLEVEL"
+KERNEL_TUN="$KERNEL_TUN"
 PING_MODE="$PING_MODE"
 PING_URL="$PING_URL"
 PING_TIMEOUT="$PING_TIMEOUT"
@@ -590,6 +595,7 @@ PYEOF
     else
         set --
         [ -n "$INNER_DNS" ] && set -- --dns "$INNER_DNS"
+        [ "${KERNEL_TUN:-0}" = "1" ] && set -- "$@" --kernel-tun
         py "$MKXRAY" --input-file "$_inf" \
             --listen "$WG_LISTEN" --port "$WG_PORT" \
             --address "$XRAY_ADDR" --mtu "$WG_MTU" \
@@ -633,13 +639,15 @@ _build_pool() {
     _stage="$(mktemp -d "$ETC_DIR/.pool.XXXXXX")" || fatal "could not create temp dir"
     # shellcheck disable=SC2064
     trap "rm -rf '$_stage'" EXIT INT TERM HUP
+    _ktun=""; [ "${KERNEL_TUN:-0}" = "1" ] && _ktun="--kernel-tun"
+    # shellcheck disable=SC2086  # $_ktun is a single optional flag; intentional split
     py "$MKJSON" overlay --profile "$_pf" \
         --out-provider "$_stage/01-provider.json" \
         --out-overlay "$_stage/99-overlay.json" \
         --port "$WG_PORT" \
         --secret-key-file "$WG_DIR/wg_private.key" \
         --peer-pubkey-file "$WG_DIR/unifi_public.key" \
-        --address "$XRAY_ADDR" --mtu "$WG_MTU" --loglevel "$LOGLEVEL" \
+        --address "$XRAY_ADDR" --mtu "$WG_MTU" --loglevel "$LOGLEVEL" $_ktun \
         >/dev/null || fatal "could not build pool profile (unsupported or invalid JSON)"
     "$XRAY" run -test -confdir "$_stage" >/dev/null 2>&1 \
         || fatal "xray rejected the pool profile (-test failed)"
@@ -858,7 +866,13 @@ PYEOF
             INNER_DNS="$val" ;;
         loglevel)
             case "$val" in debug|info|warning|error|none) LOGLEVEL="$val" ;; *) fatal "loglevel must be debug|info|warning|error|none";; esac ;;
-        *) fatal "unknown setting '$key' (port|mtu|dns|keepalive|loglevel|ping)" ;;
+        kernel-tun|kerneltun)
+            case "$val" in
+                on|1|true|yes)  KERNEL_TUN="1" ;;
+                off|0|false|no) KERNEL_TUN="0" ;;
+                *) fatal "kernel-tun must be on or off" ;;
+            esac ;;
+        *) fatal "unknown setting '$key' (port|mtu|dns|keepalive|loglevel|kernel-tun|ping)" ;;
     esac
     save_settings
     if [ -f "$OUTBOUND_LINK" ] || [ -f "$POOL_SRC" ]; then
@@ -1242,11 +1256,13 @@ cmd_menu() {
 # WireGuard tunnel parameters, grouped under one menu entry.
 menu_wg_settings() {
     load_settings
+    _ktun_state="off"; [ "${KERNEL_TUN:-0}" = "1" ] && _ktun_state="on"
     echo "Change WireGuard settings:"
-    echo "  1. Port            (current: $WG_PORT)"
-    echo "  2. MTU             (current: $WG_MTU)"
-    echo "  3. DNS resolvers   (current: $INNER_DNS)"
-    printf 'Please select a setting for modification [1-3]: '
+    echo "  1. Port               (current: $WG_PORT)"
+    echo "  2. MTU                (current: $WG_MTU)"
+    echo "  3. DNS resolvers      (current: $INNER_DNS)"
+    echo "  4. xray kernel TUN    (experimental throughput; current: $_ktun_state)"
+    printf 'Please select a setting for modification [1-4]: '
     read -r _w || true
     echo
     case "${_w:-}" in
@@ -1256,6 +1272,15 @@ menu_wg_settings() {
            if [ -n "${_v:-}" ]; then cmd_set mtu "$_v"; else c_ylw "Unchanged."; fi ;;
         3) printf 'Tunnel DNS (comma-separated, empty to reset to 8.8.8.8) [%s]: ' "$INNER_DNS"; read -r _v || true
            cmd_set dns "${_v:-}" ;;
+        4) c_ylw "Experimental: routes xray's decrypted WG traffic through a kernel TUN."
+           c_ylw "May raise throughput on slower gateways; if the service won't start, turn it back off."
+           if [ "${KERNEL_TUN:-0}" = "1" ]; then
+               printf 'Kernel TUN is ON. Turn it OFF? [y/N]: '; read -r _v || true
+               if [ "${_v:-}" = "y" ]; then cmd_set kernel-tun off; else c_ylw "Unchanged."; fi
+           else
+               printf 'Kernel TUN is OFF. Turn it ON? [y/N]: '; read -r _v || true
+               if [ "${_v:-}" = "y" ]; then cmd_set kernel-tun on; else c_ylw "Unchanged."; fi
+           fi ;;
         0|"") c_ylw "Cancelled." ;;
         *) c_red "invalid choice" ;;
     esac

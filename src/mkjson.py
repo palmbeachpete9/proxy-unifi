@@ -160,7 +160,9 @@ def build_overlay(args, primary_tag, sniffing):
             "secretKey": secret,
             "address": [x for x in args.address.split(",") if x],
             "mtu": args.mtu,
-            "noKernelTun": True,
+            # default userspace netstack; --kernel-tun flips to a kernel TUN for
+            # the decrypted side (experimental throughput knob, matches mkxray).
+            "noKernelTun": not getattr(args, "kernel_tun", False),
             "peers": [{
                 "publicKey": pubkey,
                 "allowedIPs": ["0.0.0.0/0", "::/0"],
@@ -271,6 +273,9 @@ def main():
     o.add_argument("--peer-pubkey-file", required=True)
     o.add_argument("--address", default="10.7.0.1/32")
     o.add_argument("--mtu", type=int, default=1340)
+    o.add_argument("--kernel-tun", action="store_true",
+                   help="use a kernel TUN for the WG inbound's decrypted side "
+                        "instead of the userspace netstack (experimental)")
     o.add_argument("--loglevel", default="warning")
     o.set_defaults(fn=cmd_overlay)
 
