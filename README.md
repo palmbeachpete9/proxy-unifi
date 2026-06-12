@@ -96,9 +96,12 @@ The proxy engine is chosen automatically based on the imported link:
 Only one core runs at a time. Both use the **same** WireGuard keys/port, so the
 single UniFi VPN Client entry works no matter which core is active.
 
-> **Note:** xray binds the WireGuard port on loopback (`127.0.0.1:51821`);
-> sing-box binds it on all interfaces (it has no listen-address option). This is
-> still secure — WireGuard only ever answers the one configured peer key.
+> **Note:** xray binds the WireGuard port on loopback (`127.0.0.1:51821`).
+> sing-box has no listen-address option, so it binds all interfaces — but
+> proxy-unifi adds an `iptables`/`ip6tables` rule that drops every non-loopback
+> packet to that port, making it unreachable from the LAN/WAN. Defence in depth:
+> the port is firewalled to loopback **and** WireGuard only ever answers the one
+> configured peer key.
 
 ## Usage
 
