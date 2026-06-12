@@ -602,8 +602,8 @@ def cmd_fetch(args):
         hwid = _read_secret(args.hwid_file) if args.hwid_file else args.hwid
         raw, headers = fetch_url(url, hwid, args.ua)
     # ensure_ascii=True: the on-disk catalog stays pure ASCII (\uXXXX escapes),
-    # so stored labels -- including astral-plane flag emoji -- survive being
-    # written and read back regardless of the gateway's locale/stream encoding.
+    # so stored text (Cyrillic / CJK labels, ...) survives being written and read
+    # back regardless of the gateway's locale / stream encoding.
     json.dump(process_body(raw, headers), sys.stdout, ensure_ascii=True, indent=2)
     sys.stdout.write("\n")
 

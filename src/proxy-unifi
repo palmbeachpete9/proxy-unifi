@@ -135,8 +135,8 @@ remove_proxy_link() {
 
 py() {
     # Force UTF-8 I/O regardless of the gateway's locale (UniFi OS often runs
-    # with LANG unset / C locale). Without this, writing or printing multi-byte
-    # text -- e.g. flag emoji in subscription labels -- can get mangled.
+    # with LANG unset / C locale). Without this, printing multi-byte text -- e.g.
+    # Cyrillic / CJK subscription labels -- can get mangled.
     PYTHONUTF8=1 PYTHONIOENCODING=utf-8 _py_run "$@"
 }
 _py_run() {
