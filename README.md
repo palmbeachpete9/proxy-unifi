@@ -1,3 +1,9 @@
+<div align="right">
+
+**🇬🇧 English** · [🇷🇺 Русский](README.ru.md)
+
+</div>
+
 # proxy-unifi
 
 Run a headless proxy client on your UniFi Cloud Gateway and steer traffic into it
