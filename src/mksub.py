@@ -84,52 +84,34 @@ def _b64(text):
     return None
 
 
-def _demojibake(s):
-    """Repair text that is UTF-8 wrongly decoded as Latin-1 -- e.g. a flag emoji
-    that an older/locale-broken write turned into 'ð©ðª'. Only maximal runs of
-    U+0080..U+00FF that re-encode to *valid* UTF-8 printable text are fixed;
-    ASCII, Cyrillic, CJK, real emoji and lone accented letters are left as-is, so
-    this is a no-op on already-correct strings (and self-heals a stale catalog)."""
-    if not s or all(ord(c) < 0x80 or ord(c) > 0xFF for c in s):
-        return s
-    out = []
-    i, n = 0, len(s)
-    while i < n:
-        if 0x80 <= ord(s[i]) <= 0xFF:
-            j = i
-            while j < n and 0x80 <= ord(s[j]) <= 0xFF:
-                j += 1
-            run = s[i:j]
-            try:
-                fixed = run.encode("latin-1").decode("utf-8")
-            except (UnicodeEncodeError, UnicodeDecodeError):
-                fixed = None
-            # accept only if it decoded to non-control text (a real repair)
-            out.append(fixed if fixed and all(ord(c) >= 0x20 for c in fixed) else run)
-            i = j
-        else:
-            out.append(s[i])
-            i += 1
-    return "".join(out)
+def _is_emoji(o):
+    """True for emoji / pictographic symbol code points we discard from labels."""
+    return (0x1F000 <= o <= 0x1FAFF or       # emoji & pictographs (incl. flags)
+            0x2600 <= o <= 0x27BF or          # misc symbols + dingbats
+            0x2190 <= o <= 0x21FF or          # arrows
+            0x2B00 <= o <= 0x2BFF or          # misc symbols & arrows
+            0xFE00 <= o <= 0xFE0F or          # variation selectors
+            o in (0x20E3, 0x2122, 0x2139, 0x303D, 0x3030))
 
 
 def clean(s, maxlen=FIELD_MAX):
-    """Make any provider-controlled string safe to print in a terminal.
-    Drops control/bidi/zero-width chars, collapses whitespace, caps length,
-    and repairs UTF-8-as-Latin-1 mojibake. Preserves ordinary Unicode
-    (Cyrillic, CJK, emoji)."""
+    """Make any provider-controlled string safe to print in a terminal, reducing
+    it to plain text. Discards: control/bidi/zero-width chars; the whole Latin-1
+    supplement (0x80-0xFF) -- on minimal/locale-broken gateways a flag emoji
+    routinely arrives UTF-8-as-Latin-1-mangled into this range ('ð©ðª') and is
+    not always recoverable, so we drop it rather than show garbage; and emoji /
+    pictographs. Keeps real text (ASCII, Cyrillic, Greek, CJK, Latin-Extended,
+    ...), collapses whitespace, caps length."""
     if not s:
         return ""
     out = []
-    for ch in _demojibake(str(s)):
+    for ch in str(s):
         o = ord(ch)
-        if o in _BAD:
+        if o in _BAD or 0x80 <= o <= 0xFF or _is_emoji(o):
             continue
-        if ch in ("\t", "\n", "\r"):
-            out.append(" ")
-        else:
-            out.append(ch)
-    r = "".join(out).strip()
+        out.append(" " if ch in ("\t", "\n", "\r") else ch)
+    # collapse runs of whitespace left where emoji/mojibake were removed, and trim
+    r = " ".join("".join(out).split())
     if len(r) > maxlen:
         r = r[:maxlen].rstrip() + "…"
     return r
