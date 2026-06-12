@@ -24,10 +24,11 @@ OUTBOUND_LINK="$ETC_DIR/link.txt"
 POOL_DIR="$ETC_DIR/pool"                    # xray -confdir dir for a JSON balancer profile
 POOL_SRC="$ETC_DIR/pool.json"               # the imported provider profile (verbatim source)
 ENGINE_FILE="$ETC_DIR/engine"               # active engine: "xray" / "singbox" / "xraypool"
+SERVER_CACHE="$ETC_DIR/.server"             # cached "Server:" display string (menu speed)
 MKJSON="$BIN_DIR/mkjson.py"
 AUTOSTART_FILE="$ETC_DIR/autostart"         # "enabled" / "disabled" (persisted across boots)
 SETTINGS="$ETC_DIR/settings.env"
-MKCONFIG="$BIN_DIR/mkconfig.py"
+MKXRAY="$BIN_DIR/mkxray.py"
 MKSB="$BIN_DIR/mksingbox.py"
 MKSUB="$BIN_DIR/mksub.py"
 SUB_DIR="$ETC_DIR/subscription"
@@ -231,7 +232,7 @@ engine_for_link() {
         vless://*|vmess://*|trojan://*) echo xray; return ;;
         hysteria2://*|hy2://*|tuic://*) echo singbox; return ;;
         ss://*)
-            _pn="$(py "$MKCONFIG" --link "$1" --print-plugin 2>/dev/null | cut -f1)"
+            _pn="$(py "$MKXRAY" --link "$1" --print-plugin 2>/dev/null | cut -f1)"
             if [ -z "$_pn" ]; then echo xray; return; fi   # plain SS -> xray
             case "$_pn" in
                 obfs-local|simple-obfs|v2ray-plugin) echo singbox ;;  # sing-box runs these in-process
@@ -439,8 +440,15 @@ PYEOF
     if [ -f "$tmp/geosite.dat" ]; then install -m 0644 "$tmp/geosite.dat" "$BIN_DIR/geosite.dat"; fi
     rm -rf "$tmp"; trap - EXIT INT TERM HUP
     c_grn "xray-core installed: $("$XRAY" version 2>/dev/null | head -1)"
-    # Pre-stage / refresh the sing-box engine (best-effort).
-    cmd_install_singbox || c_ylw "sing-box not installed (continuing); needed only for ss+obfs/v2ray-plugin, hysteria2, tuic links"
+    # sing-box (~48 MB) is only needed for ss+obfs/v2ray-plugin, hysteria2 and
+    # tuic links. Don't download it eagerly: it is installed on demand the first
+    # time such a link is imported (ensure_singbox). On an update, refresh it only
+    # if it is already present, so xray-only installs stay lean.
+    if [ -x "$SBIN" ]; then
+        cmd_install_singbox || c_ylw "sing-box update failed (continuing); the existing version is kept"
+    else
+        info "sing-box not installed (fetched automatically on the first hysteria2/tuic/ss+obfs link)."
+    fi
 }
 
 # --------------------------------------------------------------------------
@@ -582,7 +590,7 @@ PYEOF
     else
         set --
         [ -n "$INNER_DNS" ] && set -- --dns "$INNER_DNS"
-        py "$MKCONFIG" --input-file "$_inf" \
+        py "$MKXRAY" --input-file "$_inf" \
             --listen "$WG_LISTEN" --port "$WG_PORT" \
             --address "$XRAY_ADDR" --mtu "$WG_MTU" \
             --keepalive "$WG_KEEPALIVE" --loglevel "$LOGLEVEL" \
@@ -600,6 +608,7 @@ PYEOF
     chmod 600 "$CONFIG"
     trap - EXIT INT TERM HUP
     printf '%s' "$_eng" > "$ENGINE_FILE" || fatal "could not write engine marker"
+    rm -f "$SERVER_CACHE" 2>/dev/null || true   # server changed -> drop the menu cache
     # Refresh the systemd unit so ExecStart matches the (possibly changed) engine.
     [ -f "$SERVICE_FILE" ] && write_service || true
 }
@@ -642,6 +651,7 @@ _build_pool() {
     rm -rf "$POOL_DIR.old" 2>/dev/null || true
     trap - EXIT INT TERM HUP
     printf 'xraypool' > "$ENGINE_FILE" || fatal "could not write engine marker"
+    rm -f "$SERVER_CACHE" 2>/dev/null || true   # server changed -> drop the menu cache
     # pool mode has no single config.json; clear a stale one so status is accurate
     rm -f "$CONFIG" 2>/dev/null || true
     [ -f "$SERVICE_FILE" ] && write_service || true
@@ -921,22 +931,32 @@ cmd_geo_update() {
 # Print 'host<TAB>port' for the current link using the engine-appropriate generator.
 _server_hp() {
     [ -f "$OUTBOUND_LINK" ] || return 1
-    if [ "$(current_engine)" = "singbox" ]; then _gen="$MKSB"; else _gen="$MKCONFIG"; fi
+    if [ "$(current_engine)" = "singbox" ]; then _gen="$MKSB"; else _gen="$MKXRAY"; fi
     py "$_gen" --link "$(cat "$OUTBOUND_LINK")" --print-server 2>/dev/null
 }
 
+# Cached for menu speed: computing the server string spawns python (link parse
+# or balancer info), which is wasteful on every menu redraw. The value only
+# changes when the config does, so cache it and let _build_config/_build_pool
+# invalidate (rm) the cache. A cache miss recomputes once and re-populates it.
 current_server() {
+    if [ -s "$SERVER_CACHE" ]; then cat "$SERVER_CACHE"; return; fi
+    _cs="$(_compute_server)"
+    printf '%s' "$_cs" > "$SERVER_CACHE" 2>/dev/null || true
+    printf '%s\n' "$_cs"
+}
+_compute_server() {
     # Pool mode has no single server: summarize the balancer instead.
     if [ "$(current_engine)" = "xraypool" ] && [ -f "$POOL_SRC" ]; then
         _pi="$(py "$MKJSON" info --profile "$POOL_SRC" 2>/dev/null)"
         _m="$(printf '%s' "$_pi" | cut -f1)"; _s="$(printf '%s' "$_pi" | cut -f2)"
-        printf 'balancer pool (%s nodes, %s)\n' "${_m:-?}" "${_s:--}"
+        printf 'balancer pool (%s nodes, %s)' "${_m:-?}" "${_s:--}"
         return
     fi
-    [ -f "$OUTBOUND_LINK" ] || { echo "(none imported)"; return; }
-    hp="$(_server_hp)" || { echo "?"; return; }
-    [ -n "$hp" ] || { echo "?"; return; }
-    printf '%s:%s\n' "$(printf '%s' "$hp" | cut -f1)" "$(printf '%s' "$hp" | cut -f2)"
+    [ -f "$OUTBOUND_LINK" ] || { printf '(none imported)'; return; }
+    hp="$(_server_hp)" || { printf '?'; return; }
+    [ -n "$hp" ] || { printf '?'; return; }
+    printf '%s:%s' "$(printf '%s' "$hp" | cut -f1)" "$(printf '%s' "$hp" | cut -f2)"
 }
 
 # --------------------------------------------------------------------------
@@ -979,7 +999,7 @@ ping_proxy() {   # $1 = get|head
     else
         _link="$(cat "$OUTBOUND_LINK")"
         [ -x "$XRAY" ] || { err "xray binary not installed"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
-        py "$MKCONFIG" --link "$_link" --socks-port "$_port" > "$_cfg" 2>/dev/null \
+        py "$MKXRAY" --link "$_link" --socks-port "$_port" > "$_cfg" 2>/dev/null \
             || { err "could not build test config"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
         # -format json: mktemp names have no extension for xray to infer the format from.
         "$XRAY" run -config "$_cfg" -format json >/dev/null 2>&1 &
@@ -1071,7 +1091,12 @@ pause() { printf '\n'; printf 'Press Enter to return to the menu...'; read -r _ 
 
 print_menu() {
     load_settings
-    HR="$(py -c "print('─'*51)" 2>/dev/null || printf '%0.s─' 1 2 3 4 5)"
+    # Build the 51-char box rule once (cached in the global $HR) with pure shell,
+    # instead of spawning python on every redraw.
+    if [ -z "${HR:-}" ]; then
+        HR=""; _i=0
+        while [ "$_i" -lt 51 ]; do HR="${HR}─"; _i=$((_i + 1)); done
+    fi
     svc="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo unknown)"
     auto="$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || echo disabled)"
     lst="down"; if have ss && ss -lun 2>/dev/null | grep -q ":${WG_PORT}\b"; then lst="up"; fi

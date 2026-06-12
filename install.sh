@@ -100,17 +100,20 @@ ensure_unifi_common() {
 install_files() {
     mkdir -p "$BIN_DIR"
     _stage="$(mktemp -d "$WORKDIR/stage.XXXXXX")" || { echo "could not stage" >&2; return 1; }
-    for f in proxy-unifi mkconfig.py mksingbox.py mksub.py mkjson.py on_boot.sh; do
+    for f in proxy-unifi mkxray.py mksingbox.py mksub.py mkjson.py proxylib.py on_boot.sh; do
         fetch "$f" "$_stage/$f" 0755 || { echo "fetch failed: $f" >&2; return 1; }
         [ -s "$_stage/$f" ] || { echo "empty file fetched: $f" >&2; return 1; }
     done
     # basic sanity: the main script must be a shell script
     head -1 "$_stage/proxy-unifi" | grep -q '^#!/bin/sh' || { echo "fetched proxy-unifi looks wrong" >&2; return 1; }
     # promote atomically
-    for f in proxy-unifi mkconfig.py mksingbox.py mksub.py mkjson.py; do
+    for f in proxy-unifi mkxray.py mksingbox.py mksub.py mkjson.py proxylib.py; do
         mv -f "$_stage/$f" "$BIN_DIR/$f" || return 1
         chmod 0755 "$BIN_DIR/$f"
     done
+    # remove the pre-rename generator name so an upgraded install isn't left with
+    # a stale, unused mkconfig.py alongside mkxray.py.
+    rm -f "$BIN_DIR/mkconfig.py"
     mv -f "$_stage/on_boot.sh" "$ONBOOT_DST" || return 1
     chmod 0755 "$ONBOOT_DST"
     # the safe symlink is (re)created by 'install-service'; create it here too for
@@ -124,7 +127,7 @@ install_files() {
 printf '\n  Installing proxy-unifi\n\n'
 run_step "Preparing boot persistence" ensure_unifi_common
 run_step "Installing files"           install_files
-run_step "Downloading cores (xray + sing-box)" "$BIN_DIR/proxy-unifi" install-binary
+run_step "Downloading xray-core"      "$BIN_DIR/proxy-unifi" install-binary
 run_step "Installing service"         "$BIN_DIR/proxy-unifi" install-service
 printf '\n'
 grn "Installed."

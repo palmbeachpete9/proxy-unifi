@@ -41,7 +41,7 @@ static_tests() {
         done
         if [ "$_d" = 0 ]; then ok "dash -n"; else bad "dash -n"; fi
     else printf '  skip dash -n (not installed)\n'; fi
-    if python3 -m py_compile "$SRC"/mkconfig.py "$SRC"/mksingbox.py "$SRC"/mksub.py "$SRC"/mkjson.py 2>/dev/null
+    if python3 -m py_compile "$SRC"/mkxray.py "$SRC"/mksingbox.py "$SRC"/mksub.py "$SRC"/mkjson.py "$SRC"/proxylib.py 2>/dev/null
     then ok "python compile"; else bad "python compile"; fi
     rm -rf "$SRC/__pycache__"
 
@@ -70,7 +70,7 @@ SH
 # -------------------------------------------------------------------------
 # tier 2: parser tests (no network, no engine)
 # -------------------------------------------------------------------------
-# expect mkconfig/mksingbox to ACCEPT (exit 0) or REJECT (exit !=0) a link, and
+# expect mkxray/mksingbox to ACCEPT (exit 0) or REJECT (exit !=0) a link, and
 # never emit a Python traceback.
 expect() {  # <gen> <link> <accept|reject> <name>
     out="$(python3 "$SRC/$1" --link "$2" --port 51821 --secret-key AAAA --peer-pubkey BBBB 2>&1)"; rc=$?
@@ -85,26 +85,26 @@ parser_tests() {
     KEY=cvttX9u3nd7XD16gF4LJ09KjFZ0ZN4x9nk2TQePX5jk
     VM="vmess://$(printf '{"add":"h","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","net":"ws","tls":"tls","host":"h","path":"/w"}' | base64 | tr -d '\n')"
     # accepted forms
-    expect mkconfig.py "vless://u@h:443?security=reality&type=tcp&flow=xtls-rprx-vision&pbk=$KEY&sid=ab&sni=a&fp=chrome" accept "vless reality"
-    expect mkconfig.py "$VM" accept "vmess base64-json"
-    expect mkconfig.py "vmess://b831381d-6324-4d53-ad4f-8cda48b30811@h:443?type=ws&security=tls&path=%2Fw&host=a&sni=a" accept "vmess URI form"
-    expect mkconfig.py "trojan://pw@h:443?security=tls&sni=a" accept "trojan"
-    expect mkconfig.py "ss://$(printf 'aes-256-gcm:pw' | base64 | tr -d '\n')@h:8388" accept "ss plain"
-    expect mkconfig.py "vless://u@h:443?type=kcp&security=none" accept "mKCP plain"
+    expect mkxray.py "vless://u@h:443?security=reality&type=tcp&flow=xtls-rprx-vision&pbk=$KEY&sid=ab&sni=a&fp=chrome" accept "vless reality"
+    expect mkxray.py "$VM" accept "vmess base64-json"
+    expect mkxray.py "vmess://b831381d-6324-4d53-ad4f-8cda48b30811@h:443?type=ws&security=tls&path=%2Fw&host=a&sni=a" accept "vmess URI form"
+    expect mkxray.py "trojan://pw@h:443?security=tls&sni=a" accept "trojan"
+    expect mkxray.py "ss://$(printf 'aes-256-gcm:pw' | base64 | tr -d '\n')@h:8388" accept "ss plain"
+    expect mkxray.py "vless://u@h:443?type=kcp&security=none" accept "mKCP plain"
     expect mksingbox.py "hysteria2://pw@h:443?sni=h" accept "hysteria2"
     expect mksingbox.py "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?sni=h" accept "tuic"
     expect mksingbox.py "ss://$(printf 'aes-256-gcm:pw' | base64 | tr -d '\n')@h:8388?plugin=obfs-local%3Bobfs%3Dhttp" accept "ss+obfs"
     # rejected forms (security / removed transports / bad input)
-    expect mkconfig.py "vless://u@h:443?security=tls&allowInsecure=1&sni=a" reject "allowInsecure rejected"
-    expect mkconfig.py "vless://u@h:443?security=tls&type=quic&sni=a" reject "quic rejected"
-    expect mkconfig.py "vless://u@h:443?type=kcp&seed=x" reject "mKCP seed rejected"
-    expect mkconfig.py "vless://u@-evil:443?security=tls&sni=a" reject "leading-hyphen host"
-    expect mkconfig.py "vless://u@h:notaport?security=tls&sni=a" reject "bad port"
-    expect mkconfig.py "ss://$(printf 'aes-256-gcm:pw@host:notaport' | base64 | tr -d '\n')" reject "ss legacy bad port"
-    expect mkconfig.py "naive+https://x@h:443" reject "unsupported scheme"
+    expect mkxray.py "vless://u@h:443?security=tls&allowInsecure=1&sni=a" reject "allowInsecure rejected"
+    expect mkxray.py "vless://u@h:443?security=tls&type=quic&sni=a" reject "quic rejected"
+    expect mkxray.py "vless://u@h:443?type=kcp&seed=x" reject "mKCP seed rejected"
+    expect mkxray.py "vless://u@-evil:443?security=tls&sni=a" reject "leading-hyphen host"
+    expect mkxray.py "vless://u@h:notaport?security=tls&sni=a" reject "bad port"
+    expect mkxray.py "ss://$(printf 'aes-256-gcm:pw@host:notaport' | base64 | tr -d '\n')" reject "ss legacy bad port"
+    expect mkxray.py "naive+https://x@h:443" reject "unsupported scheme"
 
     # host injection: ESC byte must be rejected (no traceback)
-    out="$(python3 "$SRC/mkconfig.py" --link "$(printf 'vless://u@h\033[2Jx:443?security=tls&sni=a')" --port 51821 --secret-key AAAA --peer-pubkey BBBB 2>&1)" || true
+    out="$(python3 "$SRC/mkxray.py" --link "$(printf 'vless://u@h\033[2Jx:443?security=tls&sni=a')" --port 51821 --secret-key AAAA --peer-pubkey BBBB 2>&1)" || true
     if printf '%s' "$out" | grep -qi 'control\|unsafe\|malformed'; then ok "ESC host rejected"; else bad "ESC host rejected"; fi
 
     # mksub: classification + safety (pure python)
@@ -245,7 +245,7 @@ engine_tests() {
     XP="$(python3 -c 'import os,base64;print(base64.b64encode(os.urandom(32)).decode())')"
     UP="$(python3 -c 'import os,base64;print(base64.b64encode(os.urandom(32)).decode())')"
     _d="$(mktemp -d)"
-    gx() { python3 "$SRC/mkconfig.py" --link "$1" --port 51821 --secret-key "$XP" --peer-pubkey "$UP" > "$_d/c.json" 2>/dev/null \
+    gx() { python3 "$SRC/mkxray.py" --link "$1" --port 51821 --secret-key "$XP" --peer-pubkey "$UP" > "$_d/c.json" 2>/dev/null \
            && "$XR" run -test -config "$_d/c.json" -format json >/dev/null 2>&1; }
     gs() { python3 "$SRC/mksingbox.py" --link "$1" --port 51821 --secret-key "$XP" --peer-pubkey "$UP" > "$_d/s.json" 2>/dev/null \
            && "$SG" check -c "$_d/s.json" >/dev/null 2>&1; }
