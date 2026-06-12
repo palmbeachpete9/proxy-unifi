@@ -128,14 +128,18 @@ n = mksub.node_from_link("VLESS://u@h:443#x"); assert n["link"].startswith("vles
 # control bytes / oversize / dup dropped
 assert mksub.node_from_link("vless://u@h:443\x00evil") is None
 assert mksub.node_from_link("vless://u@h:443?x=" + "a"*9000) is None
-# label sanitization keeps unicode, drops ESC
+# label sanitization: ESC dropped, plain text kept
 got = mksub.clean("Ru \x1b[31mX")
-assert "\x1b" not in got and "Нидерланды" in mksub.clean("Нидерланды 🇳🇱"), got
-# mojibake repair: UTF-8-as-Latin-1 flag emoji is healed; correct text untouched
-stale = "🇩🇪🎯".encode("utf-8").decode("latin-1") + " Автовыбор"
-assert mksub.clean(stale, 36) == "🇩🇪🎯 Автовыбор", mksub.clean(stale, 36)
-for good in ("🇺🇸 США", "café Düsseldorf", "日本", "plain ascii"):
-    assert mksub.clean(good, 40) == good, good
+assert "\x1b" not in got and mksub.clean("Нидерланды 🇳🇱", 40) == "Нидерланды", got
+# emoji + mojibake residue are discarded, leaving only real text
+assert mksub.clean("🇩🇪🎯 Автовыбор | Германия", 40) == "Автовыбор | Германия"
+assert mksub.clean("🇺🇸 США", 40) == "США"
+full = "🇩🇪🎯".encode("utf-8").decode("latin-1") + " Автовыбор"     # full mojibake
+assert mksub.clean(full, 40) == "Автовыбор", mksub.clean(full, 40)
+two = "ð©ðªð¯ Обход"                  # 2-char form (gateway)
+assert mksub.clean(two, 40) == "Обход", mksub.clean(two, 40)
+assert mksub.clean("日本 经由", 40) == "日本 经由"                     # CJK kept
+assert mksub.clean("plain ascii", 40) == "plain ascii"
 # empty / html / no-outbounds-json bodies rejected
 for b in [b"", base64.b64encode(b"nothing here"), b"<html></html>", base64.b64encode(b'{"x":1}')]:
     try:
