@@ -1282,7 +1282,7 @@ menu_import_json() {
 menu_sub() {
     if [ -s "$SUB_URL_FILE" ]; then sub_status; echo; fi
     echo "Subscription:"
-    echo "  1. Add / replace subscription URL"
+    echo "  1. Add or replace subscription URL"
     echo "  2. List nodes"
     echo "  3. Select node"
     echo "  4. Refresh"
