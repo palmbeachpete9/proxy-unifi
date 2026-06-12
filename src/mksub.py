@@ -84,14 +84,44 @@ def _b64(text):
     return None
 
 
+def _demojibake(s):
+    """Repair text that is UTF-8 wrongly decoded as Latin-1 -- e.g. a flag emoji
+    that an older/locale-broken write turned into 'ð©ðª'. Only maximal runs of
+    U+0080..U+00FF that re-encode to *valid* UTF-8 printable text are fixed;
+    ASCII, Cyrillic, CJK, real emoji and lone accented letters are left as-is, so
+    this is a no-op on already-correct strings (and self-heals a stale catalog)."""
+    if not s or all(ord(c) < 0x80 or ord(c) > 0xFF for c in s):
+        return s
+    out = []
+    i, n = 0, len(s)
+    while i < n:
+        if 0x80 <= ord(s[i]) <= 0xFF:
+            j = i
+            while j < n and 0x80 <= ord(s[j]) <= 0xFF:
+                j += 1
+            run = s[i:j]
+            try:
+                fixed = run.encode("latin-1").decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                fixed = None
+            # accept only if it decoded to non-control text (a real repair)
+            out.append(fixed if fixed and all(ord(c) >= 0x20 for c in fixed) else run)
+            i = j
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
 def clean(s, maxlen=FIELD_MAX):
     """Make any provider-controlled string safe to print in a terminal.
-    Drops control/bidi/zero-width chars, collapses whitespace, caps length.
-    Preserves ordinary Unicode (Cyrillic, CJK, emoji)."""
+    Drops control/bidi/zero-width chars, collapses whitespace, caps length,
+    and repairs UTF-8-as-Latin-1 mojibake. Preserves ordinary Unicode
+    (Cyrillic, CJK, emoji)."""
     if not s:
         return ""
     out = []
-    for ch in str(s):
+    for ch in _demojibake(str(s)):
         o = ord(ch)
         if o in _BAD:
             continue
