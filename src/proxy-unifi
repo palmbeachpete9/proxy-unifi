@@ -942,7 +942,10 @@ _server_hp() {
 current_server() {
     if [ -s "$SERVER_CACHE" ]; then cat "$SERVER_CACHE"; return; fi
     _cs="$(_compute_server)"
-    printf '%s' "$_cs" > "$SERVER_CACHE" 2>/dev/null || true
+    # Cache only once $ETC_DIR exists (it does not before the first import), and
+    # put 2>/dev/null BEFORE '>' so a failed open can't leak a shell redirection
+    # error onto the menu.
+    if [ -d "$ETC_DIR" ]; then printf '%s' "$_cs" 2>/dev/null > "$SERVER_CACHE" || true; fi
     printf '%s\n' "$_cs"
 }
 _compute_server() {
@@ -1097,8 +1100,11 @@ print_menu() {
         HR=""; _i=0
         while [ "$_i" -lt 51 ]; do HR="${HR}─"; _i=$((_i + 1)); done
     fi
-    svc="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo unknown)"
-    auto="$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || echo disabled)"
+    # is-active/is-enabled PRINT the state but EXIT non-zero for inactive/disabled,
+    # so '|| echo ...' would append a second word. Capture stdout; default only
+    # when it is empty (e.g. systemctl missing).
+    svc="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)";  [ -n "$svc" ]  || svc=unknown
+    auto="$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null)"; [ -n "$auto" ] || auto=disabled
     lst="down"; if have ss && ss -lun 2>/dev/null | grep -q ":${WG_PORT}\b"; then lst="up"; fi
     ml() { printf '│ %-49s │\n' "$1"; }
     case "$svc" in active) svc_d="Running";; inactive) svc_d="Stopped";; *) svc_d="$svc";; esac
