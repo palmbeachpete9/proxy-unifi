@@ -33,15 +33,20 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # Resolve where we copy source files from: local clone if present, else download.
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || echo "")"
+# Per-run nonce appended to every download URL. raw.githubusercontent.com is
+# served through a CDN that caches each path for minutes; a reinstall could
+# otherwise pull a STALE script (this is exactly what made an emoji fix look
+# like it "didn't apply"). A unique query string is a fresh cache key => fresh file.
+CACHEBUST="$(date +%s 2>/dev/null || echo $$)"
 fetch() {
     # fetch <relative-path> <dest> [mode]
     src="$1"; dst="$2"
     if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/src/$src" ]; then
         install -m "${3:-0755}" "$SCRIPT_DIR/src/$src" "$dst"
     elif have curl; then
-        curl -fsSL "$REPO_RAW/src/$src" -o "$dst" && chmod "${3:-0755}" "$dst"
+        curl -fsSL "$REPO_RAW/src/$src?cb=$CACHEBUST" -o "$dst" && chmod "${3:-0755}" "$dst"
     elif have wget; then
-        wget -qO "$dst" "$REPO_RAW/src/$src" && chmod "${3:-0755}" "$dst"
+        wget -qO "$dst" "$REPO_RAW/src/$src?cb=$CACHEBUST" && chmod "${3:-0755}" "$dst"
     else
         echo "need curl or wget" >&2; return 1
     fi
