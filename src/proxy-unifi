@@ -443,13 +443,63 @@ PYEOF
     cmd_install_singbox || c_ylw "sing-box not installed (continuing); needed only for ss+obfs/v2ray-plugin, hysteria2, tuic links"
 }
 
+# --------------------------------------------------------------------------
+# External-exposure guard for the sing-box engine
+# --------------------------------------------------------------------------
+# xray binds the WireGuard inbound to 127.0.0.1 (loopback-only), so nothing it
+# runs is reachable from the LAN/WAN. sing-box has no bind-address option for its
+# WG inbound and binds 0.0.0.0 (all interfaces). The local UniFi WG client only
+# ever dials 127.0.0.1, so we drop every NON-loopback packet to that UDP port,
+# closing the external surface while leaving the loopback path working. The rule
+# spec is written identically for -C/-D/-I so add/remove always match; both IPv4
+# and IPv6 are covered. Everything here is best-effort and ALWAYS returns 0 so a
+# firewall hiccup can never stop the proxy from starting.
+fw_lock() {
+    load_settings
+    _p="$WG_PORT"
+    for _ipt in iptables ip6tables; do
+        have "$_ipt" || continue
+        # remove any existing copies first so restarts don't stack duplicates
+        _n=0
+        while [ "$_n" -lt 16 ] && "$_ipt" -C INPUT -p udp --dport "$_p" ! -i lo -j DROP 2>/dev/null; do
+            "$_ipt" -D INPUT -p udp --dport "$_p" ! -i lo -j DROP 2>/dev/null || break
+            _n=$((_n + 1))
+        done
+        "$_ipt" -I INPUT -p udp --dport "$_p" ! -i lo -j DROP 2>/dev/null || true
+    done
+    return 0
+}
+fw_unlock() {
+    load_settings
+    _p="$WG_PORT"
+    for _ipt in iptables ip6tables; do
+        have "$_ipt" || continue
+        _n=0
+        while [ "$_n" -lt 16 ] && "$_ipt" -C INPUT -p udp --dport "$_p" ! -i lo -j DROP 2>/dev/null; do
+            "$_ipt" -D INPUT -p udp --dport "$_p" ! -i lo -j DROP 2>/dev/null || break
+            _n=$((_n + 1))
+        done
+    done
+    return 0
+}
+
 write_service() {
     # ExecStart depends on the active engine. Prefer the recorded engine; if the
     # engine file was lost (e.g. after a partial restore) fall back to inferring it.
+    # _fwpre/_fwpost wire the external-exposure guard to the service lifecycle:
+    # for sing-box, block the port BEFORE the binary binds (ExecStartPre) and
+    # clean up on stop; for xray (loopback-only) just clear any stale rule.
     case "$(current_engine)" in
-        singbox)  _exec="$SBIN run -c $CONFIG";        _cond="$CONFIG" ;;
-        xraypool) _exec="$XRAY run -confdir $POOL_DIR"; _cond="$POOL_DIR/99-overlay.json" ;;
-        *)        _exec="$XRAY run -config $CONFIG";    _cond="$CONFIG" ;;
+        singbox)
+            _exec="$SBIN run -c $CONFIG"; _cond="$CONFIG"
+            _fwpre="ExecStartPre=-$BIN_DIR/proxy-unifi _fw-lock"
+            _fwpost="ExecStopPost=-$BIN_DIR/proxy-unifi _fw-unlock" ;;
+        xraypool)
+            _exec="$XRAY run -confdir $POOL_DIR"; _cond="$POOL_DIR/99-overlay.json"
+            _fwpre="ExecStartPre=-$BIN_DIR/proxy-unifi _fw-unlock"; _fwpost="" ;;
+        *)
+            _exec="$XRAY run -config $CONFIG"; _cond="$CONFIG"
+            _fwpre="ExecStartPre=-$BIN_DIR/proxy-unifi _fw-unlock"; _fwpost="" ;;
     esac
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -461,7 +511,9 @@ ConditionPathExists=$_cond
 
 [Service]
 Type=simple
+$_fwpre
 ExecStart=$_exec
+$_fwpost
 Environment=XRAY_LOCATION_ASSET=$BIN_DIR
 WorkingDirectory=$ROOT
 Restart=on-failure
@@ -699,9 +751,14 @@ cmd_status() {
     fi
     echo "server:    $(current_server)"
     # sing-box has no listen-address option, so it binds the WG port on all
-    # interfaces; report that honestly rather than implying loopback-only.
+    # interfaces; a firewall rule blocks non-loopback access. Report what is
+    # actually in effect rather than guessing.
     if [ "$_eng" = "singbox" ]; then
-        echo "wg listen: 0.0.0.0:${WG_PORT} (all interfaces; WG-key gated)  mtu=${WG_MTU}"
+        if have iptables && iptables -C INPUT -p udp --dport "$WG_PORT" ! -i lo -j DROP 2>/dev/null; then
+            echo "wg listen: 0.0.0.0:${WG_PORT} (loopback only; LAN/WAN blocked by firewall)  mtu=${WG_MTU}"
+        else
+            c_ylw "wg listen: 0.0.0.0:${WG_PORT} (all interfaces; firewall rule NOT active)  mtu=${WG_MTU}"
+        fi
     else
         echo "wg listen: ${WG_LISTEN}:${WG_PORT}  mtu=${WG_MTU}"
     fi
@@ -1402,6 +1459,7 @@ cmd_uninstall() {
     need_root
     systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
     systemctl disable --now "$PLUGIN_SERVICE_NAME" 2>/dev/null || true
+    fw_unlock                       # drop the sing-box external-exposure rule, if any
     rm -f "$SERVICE_FILE" "$PLUGIN_SERVICE_FILE" "$ONBOOT_DST"
     remove_proxy_link
     systemctl daemon-reload 2>/dev/null || true
@@ -1446,8 +1504,12 @@ case "$cmd" in
     status)       cmd_status ;;
     logs)         cmd_logs logs "$@" ;;
     -h|--help|help) usage ;;
-    # internal hooks (used only by install.sh and the boot hook, not user-facing)
+    # internal hooks (used only by install.sh, the boot hook, and the systemd
+    # unit's ExecStartPre/ExecStopPost; not user-facing). The _fw-* hooks are
+    # best-effort and always succeed so they can never block service start/stop.
     install-binary)  need_root; cmd_install_binary ;;
     install-service) need_root; install_service ;;
+    _fw-lock)        fw_lock ;;
+    _fw-unlock)      fw_unlock ;;
     *) err "unknown command: $cmd"; echo; usage; exit 1 ;;
 esac

@@ -44,6 +44,27 @@ static_tests() {
     if python3 -m py_compile "$SRC"/mkconfig.py "$SRC"/mksingbox.py "$SRC"/mksub.py "$SRC"/mkjson.py 2>/dev/null
     then ok "python compile"; else bad "python compile"; fi
     rm -rf "$SRC/__pycache__"
+
+    # external-exposure guard: the rendered systemd unit must firewall the
+    # sing-box (0.0.0.0) WG port BEFORE it binds, and must NOT firewall xray
+    # (loopback-only) -- clearing any stale rule instead.
+    _ud="$(mktemp -d)"
+    cat > "$_ud/h.sh" <<'SH'
+SBIN=/b/sing-box; XRAY=/b/xray; CONFIG=/c/config.json; POOL_DIR=/c/pool
+BIN_DIR=/b; ROOT=/r; SERVICE_FILE="$WORK/unit"
+current_engine() { echo "$ENG"; }
+SH
+    awk '/^write_service\(\) \{/,/^}/' "$SRC/proxy-unifi" >> "$_ud/h.sh"
+    echo 'write_service' >> "$_ud/h.sh"
+    _fw_ok=1
+    ENG=singbox  WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
+    grep -q '^ExecStartPre=-/b/proxy-unifi _fw-lock$'  "$_ud/unit" || _fw_ok=0
+    grep -q '^ExecStopPost=-/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
+    ENG=xray     WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
+    grep -q '^ExecStartPre=-/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
+    grep -q '_fw-lock' "$_ud/unit" && _fw_ok=0          # xray must NOT lock a port
+    [ "$_fw_ok" = 1 ] && ok "singbox WG port firewalled (unit)" || bad "singbox WG port firewalled (unit)"
+    rm -rf "$_ud"
 }
 
 # -------------------------------------------------------------------------
