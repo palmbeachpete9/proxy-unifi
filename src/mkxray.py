@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mkconfig.py - Build a complete Xray-core config.json for the UniFi WireGuard bridge.
+mkxray.py - Build a complete Xray-core config.json for the UniFi WireGuard bridge.
 
 Topology:
     UniFi WireGuard VPN Client  --(UDP 127.0.0.1:PORT)-->  Xray WireGuard inbound
@@ -11,111 +11,19 @@ It parses a proxy share link into an Xray outbound and emits a full config that
 terminates a WireGuard peer (the UniFi gateway) locally and forwards everything
 out through that proxy server.
 
-Dependency-free (Python 3.7+ stdlib only) so it runs on the gateway as shipped.
+Generic link-parsing helpers (URL split, host/port validation, base64, query
+helpers, the --input-file loader, die) live in proxylib.py, shared with
+mksingbox.py. Stdlib only (Python 3.7+) so it runs on the gateway as shipped.
 """
 
 import argparse
-import base64
 import ipaddress
 import json
 import sys
-from urllib.parse import urlsplit, parse_qs, unquote
+from urllib.parse import urlsplit, unquote
 
-
-def die(msg):
-    sys.stderr.write("mkconfig: error: %s\n" % msg)
-    sys.exit(2)
-
-
-def _b64_pad(s):
-    return s + "=" * (-len(s) % 4)
-
-
-def _b64decode_any(s):
-    """Decode url-safe or standard base64, with or without padding."""
-    s = s.strip()
-    for dec in (base64.urlsafe_b64decode, base64.b64decode):
-        try:
-            return dec(_b64_pad(s)).decode("utf-8")
-        except Exception:
-            pass
-    return None
-
-
-def safe_urlsplit(link):
-    """urlsplit that dies cleanly instead of raising on a malformed URL
-    (e.g. an unterminated bracketed IPv6 host)."""
-    try:
-        return urlsplit(link)
-    except ValueError:
-        die("malformed link (could not parse URL)")
-
-
-def host_port(u):
-    """(hostname, port) from a urlsplit result. urlsplit raises ValueError for a
-    non-numeric/out-of-range port instead of returning None, so catch it and die
-    cleanly rather than letting a traceback escape."""
-    try:
-        return u.hostname, u.port
-    except ValueError:
-        die("invalid port in link (must be 1-65535)")
-
-
-def safe_port(value):
-    """Parse a port string/int into 1..65535, dying cleanly on anything else."""
-    try:
-        p = int(value)
-    except (TypeError, ValueError):
-        die("invalid port in link (must be a number 1-65535)")
-    if not (0 < p < 65536):
-        die("port out of range in link (1-65535)")
-    return p
-
-
-# Host chars allowed without further IDNA processing: letters/digits/.-_:[] and %
-# (for zone ids). Control bytes, ESC/OSC, whitespace, and a leading '-' are rejected
-# so a hostile server address can't inject terminal sequences or look like a CLI flag.
-_HOST_OK = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:[]%")
-
-
-def valid_host(host):
-    """Return host if it is a safe IP literal or hostname, else die. Always rejects
-    control/whitespace/non-printable characters and a leading hyphen; non-ASCII is
-    allowed only if it is a real IDNA-encodable domain name."""
-    if not host:
-        die("link is missing a server host")
-    if len(host) > 255:
-        die("server host is too long")
-    if host[0] == "-":
-        die("invalid server host (starts with '-')")
-    has_nonascii = False
-    for ch in host:
-        o = ord(ch)
-        if o < 0x20 or o == 0x7f or ch in " \t\r\n":
-            die("invalid server host (control/whitespace characters)")
-        if o > 0x7f:
-            has_nonascii = True
-        elif ch not in _HOST_OK:
-            die("invalid server host (unsafe characters)")
-    if has_nonascii:
-        # non-ASCII present: accept only a real IDNA-encodable domain name
-        try:
-            host.encode("idna")
-        except Exception:
-            die("invalid server host (not a valid domain name)")
-    return host
-
-
-def flat_query(u):
-    raw = parse_qs(u.query, keep_blank_values=True)
-    return {k: v[0] for k, v in raw.items()}
-
-
-def qg(q, *names, default=""):
-    for n in names:
-        if q.get(n, "") != "":
-            return q[n]
-    return default
+from proxylib import (die, b64decode_any, flat_query, qg, safe_urlsplit,
+                      host_port, safe_port, valid_host, apply_input_file)
 
 
 def build_stream(q, security, net, host):
@@ -286,13 +194,13 @@ def _ss_creds(link):
         if u.password is not None:
             method, password = unquote(u.username), unquote(u.password)
         else:
-            dec = _b64decode_any(u.username)
+            dec = b64decode_any(u.username)
             if dec and ":" in dec:
                 method, password = dec.split(":", 1)
 
     # Legacy: ss://base64(method:password@host:port)
     if method is None:
-        dec = _b64decode_any(u.netloc)
+        dec = b64decode_any(u.netloc)
         if dec and "@" in dec and ":" in dec:
             creds, hostport = dec.rsplit("@", 1)
             method, password = creds.split(":", 1)
@@ -364,7 +272,7 @@ def parse_vmess(link):
         return _vmess_outbound(host, port, uid, aid, scy, security, net, q)
 
     # legacy base64(JSON)
-    dec = _b64decode_any(body)
+    dec = b64decode_any(body)
     if not dec:
         die("could not decode vmess link (expected base64-encoded JSON or URI form)")
     try:
@@ -510,20 +418,7 @@ def main():
     # Secret inputs (proxy link + WireGuard private key) are read from a mode-600
     # file instead of argv to keep them out of the process list, and to avoid the
     # ARG_MAX limit on very long links.
-    if args.input_file:
-        try:
-            with open(args.input_file, "r", encoding="utf-8") as fh:
-                _inp = json.load(fh)
-        except Exception as e:
-            die("could not read --input-file: %s" % e)
-        if not isinstance(_inp, dict):
-            die("--input-file must contain a JSON object")
-        if "link" in _inp:
-            args.link = str(_inp["link"])
-        if "secret_key" in _inp:
-            args.secret_key = str(_inp["secret_key"])
-        if "peer_pubkey" in _inp:
-            args.peer_pubkey = str(_inp["peer_pubkey"])
+    apply_input_file(args)
     if not args.link:
         die("no link provided (use --link or --input-file)")
 

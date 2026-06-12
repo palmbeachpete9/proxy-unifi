@@ -13,96 +13,12 @@ Stdlib only (Python 3.7+).
 """
 
 import argparse
-import base64
 import json
 import sys
-from urllib.parse import urlsplit, parse_qs, unquote
+from urllib.parse import unquote
 
-
-def die(msg):
-    sys.stderr.write("mksingbox: error: %s\n" % msg)
-    sys.exit(2)
-
-
-def _b64_pad(s):
-    return s + "=" * (-len(s) % 4)
-
-
-def _b64decode_any(s):
-    s = s.strip()
-    for dec in (base64.urlsafe_b64decode, base64.b64decode):
-        try:
-            return dec(_b64_pad(s)).decode("utf-8")
-        except Exception:
-            pass
-    return None
-
-
-def flat_query(u):
-    return {k: v[0] for k, v in parse_qs(u.query, keep_blank_values=True).items()}
-
-
-def qg(q, *names, default=""):
-    for n in names:
-        if q.get(n, "") != "":
-            return q[n]
-    return default
-
-
-def safe_urlsplit(link):
-    """urlsplit that dies cleanly on a malformed URL (e.g. bad bracketed host)."""
-    try:
-        return urlsplit(link)
-    except ValueError:
-        die("malformed link (could not parse URL)")
-
-
-def host_port(u):
-    """(hostname, port) from a urlsplit result, dying cleanly on a bad port
-    (urlsplit raises ValueError instead of returning None for non-numeric ports)."""
-    try:
-        return u.hostname, u.port
-    except ValueError:
-        die("invalid port in link (must be 1-65535)")
-
-
-def safe_port(value):
-    try:
-        p = int(value)
-    except (TypeError, ValueError):
-        die("invalid port in link (must be a number 1-65535)")
-    if not (0 < p < 65536):
-        die("port out of range in link (1-65535)")
-    return p
-
-
-_HOST_OK = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:[]%")
-
-
-def valid_host(host):
-    """Return host if it is a safe IP/hostname, else die. Always rejects control/
-    whitespace chars and a leading hyphen; non-ASCII only if IDNA-encodable."""
-    if not host:
-        die("link is missing a server host")
-    if len(host) > 255:
-        die("server host is too long")
-    if host[0] == "-":
-        die("invalid server host (starts with '-')")
-    has_nonascii = False
-    for ch in host:
-        o = ord(ch)
-        if o < 0x20 or o == 0x7f or ch in " \t\r\n":
-            die("invalid server host (control/whitespace characters)")
-        if o > 0x7f:
-            has_nonascii = True
-        elif ch not in _HOST_OK:
-            die("invalid server host (unsafe characters)")
-    if has_nonascii:
-        try:
-            host.encode("idna")
-        except Exception:
-            die("invalid server host (not a valid domain name)")
-    return host
+from proxylib import (die, b64decode_any, flat_query, qg, safe_urlsplit,
+                      host_port, safe_port, valid_host, apply_input_file)
 
 
 def _truthy(v):
@@ -141,11 +57,11 @@ def parse_ss(link):
         if u.password is not None:
             method, password = unquote(u.username), unquote(u.password)
         else:
-            dec = _b64decode_any(u.username)
+            dec = b64decode_any(u.username)
             if dec and ":" in dec:
                 method, password = dec.split(":", 1)
     if method is None:
-        dec = _b64decode_any(u.netloc)
+        dec = b64decode_any(u.netloc)
         if dec and "@" in dec and ":" in dec:
             creds, hostport = dec.rsplit("@", 1)
             method, password = creds.split(":", 1)
@@ -296,20 +212,7 @@ def main():
     args = ap.parse_args()
 
     # Secrets via a mode-600 file instead of argv (process-list safety + no ARG_MAX).
-    if args.input_file:
-        try:
-            with open(args.input_file, "r", encoding="utf-8") as fh:
-                _inp = json.load(fh)
-        except Exception as e:
-            die("could not read --input-file: %s" % e)
-        if not isinstance(_inp, dict):
-            die("--input-file must contain a JSON object")
-        if "link" in _inp:
-            args.link = str(_inp["link"])
-        if "secret_key" in _inp:
-            args.secret_key = str(_inp["secret_key"])
-        if "peer_pubkey" in _inp:
-            args.peer_pubkey = str(_inp["peer_pubkey"])
+    apply_input_file(args)
     if not args.link:
         die("no link provided (use --link or --input-file)")
 
