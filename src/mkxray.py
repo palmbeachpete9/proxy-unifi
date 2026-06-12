@@ -367,9 +367,7 @@ def build_config(args):
             "secretKey": args.secret_key,
             "address": [x for x in args.address.split(",") if x],
             "mtu": args.mtu,
-            # default: fully userspace (gVisor netstack). --kernel-tun flips it to
-            # a kernel TUN for the decrypted side (experimental throughput knob).
-            "noKernelTun": not args.kernel_tun,
+            "noKernelTun": True,
             "peers": [peer],
         },
         "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True},
@@ -405,9 +403,6 @@ def main():
     ap.add_argument("--address", default="10.7.0.1/32", help="Xray tunnel interface address(es)")
     ap.add_argument("--peer-allowed", default="0.0.0.0/0,::/0", help="allowedIPs accepted from the UniFi peer")
     ap.add_argument("--mtu", type=int, default=1340)
-    ap.add_argument("--kernel-tun", action="store_true",
-                    help="use a kernel TUN for the WG inbound's decrypted side "
-                         "instead of the userspace netstack (experimental)")
     ap.add_argument("--keepalive", type=int, default=25)
     ap.add_argument("--dns", default="", help="comma-separated inner DNS servers (optional)")
     ap.add_argument("--loglevel", default="warning")
