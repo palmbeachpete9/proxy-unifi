@@ -18,11 +18,23 @@ import sys
 from urllib.parse import unquote
 
 from proxylib import (die, b64decode_any, flat_query, qg, safe_urlsplit,
-                      host_port, safe_port, valid_host, apply_input_file)
+                      host_port, safe_port, valid_host, apply_input_file,
+                      reject_unknown_query)
 
 
-def _truthy(v):
-    return str(v).lower() in ("1", "true", "yes")
+_TLS_QUERY = {"sni", "peer", "alpn", "insecure", "allowInsecure",
+              "allow_insecure", "fp", "fingerprint"}
+
+
+def _bool_value(value, label):
+    if value in (None, ""):
+        return None
+    lowered = str(value).lower()
+    if lowered in ("1", "true", "yes"):
+        return True
+    if lowered in ("0", "false", "no"):
+        return False
+    die("%s must be true/false or 1/0" % label)
 
 
 def _tls(sni, q, default_alpn=None):
@@ -32,7 +44,8 @@ def _tls(sni, q, default_alpn=None):
         tls["alpn"] = [a for a in alpn.split(",") if a]
     elif default_alpn:
         tls["alpn"] = default_alpn
-    if _truthy(qg(q, "insecure", "allowInsecure", "allow_insecure")):
+    if _bool_value(qg(q, "insecure", "allowInsecure", "allow_insecure"),
+                   "TLS insecure option"):
         tls["insecure"] = True
     fp = qg(q, "fp", "fingerprint")
     if fp:
@@ -74,7 +87,9 @@ def parse_ss(link):
     out = {"type": "shadowsocks", "tag": "proxy", "server": host,
            "server_port": port, "method": method, "password": password}
 
-    raw = qg(flat_query(u), "plugin")
+    query = flat_query(u)
+    reject_unknown_query(query, {"plugin"})
+    raw = qg(query, "plugin")
     if raw:
         raw = unquote(raw)
         name, opts = (raw.split(";", 1) + [""])[:2]
@@ -93,6 +108,8 @@ def parse_hysteria2(link):
     if u.password:                       # hysteria2://user:pass@ -> password is after ':'
         auth = auth + ":" + unquote(u.password) if auth else unquote(u.password)
     q = flat_query(u)
+    reject_unknown_query(q, _TLS_QUERY | {"obfs", "obfs-password", "obfs_password",
+                                          "pinSHA256", "pinsha256"})
     # Reject a multi-port / port-hopping form we don't implement, rather than
     # silently connecting to a single port.
     if qg(q, "mport") or "-" in str(qg(q, "ports")) or "," in str(qg(q, "ports")):
@@ -108,6 +125,8 @@ def parse_hysteria2(link):
            "password": auth, "tls": tls}
     obfs_pw = qg(q, "obfs-password", "obfs_password")
     obfs_type = qg(q, "obfs")
+    if bool(obfs_type) != bool(obfs_pw):
+        die("hysteria2 obfs requires both type and password")
     if obfs_type and obfs_pw:
         # sing-box only implements 'salamander'; reject any other requested type
         # rather than silently substituting it.
@@ -126,22 +145,36 @@ def parse_tuic(link):
         die("tuic link is missing uuid/host/port")
     host = valid_host(host); port = safe_port(port)
     q = flat_query(u)
+    reject_unknown_query(q, _TLS_QUERY | {
+        "congestion_control", "congestion", "udp_relay_mode", "udp_over_stream",
+        "zero_rtt_handshake", "reduce_rtt", "heartbeat", "network",
+    })
     sni = qg(q, "sni", "peer") or host
     out = {"type": "tuic", "tag": "proxy", "server": host, "server_port": port,
            "uuid": uuid, "password": password, "tls": _tls(sni, q, default_alpn=["h3"])}
     cc = qg(q, "congestion_control", "congestion")
     if cc:
         out["congestion_control"] = cc
-    urm = qg(q, "udp_relay_mode", "udp_over_stream")
-    if qg(q, "udp_over_stream") in ("1", "true", "True"):
+    udp_over_stream = _bool_value(qg(q, "udp_over_stream"), "tuic udp_over_stream")
+    udp_relay_mode = qg(q, "udp_relay_mode")
+    if udp_over_stream is True:
+        if udp_relay_mode:
+            die("tuic udp_over_stream conflicts with udp_relay_mode")
         out["udp_over_stream"] = True
-    elif urm:
-        out["udp_relay_mode"] = urm
-    if qg(q, "zero_rtt_handshake", "reduce_rtt") in ("1", "true", "True"):
+    elif udp_relay_mode:
+        out["udp_relay_mode"] = udp_relay_mode
+    zero_rtt = _bool_value(qg(q, "zero_rtt_handshake", "reduce_rtt"),
+                           "tuic zero_rtt_handshake")
+    if zero_rtt is True:
         out["zero_rtt_handshake"] = True
     hb = qg(q, "heartbeat")
     if hb:
         out["heartbeat"] = hb
+    network = qg(q, "network")
+    if network:
+        if network not in ("tcp", "udp"):
+            die("tuic network must be 'tcp' or 'udp'")
+        out["network"] = network
     return out, host, port
 
 
@@ -209,6 +242,9 @@ def main():
     ap.add_argument("--input-file", default="",
                     help="JSON file with secret inputs (link/secret_key/peer_pubkey), keeping "
                          "them out of argv; values here override the matching flags")
+    ap.add_argument("--link-file", default="", help="read the proxy link from a file")
+    ap.add_argument("--secret-key-file", default="", help="read the WireGuard private key from a file")
+    ap.add_argument("--peer-pubkey-file", default="", help="read the peer public key from a file")
     args = ap.parse_args()
 
     # Secrets via a mode-600 file instead of argv (process-list safety + no ARG_MAX).

@@ -9,6 +9,7 @@
 # POSIX sh on purpose: UniFi OS ships dash/busybox-ish environments.
 
 set -eu
+umask 077
 
 # --------------------------------------------------------------------------
 # Paths / constants
@@ -31,15 +32,24 @@ SETTINGS="$ETC_DIR/settings.env"
 MKXRAY="$BIN_DIR/mkxray.py"
 MKSB="$BIN_DIR/mksingbox.py"
 MKSUB="$BIN_DIR/mksub.py"
+SAFEEXEC="$BIN_DIR/safeexec.py"
 SUB_DIR="$ETC_DIR/subscription"
 SUB_URL_FILE="$SUB_DIR/url.txt"             # subscription URL (mode 600)
 SUB_CATALOG="$SUB_DIR/catalog.json"         # cached parsed nodes
 SUB_HWID_FILE="$SUB_DIR/hwid"               # stable per-install device id
 SUB_SELECTED="$SUB_DIR/selected"            # id of the node currently activated
+SUB_SELECTED_META="$SUB_DIR/selected.json"  # stable selection metadata for refresh matching
 SERVICE_NAME="proxy-unifi"
+SERVICE_USER="proxy-unifi"
+SERVICE_GROUP="proxy-unifi"
 # (no RUN_DIR: xray runs under systemd, no pidfile needed)
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+REFRESH_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}-refresh.service"
+REFRESH_TIMER_FILE="/etc/systemd/system/${SERVICE_NAME}-refresh.timer"
 ONBOOT_DST="/data/on_boot.d/15-proxy-unifi.sh"
+LOCK_DIR="$ROOT/.lock"
+TXN_ROOT="$ROOT/.transactions"
+TXN_MARKER="$TXN_ROOT/active"
 
 # Legacy SIP003 plugin unit (from when xray ran external plugins). Kept only so
 # uninstall / migration can clean up any leftovers on older installs.
@@ -47,7 +57,6 @@ PLUGIN_SERVICE_NAME="proxy-unifi-plugin"
 PLUGIN_SERVICE_FILE="/etc/systemd/system/${PLUGIN_SERVICE_NAME}.service"
 
 XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/latest/download"
-GEO_BASE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
 SINGBOX_RELEASES="https://github.com/SagerNet/sing-box/releases"
 
 # defaults (overridable via settings.env)
@@ -62,6 +71,8 @@ LOGLEVEL="warning"
 PING_MODE="get"
 PING_URL="https://www.gstatic.com/generate_204"
 PING_TIMEOUT="5"
+SUB_REFRESH_HOURS="6"
+SUB_USER_AGENT="proxy-unifi/1.1"
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -78,15 +89,62 @@ need_root() {
     [ "$(id -u)" = "0" ] || fatal "must be run as root (you are on a UniFi gateway via SSH, use 'root')."
 }
 
+_uint() { case "$1" in ""|*[!0-9]*) return 1;; *) return 0;; esac; }
+
 load_settings() {
-    # shellcheck source=/dev/null
-    [ -f "$SETTINGS" ] && . "$SETTINGS" || true
+    [ -f "$SETTINGS" ] || return 0
+    while IFS='=' read -r _key _value || [ -n "${_key:-}" ]; do
+        case "${_key:-}" in ""|'#'*) continue ;; esac
+        case "$_value" in \"*\") _value="${_value#\"}"; _value="${_value%\"}" ;; esac
+        case "$_key" in
+            WG_LISTEN) case "$_value" in ""|*[!0-9A-Fa-f:.]*) : ;; *) WG_LISTEN="$_value" ;; esac ;;
+            WG_PORT) _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 65535 ] && WG_PORT="$_value" || true ;;
+            WG_MTU) _uint "$_value" && [ "$_value" -ge 576 ] && [ "$_value" -le 9000 ] && WG_MTU="$_value" || true ;;
+            WG_KEEPALIVE) _uint "$_value" && [ "$_value" -le 65535 ] && WG_KEEPALIVE="$_value" || true ;;
+            XRAY_ADDR) case "$_value" in ""|*[!0-9A-Fa-f:.,/]*) : ;; *) XRAY_ADDR="$_value" ;; esac ;;
+            UNIFI_ADDR) case "$_value" in ""|*[!0-9A-Fa-f:.,/]*) : ;; *) UNIFI_ADDR="$_value" ;; esac ;;
+            INNER_DNS) case "$_value" in *[!0-9A-Fa-f:.,]*) : ;; *) INNER_DNS="$_value" ;; esac ;;
+            LOGLEVEL) case "$_value" in debug|info|warning|error|none) LOGLEVEL="$_value" ;; esac ;;
+            PING_MODE) case "$_value" in get|head|tcp|icmp) PING_MODE="$_value" ;; esac ;;
+            PING_URL) case "$_value" in https://*) PING_URL="$_value" ;; esac ;;
+            PING_TIMEOUT) _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 60 ] && PING_TIMEOUT="$_value" || true ;;
+            SUB_REFRESH_HOURS) _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 8760 ] && SUB_REFRESH_HOURS="$_value" || true ;;
+            SUB_USER_AGENT)
+                case "$_value" in ""|*\"*|*\\*|*[![:print:]]*) : ;; *) SUB_USER_AGENT="$_value" ;; esac ;;
+        esac
+    done < "$SETTINGS"
+}
+
+atomic_write() {
+    _aw_dest="$1"; _aw_mode="${2:-600}"; _aw_dir="$(dirname "$_aw_dest")"
+    mkdir -p "$_aw_dir" || return 1
+    _aw_tmp="$(mktemp "$_aw_dir/.write.XXXXXX")" || return 1
+    chmod "$_aw_mode" "$_aw_tmp" || { rm -f "$_aw_tmp"; return 1; }
+    if ! cat > "$_aw_tmp"; then rm -f "$_aw_tmp"; return 1; fi
+    if ! py - "$_aw_tmp" <<'PYEOF' 2>/dev/null
+import os,sys
+fd=os.open(sys.argv[1],os.O_RDONLY)
+try: os.fsync(fd)
+finally: os.close(fd)
+PYEOF
+    then
+        rm -f "$_aw_tmp"
+        return 1
+    fi
+    mv -f "$_aw_tmp" "$_aw_dest" || { rm -f "$_aw_tmp"; return 1; }
+    py - "$_aw_dir" <<'PYEOF' 2>/dev/null
+import os,sys
+flags=os.O_RDONLY|getattr(os,"O_DIRECTORY",0)
+fd=os.open(sys.argv[1],flags)
+try: os.fsync(fd)
+finally: os.close(fd)
+PYEOF
 }
 
 save_settings() {
     mkdir -p "$ETC_DIR"
-    cat > "$SETTINGS" <<EOF
-# proxy-unifi settings - managed by the CLI ('proxy set <key> <value>'). Safe to edit by hand.
+    atomic_write "$SETTINGS" 600 <<EOF || fatal "could not persist settings"
+# proxy-unifi settings - parsed as data, never sourced as shell code.
 WG_LISTEN="$WG_LISTEN"
 WG_PORT="$WG_PORT"
 WG_MTU="$WG_MTU"
@@ -98,6 +156,8 @@ LOGLEVEL="$LOGLEVEL"
 PING_MODE="$PING_MODE"
 PING_URL="$PING_URL"
 PING_TIMEOUT="$PING_TIMEOUT"
+SUB_REFRESH_HOURS="$SUB_REFRESH_HOURS"
+SUB_USER_AGENT="$SUB_USER_AGENT"
 EOF
 }
 
@@ -146,22 +206,292 @@ _py_run() {
     fi
 }
 
+RUN_DIR=""
+LOCK_HELD=0
+LOCK_OWNER=""
+TXN_DIR=""
+BG_PID=""
+UPDATE_BACKUP=""
+UPDATE_WAS_ACTIVE=0
+GEO_BACKUP=""
+GEO_WAS_ACTIVE=0
+
+ensure_run_dir() {
+    [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] && return 0
+    mkdir -p "$ROOT"
+    RUN_DIR="$(mktemp -d "$ROOT/.run.XXXXXX")" || fatal "could not create private run directory"
+    chmod 700 "$RUN_DIR"
+}
+
+acquire_lock() {
+    [ "$LOCK_HELD" = 1 ] && return 0
+    # POSIX shells keep $$ unchanged in (...) subshells. Ask a short-lived child
+    # for its PPID so a menu action records its real process id in the lock.
+    LOCK_OWNER="$(sh -c 'printf "%s\n" "$PPID"' 2>/dev/null || true)"
+    case "$LOCK_OWNER" in ""|*[!0-9]*) LOCK_OWNER="$$" ;; esac
+    mkdir -p "$ROOT" || fatal "could not create $ROOT"
+    _tries=0
+    _uninitialized=0
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        _owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+        case "$_owner" in ""|*[!0-9]*) _owner="" ;; esac
+        if [ -z "$_owner" ]; then
+            # Another process may be between mkdir and writing pid. Give it a
+            # short initialization window before treating an empty lock as stale.
+            _uninitialized=$((_uninitialized + 1))
+            if [ "$_uninitialized" -lt 10 ]; then
+                sleep 0.2 2>/dev/null || sleep 1
+                continue
+            fi
+            rm -rf "$LOCK_DIR" 2>/dev/null || true
+            _uninitialized=0
+            continue
+        fi
+        _uninitialized=0
+        if ! kill -0 "$_owner" 2>/dev/null; then
+            rm -rf "$LOCK_DIR" 2>/dev/null || true
+            continue
+        fi
+        _tries=$((_tries + 1))
+        [ "$_tries" -lt 150 ] || fatal "another proxy-unifi operation is still running (pid $_owner)"
+        sleep 0.2 2>/dev/null || sleep 1
+    done
+    printf '%s\n' "$LOCK_OWNER" > "$LOCK_DIR/pid" \
+        || { rm -rf "$LOCK_DIR" 2>/dev/null || true; fatal "could not initialize operation lock"; }
+    LOCK_HELD=1
+}
+
+release_lock() {
+    [ "$LOCK_HELD" = 1 ] || return 0
+    _owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    [ "$_owner" = "$LOCK_OWNER" ] && rm -rf "$LOCK_DIR" 2>/dev/null || true
+    LOCK_HELD=0
+    LOCK_OWNER=""
+}
+
+fsync_dir() {
+    py - "$1" <<'PYEOF' 2>/dev/null
+import os, sys
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+fd = os.open(sys.argv[1], flags)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PYEOF
+}
+
+fsync_tree() {
+    py - "$1" <<'PYEOF' 2>/dev/null
+import os, stat, sys
+root = sys.argv[1]
+directories = []
+for current, dirs, files in os.walk(root):
+    directories.append(current)
+    for name in files:
+        path = os.path.join(current, name)
+        mode = os.lstat(path).st_mode
+        if not stat.S_ISREG(mode):
+            continue
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+for path in reversed(directories):
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+PYEOF
+}
+
+# Restore the ETC snapshot without consuming it. The transaction marker is
+# cleared only after this copy-and-swap is durable, so recovery remains
+# repeatable even if power is lost during an earlier recovery attempt.
+restore_transaction_files() {
+    _rt_state="$1"
+    _rt_candidate="$_rt_state/restore-candidate"
+    _rt_failed="$_rt_state/failed-current"
+    rm -rf "$_rt_candidate" "$_rt_failed" || return 1
+    if [ -f "$_rt_state/had-etc" ]; then
+        [ -d "$_rt_state/etc" ] || return 1
+        cp -Rp "$_rt_state/etc" "$_rt_candidate" || { rm -rf "$_rt_candidate"; return 1; }
+        fsync_tree "$_rt_candidate" || { rm -rf "$_rt_candidate"; return 1; }
+        if [ -e "$ETC_DIR" ] || [ -L "$ETC_DIR" ]; then
+            mv "$ETC_DIR" "$_rt_failed" || { rm -rf "$_rt_candidate"; return 1; }
+        fi
+        if ! mv "$_rt_candidate" "$ETC_DIR"; then
+            [ -e "$_rt_failed" ] && mv "$_rt_failed" "$ETC_DIR" 2>/dev/null || true
+            rm -rf "$_rt_candidate"
+            return 1
+        fi
+        fsync_dir "$ROOT" || return 1
+        rm -rf "$_rt_failed" || return 1
+    else
+        rm -rf "$ETC_DIR" || return 1
+        fsync_dir "$ROOT" || return 1
+    fi
+}
+
+restore_runtime_state() {
+    _state="$1"
+    if [ ! -f "$_state/runtime-state" ]; then
+        [ -f "$SERVICE_FILE" ] && { ( write_service ) 2>/dev/null || true; systemctl restart "$SERVICE_NAME" 2>/dev/null || true; }
+        return 0
+    fi
+    if [ -f "$SERVICE_FILE" ]; then
+        ( write_service ) 2>/dev/null || true
+        if [ -f "$_state/service-enabled" ]; then
+            systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        else
+            systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        fi
+        if [ -f "$_state/service-active" ]; then
+            systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+        else
+            systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+        fi
+    fi
+    if [ -s "$SUB_URL_FILE" ]; then
+        ( load_settings; write_refresh_timer ) 2>/dev/null || true
+    fi
+    if [ -f "$_state/timer-enabled" ]; then
+        systemctl enable "${SERVICE_NAME}-refresh.timer" >/dev/null 2>&1 || true
+    else
+        systemctl disable "${SERVICE_NAME}-refresh.timer" >/dev/null 2>&1 || true
+    fi
+    if [ -f "$_state/timer-active" ]; then
+        systemctl start "${SERVICE_NAME}-refresh.timer" >/dev/null 2>&1 || true
+    else
+        systemctl stop "${SERVICE_NAME}-refresh.timer" >/dev/null 2>&1 || true
+    fi
+}
+
+recover_transaction() {
+    [ -s "$TXN_MARKER" ] || return 0
+    _recover="$(cat "$TXN_MARKER" 2>/dev/null || true)"
+    case "$(basename "$_recover" 2>/dev/null)" in txn.*) : ;; *) fatal "transaction marker is malformed" ;; esac
+    [ "$(dirname "$_recover" 2>/dev/null)" = "$TXN_ROOT" ] \
+        || fatal "transaction marker escapes the transaction directory"
+    [ -d "$_recover" ] || fatal "transaction recovery directory is missing"
+    c_ylw "Recovering an interrupted proxy-unifi state transaction."
+    restore_transaction_files "$_recover" \
+        || fatal "could not recover interrupted state transaction"
+    restore_runtime_state "$_recover"
+    rm -f "$TXN_MARKER" || fatal "could not clear recovered transaction marker"
+    fsync_dir "$TXN_ROOT" || fatal "could not persist transaction recovery"
+    rm -rf "$_recover"
+}
+
+txn_begin() {
+    [ -z "$TXN_DIR" ] || return 0
+    mkdir -p "$TXN_ROOT"
+    chmod 700 "$TXN_ROOT" || fatal "could not secure transaction directory"
+    TXN_DIR="$(mktemp -d "$TXN_ROOT/txn.XXXXXX")" || fatal "could not create state transaction"
+    chmod 700 "$TXN_DIR"
+    if [ -d "$ETC_DIR" ]; then
+        : > "$TXN_DIR/had-etc"
+        cp -Rp "$ETC_DIR" "$TXN_DIR/etc" || fatal "could not snapshot current state"
+    fi
+    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && : > "$TXN_DIR/service-active" || true
+    systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null && : > "$TXN_DIR/service-enabled" || true
+    systemctl is-active --quiet "${SERVICE_NAME}-refresh.timer" 2>/dev/null \
+        && : > "$TXN_DIR/timer-active" || true
+    systemctl is-enabled --quiet "${SERVICE_NAME}-refresh.timer" 2>/dev/null \
+        && : > "$TXN_DIR/timer-enabled" || true
+    : > "$TXN_DIR/runtime-state"
+    fsync_tree "$TXN_DIR" || fatal "could not persist state transaction snapshot"
+    printf '%s\n' "$TXN_DIR" | atomic_write "$TXN_MARKER" 600 \
+        || fatal "could not activate state transaction"
+}
+
+txn_commit() {
+    [ -n "$TXN_DIR" ] || return 0
+    rm -f "$TXN_MARKER" || fatal "could not clear committed transaction marker"
+    fsync_dir "$TXN_ROOT" || fatal "could not persist transaction commit"
+    rm -rf "$TXN_DIR"
+    TXN_DIR=""
+}
+
+txn_rollback() {
+    [ -n "$TXN_DIR" ] || return 0
+    _rollback="$TXN_DIR"
+    restore_transaction_files "$_rollback" || return 1
+    restore_runtime_state "$_rollback"
+    rm -f "$TXN_MARKER" || return 1
+    fsync_dir "$TXN_ROOT" || return 1
+    rm -rf "$_rollback"
+    TXN_DIR=""
+}
+
+on_exit() {
+    _rc="$1"
+    trap - EXIT INT TERM HUP
+    [ -z "$BG_PID" ] || { kill "$BG_PID" 2>/dev/null || true; wait "$BG_PID" 2>/dev/null || true; }
+    if [ -n "$UPDATE_BACKUP" ]; then
+        _restore_update_backup "$UPDATE_BACKUP" || err "core update rollback was incomplete"
+        ( write_service ) 2>/dev/null || true
+        if [ "$UPDATE_WAS_ACTIVE" = 1 ]; then systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+        else systemctl stop "$SERVICE_NAME" 2>/dev/null || true; fi
+        UPDATE_BACKUP=""
+    fi
+    if [ -n "$GEO_BACKUP" ]; then
+        _restore_geo_backup "$GEO_BACKUP" || err "geo update rollback was incomplete"
+        if [ "$GEO_WAS_ACTIVE" = 1 ]; then systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+        else systemctl stop "$SERVICE_NAME" 2>/dev/null || true; fi
+        GEO_BACKUP=""
+    fi
+    if [ -n "$TXN_DIR" ] && ! txn_rollback; then
+        err "state rollback was incomplete; boot recovery will retry it"
+        _rc=1
+    fi
+    [ -z "$RUN_DIR" ] || rm -rf "$RUN_DIR"
+    release_lock
+    exit "$_rc"
+}
+trap 'on_exit $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+locked_call() {
+    # Interactive prompts happen before this wrapper is entered. This prevents
+    # an idle terminal from blocking the scheduled subscription refresh timer.
+    # dash does not inherit EXIT traps into (...) action subshells, so install
+    # the cleanup contract again here before any mutating function can fatal().
+    trap 'on_exit $?' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    set -e
+    acquire_lock
+    recover_transaction
+    "$@"
+    _locked_rc=$?
+    if [ -n "$TXN_DIR" ]; then
+        txn_rollback
+        _locked_rc=1
+    fi
+    release_lock
+    return "$_locked_rc"
+}
+
 # Generate a WireGuard keypair -> prints "PRIVATE PUBLIC" on one line.
 gen_keypair() {
     if have wg; then
         _priv="$(wg genkey)"
         _pub="$(printf '%s' "$_priv" | wg pubkey)"
     elif have openssl; then
-        _tmp="$(mktemp)" || fatal "could not create temp file"
-        # remove the key temp on any exit/interrupt, not just the success path
-        # shellcheck disable=SC2064
-        trap "rm -f '$_tmp'" EXIT INT TERM HUP
+        ensure_run_dir
+        _tmp="$RUN_DIR/x25519.pem"
         openssl genpkey -algorithm X25519 -out "$_tmp" 2>/dev/null \
             || fatal "openssl could not generate an X25519 key"
         _priv="$(openssl pkey -in "$_tmp" -outform DER 2>/dev/null | tail -c 32 | base64)"
         _pub="$(openssl pkey -in "$_tmp" -pubout -outform DER 2>/dev/null | tail -c 32 | base64)"
         rm -f "$_tmp"
-        trap - EXIT INT TERM HUP
     else
         fatal "need either 'wg' or 'openssl' to generate WireGuard keys"
     fi
@@ -174,10 +504,12 @@ ensure_keys() {
     # migrate legacy key names (xray-only era) -> engine-neutral names, so an
     # upgrade reuses the existing keypair instead of regenerating (which would
     # break the already-applied UniFi WireGuard VPN Client).
-    if [ -f "$WG_DIR/xray_private.key" ] && [ ! -f "$WG_DIR/wg_private.key" ]; then
+    if [ -s "$WG_DIR/xray_private.key" ] && [ ! -s "$WG_DIR/wg_private.key" ]; then
+        rm -f "$WG_DIR/wg_private.key"
         mv "$WG_DIR/xray_private.key" "$WG_DIR/wg_private.key"
     fi
-    if [ -f "$WG_DIR/xray_public.key" ] && [ ! -f "$WG_DIR/wg_public.key" ]; then
+    if [ -s "$WG_DIR/xray_public.key" ] && [ ! -s "$WG_DIR/wg_public.key" ]; then
+        rm -f "$WG_DIR/wg_public.key"
         mv "$WG_DIR/xray_public.key" "$WG_DIR/wg_public.key"
     fi
     # Each keypair is repaired independently so a missing/lost file never destroys
@@ -193,25 +525,37 @@ ensure_keys() {
 # public half when possible and never rotating a valid private key needlessly.
 _ensure_pair() {
     _pp="$WG_DIR/$1_private.key"; _pub="$WG_DIR/$1_public.key"
-    if [ -s "$_pp" ] && have wg; then
-        # derive the correct public key from the existing private key
-        _derived="$(wg pubkey < "$_pp" 2>/dev/null)"
+    if [ -s "$_pp" ]; then
+        _derived=""
+        if have wg; then
+            _derived="$(wg pubkey < "$_pp" 2>/dev/null || true)"
+        elif have openssl; then
+            ensure_run_dir
+            _der="$RUN_DIR/$1-private.der"
+            py - "$_pp" "$_der" <<'PYEOF' 2>/dev/null || true
+import base64,sys
+raw=base64.b64decode(open(sys.argv[1],"rb").read().strip(),validate=True)
+if len(raw)!=32: raise SystemExit(1)
+open(sys.argv[2],"wb").write(bytes.fromhex("302e020100300506032b656e04220420")+raw)
+PYEOF
+            if [ -s "$_der" ]; then
+                _derived="$(openssl pkey -inform DER -in "$_der" -pubout -outform DER 2>/dev/null | tail -c 32 | base64 || true)"
+            fi
+        fi
         if [ -n "$_derived" ]; then
             if [ ! -s "$_pub" ] || [ "$_derived" != "$(cat "$_pub" 2>/dev/null)" ]; then
                 # repair only the public half to match the (kept) private key
-                printf '%s' "$_derived" > "$_pub"; chmod 600 "$_pub"
+                printf '%s' "$_derived" | atomic_write "$_pub" 600 || fatal "could not repair public key"
             fi
             return 0
         fi
-        # private key is unreadable/invalid by wg -> fall through and regenerate
-    elif [ -s "$_pp" ] && [ -s "$_pub" ]; then
-        return 0                                   # no 'wg' to verify; trust both
+        fatal "existing $1 WireGuard private key is invalid; refusing automatic rotation"
     fi
     # otherwise (re)generate the whole pair
     info "generating WireGuard keypair: $1 ..."
     _kp="$(gen_keypair)"
-    printf '%s' "${_kp% *}" > "$_pp"; printf '%s' "${_kp#* }" > "$_pub"
-    chmod 600 "$_pp" "$_pub"
+    printf '%s' "${_kp% *}" | atomic_write "$_pp" 600 || fatal "could not store private key"
+    printf '%s' "${_kp#* }" | atomic_write "$_pub" 600 || fatal "could not store public key"
 }
 
 arch_slug() {
@@ -226,13 +570,16 @@ arch_slug() {
 # --------------------------------------------------------------------------
 # Engine selection (xray vs sing-box)
 # --------------------------------------------------------------------------
-# Which engine handles a link: "xray", "singbox", or "" (unsupported).
-engine_for_link() {
-    case "$1" in
+# Which engine handles a link file: "xray", "singbox", or "" (unsupported).
+engine_for_link_file() {
+    _ef_file="$1"
+    [ -s "$_ef_file" ] || { echo ""; return; }
+    _ef_link="$(cat "$_ef_file")"
+    case "$_ef_link" in
         vless://*|vmess://*|trojan://*) echo xray; return ;;
         hysteria2://*|hy2://*|tuic://*) echo singbox; return ;;
         ss://*)
-            _pn="$(py "$MKXRAY" --link "$1" --print-plugin 2>/dev/null | cut -f1)"
+            _pn="$(py "$MKXRAY" --link-file "$_ef_file" --print-plugin 2>/dev/null | cut -f1)"
             if [ -z "$_pn" ]; then echo xray; return; fi   # plain SS -> xray
             case "$_pn" in
                 obfs-local|simple-obfs|v2ray-plugin) echo singbox ;;  # sing-box runs these in-process
@@ -254,7 +601,7 @@ current_engine() {
     # a pool dir present means we're in pool mode
     if [ -f "$POOL_DIR/99-overlay.json" ]; then echo xraypool; return; fi
     if [ -f "$OUTBOUND_LINK" ]; then
-        _ce="$(engine_for_link "$(cat "$OUTBOUND_LINK")")"
+        _ce="$(engine_for_link_file "$OUTBOUND_LINK")"
         [ -n "$_ce" ] && { echo "$_ce"; return; }
     fi
     echo xray
@@ -283,22 +630,30 @@ sb_arch() {
 # failure (and removes a partial file). One place, so tag-resolution and the
 # tarball download use the same available tool.
 download_to() {
-    _d_url="$1"; _d_dst="$2"
+    _d_url="$1"; _d_dst="$2"; _d_max="${3:-419430400}"
     if have curl; then
-        curl -fsSL "$_d_url" -o "$_d_dst" || { rm -f "$_d_dst"; return 1; }
+        ( ulimit -f $(((_d_max + 511) / 512)) 2>/dev/null || exit 1
+          curl -fsSL --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 2 \
+              --max-filesize "$_d_max" "$_d_url" -o "$_d_dst" ) \
+            || { rm -f "$_d_dst"; return 1; }
     elif have wget; then
-        wget -qO "$_d_dst" "$_d_url" || { rm -f "$_d_dst"; return 1; }
+        ( ulimit -f $(((_d_max + 511) / 512)) 2>/dev/null || exit 1
+          wget -q --timeout=30 --tries=3 -O "$_d_dst" "$_d_url" ) \
+            || { rm -f "$_d_dst"; return 1; }
     else
         return 1
     fi
+    _d_size="$(wc -c < "$_d_dst" | tr -d ' ')"
+    case "$_d_size" in ""|*[!0-9]*) rm -f "$_d_dst"; return 1 ;; esac
+    [ "$_d_size" -le "$_d_max" ] || { rm -f "$_d_dst"; return 1; }
 }
 
 # Resolve the latest tag from a .../releases/latest redirect with the available tool.
 resolve_latest_tag() {
     if have curl; then
-        curl -fsSLI "$1/latest" 2>/dev/null | tr -d '\r'
+        curl -fsSLI --connect-timeout 15 --max-time 60 --retry 3 "$1/latest" 2>/dev/null | tr -d '\r'
     elif have wget; then
-        wget -qS --max-redirect=0 "$1/latest" -O /dev/null 2>&1 | tr -d '\r'
+        wget -qS --timeout=30 --tries=3 --max-redirect=0 "$1/latest" -O /dev/null 2>&1 | tr -d '\r'
     fi | awk -F'/tag/' 'tolower($0) ~ /location:/ {print $2}' | awk '{print $1}' | tail -1
 }
 
@@ -322,19 +677,53 @@ verify_sha256() {
     return 1
 }
 
+github_asset_digest() {
+    _gh_repo="$1"; _gh_tag="$2"; _gh_name="$3"
+    ensure_run_dir
+    _gh_meta="$RUN_DIR/release-$(printf '%s' "$_gh_repo-$_gh_tag" | tr '/:' '__').json"
+    download_to "https://api.github.com/repos/${_gh_repo}/releases/tags/${_gh_tag}" "$_gh_meta" 10485760 || return 1
+    py - "$_gh_meta" "$_gh_name" <<'PYEOF'
+import json,sys
+data=json.load(open(sys.argv[1],encoding="utf-8"))
+for asset in data.get("assets",[]):
+    if asset.get("name")==sys.argv[2]:
+        digest=asset.get("digest","")
+        if digest.startswith("sha256:"):
+            print(digest.split(":",1)[1]); raise SystemExit(0)
+raise SystemExit(1)
+PYEOF
+}
+
 cmd_install_singbox() {
     mkdir -p "$BIN_DIR"
-    have tar || { err "need tar to install sing-box"; return 1; }
     { have curl || have wget; } || { err "need curl or wget to download sing-box"; return 1; }
     _sa="$(sb_arch)"
     _tag="$(resolve_latest_tag "$SINGBOX_RELEASES")"
     [ -n "$_tag" ] || { err "could not resolve sing-box latest version"; return 1; }
     _ver="${_tag#v}"
-    _url="$SINGBOX_RELEASES/download/${_tag}/sing-box-${_ver}-linux-${_sa}.tar.gz"
-    _tmp="$(mktemp -d)"
+    _asset="sing-box-${_ver}-linux-${_sa}.tar.gz"
+    _url="$SINGBOX_RELEASES/download/${_tag}/${_asset}"
+    ensure_run_dir
+    _tmp="$RUN_DIR/singbox"; mkdir -p "$_tmp"
     info "downloading sing-box ${_tag} (${_sa}) ..."
-    download_to "$_url" "$_tmp/sb.tgz" || { rm -rf "$_tmp"; err "sing-box download failed"; return 1; }
-    tar xzf "$_tmp/sb.tgz" -C "$_tmp" || { rm -rf "$_tmp"; err "could not extract sing-box"; return 1; }
+    download_to "$_url" "$_tmp/sb.tgz" 262144000 || { rm -rf "$_tmp"; err "sing-box download failed"; return 1; }
+    _want="$(github_asset_digest SagerNet/sing-box "$_tag" "$_asset" 2>/dev/null)" \
+        || { rm -rf "$_tmp"; err "could not obtain sing-box's GitHub asset digest"; return 1; }
+    verify_sha256 "$_tmp/sb.tgz" "$_want" \
+        || { rm -rf "$_tmp"; err "sing-box checksum verification failed"; return 1; }
+    py - "$_tmp/sb.tgz" "$_tmp" <<'PYEOF' || { rm -rf "$_tmp"; err "could not safely extract sing-box"; return 1; }
+import os,sys,tarfile
+src,dest=sys.argv[1],os.path.realpath(sys.argv[2]); total=0; limit=250*1024*1024
+with tarfile.open(src,"r:gz") as archive:
+    members=archive.getmembers()
+    for member in members:
+        target=os.path.realpath(os.path.join(dest,member.name))
+        if target!=dest and not target.startswith(dest+os.sep): raise SystemExit("unsafe archive path")
+        if member.issym() or member.islnk() or member.isdev() or member.isfifo(): raise SystemExit("unsafe archive member")
+        total += max(0,member.size)
+        if total>limit: raise SystemExit("archive is too large")
+    archive.extractall(dest,members=members)
+PYEOF
     _b="$(find "$_tmp" -name sing-box -type f | head -1)"
     [ -n "$_b" ] || { rm -rf "$_tmp"; err "sing-box binary not found in archive"; return 1; }
     chmod 0755 "$_b"
@@ -343,17 +732,22 @@ cmd_install_singbox() {
     # D15: if sing-box is the active engine and we have a config, validate it
     # against the NEW binary before switching; keep a backup for rollback.
     if [ -x "$SBIN" ] && [ "$(current_engine)" = "singbox" ] && [ -f "$CONFIG" ]; then
-        "$_b" check -c "$CONFIG" >/dev/null 2>&1 \
+        prepare_service_permissions
+        chown root:"$SERVICE_GROUP" "$RUN_DIR" "$_tmp" 2>/dev/null || true
+        chmod 750 "$RUN_DIR" "$_tmp" 2>/dev/null || true
+        validate_as_service "$_b" check -c "$CONFIG" >/dev/null 2>&1 \
             || { rm -rf "$_tmp"; err "the new sing-box rejects your current config; keeping the old version"; return 1; }
     fi
-    [ -x "$SBIN" ] && cp -f "$SBIN" "$SBIN.bak" 2>/dev/null || true
+    if [ -x "$SBIN" ]; then
+        cp -p "$SBIN" "$SBIN.bak.new" || { rm -rf "$_tmp"; err "could not back up sing-box"; return 1; }
+        mv -f "$SBIN.bak.new" "$SBIN.bak"
+    fi
     install -m 0755 "$_b" "$SBIN.new" || { rm -rf "$_tmp"; rm -f "$SBIN.new"; err "could not install sing-box binary"; return 1; }
     mv -f "$SBIN.new" "$SBIN" || { rm -rf "$_tmp"; err "could not activate sing-box binary"; return 1; }
     if ! "$SBIN" version >/dev/null 2>&1; then
         [ -f "$SBIN.bak" ] && mv -f "$SBIN.bak" "$SBIN"
         rm -rf "$_tmp"; err "new sing-box failed to run; rolled back to the previous version"; return 1
     fi
-    rm -f "$SBIN.bak" 2>/dev/null || true
     rm -rf "$_tmp"
     c_grn "sing-box installed: $("$SBIN" version 2>/dev/null | head -1)"
 }
@@ -371,46 +765,40 @@ cmd_install_binary() {
     mkdir -p "$BIN_DIR"
     slug="$(arch_slug)"
     url="${XRAY_RELEASE_BASE}/Xray-linux-${slug}.zip"
-    tmp="$(mktemp -d)" || fatal "could not create temp dir"
-    # shellcheck disable=SC2064
-    trap "rm -rf '$tmp'" EXIT INT TERM HUP
+    ensure_run_dir
+    tmp="$RUN_DIR/xray"; mkdir -p "$tmp"
     info "downloading xray-core ($slug) ..."
-    download_to "$url" "$tmp/xray.zip" || fatal "download failed: $url"
+    download_to "$url" "$tmp/xray.zip" 367001600 || fatal "download failed: $url"
     # D21: verify the archive against the release's published SHA-256 (.dgst). This
     # is integrity (catches corruption/truncation/MITM-without-cert), not signing.
-    if download_to "$url.dgst" "$tmp/xray.dgst" 2>/dev/null; then
-        _want="$(awk -F'= ' 'tolower($1) ~ /sha2-256/ {print tolower($2)}' "$tmp/xray.dgst" | tr -d ' \r' | head -1)"
-        verify_sha256 "$tmp/xray.zip" "$_want"
-        case $? in
-            0) info "xray-core checksum verified." ;;
-            1) fatal "xray-core download failed checksum verification (aborting)" ;;
-            2) c_ylw "xray-core checksum could not be computed; continuing on HTTPS trust." ;;
-        esac
-    else
-        c_ylw "xray-core checksum file unavailable; continuing on HTTPS trust."
-    fi
-    if have unzip; then
-        unzip -oq "$tmp/xray.zip" -d "$tmp" || fatal "unzip failed"
-    else
-        # zipfile.extractall() is zip-slip-vulnerable (a '../' or absolute member
-        # would write outside $tmp, as root). Validate every member name against the
-        # destination before writing, and extract members individually.
-        py - "$tmp/xray.zip" "$tmp" <<'PYEOF' || fatal "could not extract xray.zip (no unzip and python failed)"
-import os, sys, zipfile
-src, dest = sys.argv[1], os.path.realpath(sys.argv[2])
-with zipfile.ZipFile(src) as z:
-    for name in z.namelist():
-        if name.endswith("/"):
-            continue
-        target = os.path.realpath(os.path.join(dest, name))
-        if target != dest and not target.startswith(dest + os.sep):
-            sys.stderr.write("refusing unsafe zip member: %s\n" % name)
-            sys.exit(1)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with z.open(name) as fh, open(target, "wb") as out:
-            out.write(fh.read())
+    download_to "$url.dgst" "$tmp/xray.dgst" 1048576 2>/dev/null \
+        || fatal "xray-core checksum file is unavailable; refusing unverified update"
+    _want="$(awk -F'= ' 'tolower($1) ~ /sha2-256/ {print tolower($2)}' "$tmp/xray.dgst" | tr -d ' \r' | head -1)"
+    verify_sha256 "$tmp/xray.zip" "$_want" \
+        || fatal "xray-core download failed mandatory checksum verification"
+    info "xray-core checksum verified."
+    py - "$tmp/xray.zip" "$tmp" <<'PYEOF' || fatal "could not safely extract xray.zip"
+import os,stat,sys,zipfile
+src,dest=sys.argv[1],os.path.realpath(sys.argv[2]); total=0; limit=350*1024*1024
+with zipfile.ZipFile(src) as archive:
+    infos=archive.infolist()
+    for info in infos:
+        target=os.path.realpath(os.path.join(dest,info.filename))
+        if target!=dest and not target.startswith(dest+os.sep): raise SystemExit("unsafe zip path")
+        mode=(info.external_attr >> 16) & 0xffff
+        if stat.S_ISLNK(mode): raise SystemExit("zip symlinks are not allowed")
+        total += max(0,info.file_size)
+        if total>limit: raise SystemExit("archive is too large")
+    for info in infos:
+        if info.is_dir(): continue
+        target=os.path.realpath(os.path.join(dest,info.filename))
+        os.makedirs(os.path.dirname(target),exist_ok=True)
+        with archive.open(info) as source, open(target,"wb") as output:
+            while True:
+                chunk=source.read(1024*1024)
+                if not chunk: break
+                output.write(chunk)
 PYEOF
-    fi
     [ -f "$tmp/xray" ] || fatal "downloaded archive did not contain an xray binary"
     chmod 0755 "$tmp/xray"
     "$tmp/xray" version >/dev/null 2>&1 || fatal "downloaded xray binary did not run"
@@ -418,15 +806,21 @@ PYEOF
     # switching, and keep a backup of the working binary so we can roll back.
     _had_xray=0; [ -x "$XRAY" ] && _had_xray=1
     if [ "$_had_xray" = 1 ] && { [ -f "$CONFIG" ] || [ -f "$POOL_DIR/99-overlay.json" ]; }; then
+        prepare_service_permissions
+        chown root:"$SERVICE_GROUP" "$RUN_DIR" "$tmp" 2>/dev/null || true
+        chmod 750 "$RUN_DIR" "$tmp" 2>/dev/null || true
         if [ -f "$POOL_DIR/99-overlay.json" ]; then
-            "$tmp/xray" run -test -confdir "$POOL_DIR" >/dev/null 2>&1 \
+            validate_as_service "$tmp/xray" run -test -confdir "$POOL_DIR" >/dev/null 2>&1 \
                 || fatal "the new xray-core rejects your current profile; keeping the old version"
         elif [ -f "$CONFIG" ] && [ "$(current_engine)" != "singbox" ]; then
-            "$tmp/xray" run -test -config "$CONFIG" -format json >/dev/null 2>&1 \
+            validate_as_service "$tmp/xray" run -test -config "$CONFIG" -format json >/dev/null 2>&1 \
                 || fatal "the new xray-core rejects your current config; keeping the old version"
         fi
     fi
-    [ "$_had_xray" = 1 ] && cp -f "$XRAY" "$XRAY.bak" 2>/dev/null || true
+    if [ "$_had_xray" = 1 ]; then
+        cp -p "$XRAY" "$XRAY.bak.new" || fatal "could not back up xray-core"
+        mv -f "$XRAY.bak.new" "$XRAY.bak"
+    fi
     install -m 0755 "$tmp/xray" "$XRAY.new" || fatal "could not stage xray binary"
     mv -f "$XRAY.new" "$XRAY" || fatal "could not install xray binary"
     if ! "$XRAY" version >/dev/null 2>&1; then
@@ -434,18 +828,30 @@ PYEOF
         [ -f "$XRAY.bak" ] && mv -f "$XRAY.bak" "$XRAY"
         fatal "new xray-core failed to run; rolled back to the previous version"
     fi
-    rm -f "$XRAY.bak" 2>/dev/null || true
     # geo data ships inside the xray zip, so it refreshes on every core update.
-    if [ -f "$tmp/geoip.dat" ];   then install -m 0644 "$tmp/geoip.dat"   "$BIN_DIR/geoip.dat";   fi
-    if [ -f "$tmp/geosite.dat" ]; then install -m 0644 "$tmp/geosite.dat" "$BIN_DIR/geosite.dat"; fi
-    rm -rf "$tmp"; trap - EXIT INT TERM HUP
+    if [ -f "$tmp/geoip.dat" ]; then
+        if ! install -m 0644 "$tmp/geoip.dat" "$BIN_DIR/geoip.dat.new" \
+            || ! mv -f "$BIN_DIR/geoip.dat.new" "$BIN_DIR/geoip.dat"; then
+            fatal "could not install geoip.dat"
+        fi
+    fi
+    if [ -f "$tmp/geosite.dat" ]; then
+        if ! install -m 0644 "$tmp/geosite.dat" "$BIN_DIR/geosite.dat.new" \
+            || ! mv -f "$BIN_DIR/geosite.dat.new" "$BIN_DIR/geosite.dat"; then
+            fatal "could not install geosite.dat"
+        fi
+    fi
+    rm -rf "$tmp"
     c_grn "xray-core installed: $("$XRAY" version 2>/dev/null | head -1)"
     # sing-box (~48 MB) is only needed for ss+obfs/v2ray-plugin, hysteria2 and
     # tuic links. Don't download it eagerly: it is installed on demand the first
     # time such a link is imported (ensure_singbox). On an update, refresh it only
     # if it is already present, so xray-only installs stay lean.
     if [ -x "$SBIN" ]; then
-        cmd_install_singbox || c_ylw "sing-box update failed (continuing); the existing version is kept"
+        if ! cmd_install_singbox; then
+            [ "${_STRICT_UPDATE:-0}" = 1 ] && fatal "sing-box update failed; update transaction aborted"
+            c_ylw "sing-box update failed (continuing); the existing version is kept"
+        fi
     else
         info "sing-box not installed (fetched automatically on the first hysteria2/tuic/ss+obfs link)."
     fi
@@ -459,39 +865,113 @@ PYEOF
 # WG inbound and binds 0.0.0.0 (all interfaces). The local UniFi WG client only
 # ever dials 127.0.0.1, so we drop every NON-loopback packet to that UDP port,
 # closing the external surface while leaving the loopback path working. The rule
-# spec is written identically for -C/-D/-I so add/remove always match; both IPv4
-# and IPv6 are covered. Everything here is best-effort and ALWAYS returns 0 so a
-# firewall hiccup can never stop the proxy from starting.
+# The dedicated chain is project-owned, so cleanup never removes an
+# administrator's matching rule. Protection is fail-closed before sing-box binds.
+FW_CHAIN="PROXY_UNIFI_WG"
+
+_ipv6_enabled() { [ -s /proc/net/if_inet6 ]; }
+
+_fw_lock_one() {
+    _ipt="$1"; _p="$2"
+    "$_ipt" -N "$FW_CHAIN" 2>/dev/null || "$_ipt" -F "$FW_CHAIN" 2>/dev/null || return 1
+    "$_ipt" -F "$FW_CHAIN" 2>/dev/null || return 1
+    "$_ipt" -A "$FW_CHAIN" -p udp --dport "$_p" ! -i lo -j DROP 2>/dev/null || return 1
+    "$_ipt" -C INPUT -j "$FW_CHAIN" 2>/dev/null \
+        || "$_ipt" -I INPUT 1 -j "$FW_CHAIN" 2>/dev/null || return 1
+    "$_ipt" -C INPUT -j "$FW_CHAIN" 2>/dev/null \
+        && "$_ipt" -C "$FW_CHAIN" -p udp --dport "$_p" ! -i lo -j DROP 2>/dev/null
+}
+
+_fw_unlock_one() {
+    _ipt="$1"; _n=0
+    while [ "$_n" -lt 16 ] && "$_ipt" -C INPUT -j "$FW_CHAIN" 2>/dev/null; do
+        "$_ipt" -D INPUT -j "$FW_CHAIN" 2>/dev/null || break
+        _n=$((_n + 1))
+    done
+    "$_ipt" -F "$FW_CHAIN" 2>/dev/null || true
+    "$_ipt" -X "$FW_CHAIN" 2>/dev/null || true
+}
+
 fw_lock() {
     load_settings
-    _p="$WG_PORT"
-    for _ipt in iptables ip6tables; do
-        have "$_ipt" || continue
-        # remove any existing copies first so restarts don't stack duplicates
-        _n=0
-        while [ "$_n" -lt 16 ] && "$_ipt" -C INPUT -p udp --dport "$_p" ! -i lo -j DROP 2>/dev/null; do
-            "$_ipt" -D INPUT -p udp --dport "$_p" ! -i lo -j DROP 2>/dev/null || break
-            _n=$((_n + 1))
-        done
-        "$_ipt" -I INPUT -p udp --dport "$_p" ! -i lo -j DROP 2>/dev/null || true
-    done
-    return 0
+    have iptables || { err "iptables is required to protect sing-box's listener"; return 1; }
+    _fw_lock_one iptables "$WG_PORT" || { err "could not install/verify IPv4 firewall guard"; return 1; }
+    if _ipv6_enabled; then
+        if ! have ip6tables || ! _fw_lock_one ip6tables "$WG_PORT"; then
+            _fw_unlock_one iptables
+            err "could not install/verify IPv6 firewall guard"
+            return 1
+        fi
+    fi
 }
+
 fw_unlock() {
-    load_settings
-    _p="$WG_PORT"
     for _ipt in iptables ip6tables; do
         have "$_ipt" || continue
-        _n=0
-        while [ "$_n" -lt 16 ] && "$_ipt" -C INPUT -p udp --dport "$_p" ! -i lo -j DROP 2>/dev/null; do
-            "$_ipt" -D INPUT -p udp --dport "$_p" ! -i lo -j DROP 2>/dev/null || break
-            _n=$((_n + 1))
-        done
+        _fw_unlock_one "$_ipt"
     done
-    return 0
+}
+
+fw_is_locked() {
+    _p="$1"
+    have iptables && iptables -C INPUT -j "$FW_CHAIN" 2>/dev/null \
+        && iptables -C "$FW_CHAIN" -p udp --dport "$_p" ! -i lo -j DROP 2>/dev/null \
+        || return 1
+    if _ipv6_enabled; then
+        have ip6tables && ip6tables -C INPUT -j "$FW_CHAIN" 2>/dev/null \
+            && ip6tables -C "$FW_CHAIN" -p udp --dport "$_p" ! -i lo -j DROP 2>/dev/null \
+            || return 1
+    fi
+}
+
+ensure_service_user() {
+    if id "$SERVICE_USER" >/dev/null 2>&1; then
+        SERVICE_GROUP="$(id -gn "$SERVICE_USER" 2>/dev/null || echo "$SERVICE_GROUP")"
+        return 0
+    fi
+    _nologin="$(command -v nologin 2>/dev/null || echo /bin/false)"
+    if have useradd; then
+        useradd -r -M -d /nonexistent -s "$_nologin" "$SERVICE_USER" >/dev/null 2>&1 \
+            || fatal "could not create the $SERVICE_USER service account"
+    elif have adduser; then
+        adduser -S -H -D -h /nonexistent -s "$_nologin" "$SERVICE_USER" >/dev/null 2>&1 \
+            || fatal "could not create the $SERVICE_USER service account"
+    else
+        fatal "need useradd/adduser to create the unprivileged service account"
+    fi
+    SERVICE_GROUP="$(id -gn "$SERVICE_USER" 2>/dev/null || echo "$SERVICE_USER")"
+}
+
+prepare_service_permissions() {
+    ensure_service_user
+    mkdir -p "$ROOT" "$BIN_DIR" "$ETC_DIR" || fatal "could not create service directories"
+    chmod 755 "$ROOT" "$BIN_DIR" || fatal "could not set service directory permissions"
+    chown root:"$SERVICE_GROUP" "$ETC_DIR" \
+        || fatal "could not assign service configuration group"
+    chmod 750 "$ETC_DIR" || fatal "could not secure service configuration directory"
+    for _readable in "$CONFIG" "$POOL_DIR"; do
+        [ -e "$_readable" ] || continue
+        chown -R root:"$SERVICE_GROUP" "$_readable" \
+            || fatal "could not assign service-readable configuration ownership"
+        if [ -d "$_readable" ]; then
+            find "$_readable" -type d -exec chmod 750 {} \; \
+                || fatal "could not secure service configuration directories"
+            find "$_readable" -type f -exec chmod 640 {} \; \
+                || fatal "could not secure service configuration files"
+        else
+            chmod 640 "$_readable" || fatal "could not secure service configuration file"
+        fi
+    done
+}
+
+validate_as_service() {
+    ensure_service_user
+    [ -f "$SAFEEXEC" ] || fatal "safe validator helper is missing"
+    py "$SAFEEXEC" --user "$SERVICE_USER" --timeout 20 --memory-mb 256 --fsize-mb 16 -- "$@"
 }
 
 write_service() {
+    prepare_service_permissions
     # ExecStart depends on the active engine. Prefer the recorded engine; if the
     # engine file was lost (e.g. after a partial restore) fall back to inferring it.
     # _fwpre/_fwpost wire the external-exposure guard to the service lifecycle:
@@ -500,16 +980,16 @@ write_service() {
     case "$(current_engine)" in
         singbox)
             _exec="$SBIN run -c $CONFIG"; _cond="$CONFIG"
-            _fwpre="ExecStartPre=-$BIN_DIR/proxy-unifi _fw-lock"
-            _fwpost="ExecStopPost=-$BIN_DIR/proxy-unifi _fw-unlock" ;;
+            _fwpre="ExecStartPre=+$BIN_DIR/proxy-unifi _fw-lock"
+            _fwpost="ExecStopPost=-+$BIN_DIR/proxy-unifi _fw-unlock" ;;
         xraypool)
             _exec="$XRAY run -confdir $POOL_DIR"; _cond="$POOL_DIR/99-overlay.json"
-            _fwpre="ExecStartPre=-$BIN_DIR/proxy-unifi _fw-unlock"; _fwpost="" ;;
+            _fwpre="ExecStartPre=-+$BIN_DIR/proxy-unifi _fw-unlock"; _fwpost="" ;;
         *)
             _exec="$XRAY run -config $CONFIG"; _cond="$CONFIG"
-            _fwpre="ExecStartPre=-$BIN_DIR/proxy-unifi _fw-unlock"; _fwpost="" ;;
+            _fwpre="ExecStartPre=-+$BIN_DIR/proxy-unifi _fw-unlock"; _fwpost="" ;;
     esac
-    cat > "$SERVICE_FILE" <<EOF
+    atomic_write "$SERVICE_FILE" 644 <<EOF || return 1
 [Unit]
 Description=proxy-unifi (WireGuard->proxy bridge)
 After=network-online.target nss-lookup.target
@@ -519,6 +999,9 @@ ConditionPathExists=$_cond
 
 [Service]
 Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_GROUP
+UMask=0077
 $_fwpre
 ExecStart=$_exec
 $_fwpost
@@ -527,12 +1010,78 @@ WorkingDirectory=$ROOT
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
+LimitCORE=0
+LimitFSIZE=16M
 NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadOnlyPaths=$ROOT
+TasksMax=256
+MemoryMax=512M
+CPUQuota=200%
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || { err "systemd daemon-reload failed"; return 1; }
+}
+
+write_refresh_timer() {
+    load_settings
+    atomic_write "$REFRESH_SERVICE_FILE" 644 <<EOF || return 1
+[Unit]
+Description=Refresh proxy-unifi subscription catalog
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=$SUB_URL_FILE
+
+[Service]
+Type=oneshot
+ExecStart=$BIN_DIR/proxy-unifi sub-refresh-auto
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+EOF
+    atomic_write "$REFRESH_TIMER_FILE" 644 <<EOF || return 1
+[Unit]
+Description=Scheduled proxy-unifi subscription refresh
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=${SUB_REFRESH_HOURS}h
+RandomizedDelaySec=5m
+Persistent=true
+Unit=${SERVICE_NAME}-refresh.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload 2>/dev/null || return 1
+}
+
+enable_refresh_timer() {
+    [ -s "$SUB_URL_FILE" ] || return 0
+    write_refresh_timer || return 1
+    systemctl enable --now "${SERVICE_NAME}-refresh.timer" >/dev/null 2>&1
+}
+
+disable_refresh_timer() {
+    systemctl disable --now "${SERVICE_NAME}-refresh.timer" >/dev/null 2>&1 || true
 }
 
 # Remove any leftover SIP003 plugin unit from older (external-plugin) installs.
@@ -551,46 +1100,56 @@ install_service() {
     # Honor the user's persisted autostart choice across reboots/firmware wipes.
     # Default (no marker) = enabled, matching prior behavior.
     if [ -f "$AUTOSTART_FILE" ] && [ "$(cat "$AUTOSTART_FILE")" = "disabled" ]; then
-        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || fatal "could not disable service autostart"
     else
-        systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || fatal "could not enable service autostart"
+    fi
+    if [ -s "$SUB_URL_FILE" ]; then
+        enable_refresh_timer || fatal "could not enable subscription refresh timer"
+    else
+        write_refresh_timer || true
     fi
 }
 
-# Build + validate a config from the given link and, only on success, swap it
-# into place. Never mutates stored state (link.txt) on failure.
-# Secrets (the proxy link + WireGuard private key) are passed to the generator
-# through a mode-600 JSON file, never argv (process-list safety + no ARG_MAX).
-_build_config() {
-    _bl="$1"
+boot_recover() {
+    install_service
+    if { [ -f "$CONFIG" ] || [ -f "$POOL_DIR/99-overlay.json" ]; } \
+        && [ "$(cat "$AUTOSTART_FILE" 2>/dev/null || echo enabled)" != "disabled" ]; then
+        restart_service || fatal "service failed its boot recovery health check"
+    fi
+}
+
+# Build + validate from a mode-600 candidate link file. No proxy credential or
+# WireGuard key is ever placed in argv/environment.
+_build_config_file() {
+    _link_file="$1"
     ensure_keys
-    _eng="$(engine_for_link "$_bl")"
+    _eng="$(engine_for_link_file "$_link_file")"
     [ -n "$_eng" ] || fatal "unsupported link (expected vless/vmess/trojan/ss/hysteria2/tuic)"
-    wg_priv="$(cat "$WG_DIR/wg_private.key")" || fatal "could not read WireGuard key"
-    unifi_pub="$(cat "$WG_DIR/unifi_public.key")" || fatal "could not read WireGuard key"
+    if [ "$_eng" = "singbox" ] && [ "$WG_LISTEN" != "127.0.0.1" ]; then
+        fatal "sing-box cannot bind its WireGuard endpoint to WG_LISTEN=$WG_LISTEN; use 127.0.0.1"
+    fi
     mkdir -p "$ETC_DIR" || fatal "could not create $ETC_DIR"
+    prepare_service_permissions
     tmpcfg="$(mktemp "$ETC_DIR/.cfg.XXXXXX")" || fatal "could not create temp file"
-    _inf="$(mktemp "$ETC_DIR/.in.XXXXXX")" || { rm -f "$tmpcfg"; fatal "could not create temp file"; }
-    # shellcheck disable=SC2064
-    trap "rm -f '$tmpcfg' '$_inf'" EXIT INT TERM HUP
-    chmod 600 "$_inf"
-    # JSON input doc with the secret-bearing fields
-    py - "$_inf" "$_bl" "$wg_priv" "$unifi_pub" <<'PYEOF' || fatal "could not stage generator input"
-import json,sys
-open(sys.argv[1],"w").write(json.dumps({"link":sys.argv[2],"secret_key":sys.argv[3],"peer_pubkey":sys.argv[4]}))
-PYEOF
     if [ "$_eng" = "singbox" ]; then
         ensure_singbox
-        py "$MKSB" --input-file "$_inf" --port "$WG_PORT" \
+        py "$MKSB" --link-file "$_link_file" \
+            --secret-key-file "$WG_DIR/wg_private.key" \
+            --peer-pubkey-file "$WG_DIR/unifi_public.key" --port "$WG_PORT" \
             --address "$XRAY_ADDR" --mtu "$WG_MTU" --loglevel "$(sb_loglevel)" \
             > "$tmpcfg" || fatal "config generation failed (check the link)"
         if [ -x "$SBIN" ]; then
-            "$SBIN" check -c "$tmpcfg" >/dev/null 2>&1 || fatal "sing-box rejected the generated config"
+            chown root:"$SERVICE_GROUP" "$tmpcfg"; chmod 640 "$tmpcfg"
+            validate_as_service "$SBIN" check -c "$tmpcfg" >/dev/null 2>&1 \
+                || fatal "sing-box rejected the generated config"
         fi
     else
         set --
         [ -n "$INNER_DNS" ] && set -- --dns "$INNER_DNS"
-        py "$MKXRAY" --input-file "$_inf" \
+        py "$MKXRAY" --link-file "$_link_file" \
+            --secret-key-file "$WG_DIR/wg_private.key" \
+            --peer-pubkey-file "$WG_DIR/unifi_public.key" \
             --listen "$WG_LISTEN" --port "$WG_PORT" \
             --address "$XRAY_ADDR" --mtu "$WG_MTU" \
             --keepalive "$WG_KEEPALIVE" --loglevel "$LOGLEVEL" \
@@ -598,19 +1157,20 @@ PYEOF
             > "$tmpcfg" || fatal "config generation failed (check the link)"
         # -format json is required because xray infers format from the extension.
         if [ -x "$XRAY" ]; then
-            "$XRAY" run -test -config "$tmpcfg" -format json >/dev/null 2>&1 \
+            chown root:"$SERVICE_GROUP" "$tmpcfg"; chmod 640 "$tmpcfg"
+            validate_as_service "$XRAY" run -test -config "$tmpcfg" -format json >/dev/null 2>&1 \
                 || fatal "xray rejected the generated config (-test failed)"
         fi
     fi
-    rm -f "$_inf"
     [ -s "$tmpcfg" ] || fatal "generated config is empty"
     mv -f "$tmpcfg" "$CONFIG" || fatal "could not install config"
-    chmod 600 "$CONFIG"
-    trap - EXIT INT TERM HUP
-    printf '%s' "$_eng" > "$ENGINE_FILE" || fatal "could not write engine marker"
+    chown root:"$SERVICE_GROUP" "$CONFIG"; chmod 640 "$CONFIG"
+    printf '%s' "$_eng" | atomic_write "$ENGINE_FILE" 600 || fatal "could not write engine marker"
     rm -f "$SERVER_CACHE" 2>/dev/null || true   # server changed -> drop the menu cache
     # Refresh the systemd unit so ExecStart matches the (possibly changed) engine.
-    [ -f "$SERVICE_FILE" ] && write_service || true
+    if [ -f "$SERVICE_FILE" ]; then
+        write_service || fatal "could not update the systemd service"
+    fi
 }
 
 regen_config() {
@@ -618,43 +1178,46 @@ regen_config() {
         _build_pool "$POOL_SRC"
     else
         [ -f "$OUTBOUND_LINK" ] || fatal "no proxy link imported yet. Run 'proxy' and choose option 1."
-        _build_config "$(cat "$OUTBOUND_LINK")"
+        _build_config_file "$OUTBOUND_LINK"
     fi
 }
 
 # Build + validate an Xray JSON *profile* (balancer/pool) into the -confdir POOL_DIR.
-# The provider JSON is kept verbatim (sanitized for platform paths) and a WG-inbound
-# overlay replaces its local entry by tag. Only swaps state in on a clean -test.
+# The raw provider source is retained separately for audit/refresh identity. The
+# executable projection is validated/sanitized, and a WG inbound overlay replaces
+# its local entry by tag. State is swapped only after a clean core validation.
 _build_pool() {
     _pf="$1"
     [ -x "$XRAY" ] || fatal "xray-core is required for JSON balancer profiles"
     ensure_keys
     mkdir -p "$ETC_DIR" || fatal "could not create $ETC_DIR"
     _stage="$(mktemp -d "$ETC_DIR/.pool.XXXXXX")" || fatal "could not create temp dir"
-    # shellcheck disable=SC2064
-    trap "rm -rf '$_stage'" EXIT INT TERM HUP
+    prepare_service_permissions
+    chown root:"$SERVICE_GROUP" "$_stage"; chmod 750 "$_stage"
     py "$MKJSON" overlay --profile "$_pf" \
         --out-provider "$_stage/01-provider.json" \
         --out-overlay "$_stage/99-overlay.json" \
-        --port "$WG_PORT" \
+        --listen "$WG_LISTEN" --port "$WG_PORT" \
         --secret-key-file "$WG_DIR/wg_private.key" \
         --peer-pubkey-file "$WG_DIR/unifi_public.key" \
-        --address "$XRAY_ADDR" --mtu "$WG_MTU" --loglevel "$LOGLEVEL" \
+        --address "$XRAY_ADDR" --mtu "$WG_MTU" --keepalive "$WG_KEEPALIVE" --loglevel "$LOGLEVEL" \
         >/dev/null || fatal "could not build pool profile (unsupported or invalid JSON)"
-    "$XRAY" run -test -confdir "$_stage" >/dev/null 2>&1 \
+    chown root:"$SERVICE_GROUP" "$_stage"/*.json; chmod 640 "$_stage"/*.json
+    validate_as_service "$XRAY" run -test -confdir "$_stage" >/dev/null 2>&1 \
         || fatal "xray rejected the pool profile (-test failed)"
-    chmod 600 "$_stage"/*.json 2>/dev/null || true
-    # swap the whole pool dir in atomically
-    rm -rf "$POOL_DIR.old" 2>/dev/null || true
-    [ -d "$POOL_DIR" ] && mv "$POOL_DIR" "$POOL_DIR.old"
-    mv "$_stage" "$POOL_DIR" || { [ -d "$POOL_DIR.old" ] && mv "$POOL_DIR.old" "$POOL_DIR"; fatal "could not install pool dir"; }
-    rm -rf "$POOL_DIR.old" 2>/dev/null || true
-    trap - EXIT INT TERM HUP
-    printf 'xraypool' > "$ENGINE_FILE" || fatal "could not write engine marker"
+    ensure_run_dir
+    _old_pool="$RUN_DIR/pool.old"
+    rm -rf "$_old_pool"
+    [ -d "$POOL_DIR" ] && mv "$POOL_DIR" "$_old_pool"
+    mv "$_stage" "$POOL_DIR" || { [ -d "$_old_pool" ] && mv "$_old_pool" "$POOL_DIR"; fatal "could not install pool dir"; }
+    rm -rf "$_old_pool"
+    printf 'xraypool' | atomic_write "$ENGINE_FILE" 600 || fatal "could not write engine marker"
     rm -f "$SERVER_CACHE" 2>/dev/null || true   # server changed -> drop the menu cache
     # pool mode has no single config.json; clear a stale one so status is accurate
     rm -f "$CONFIG" 2>/dev/null || true
-    [ -f "$SERVICE_FILE" ] && write_service || true
+    if [ -f "$SERVICE_FILE" ]; then
+        write_service || fatal "could not update the systemd service"
+    fi
 }
 
 # Import a JSON balancer/pool profile from a file (or piped content already saved
@@ -663,18 +1226,22 @@ cmd_import_json() {
     _src="$1"
     [ -s "$_src" ] || fatal "empty profile"
     load_settings
+    _cmd_owned=0
+    if [ -z "$TXN_DIR" ]; then txn_begin; _cmd_owned=1; fi
     # build first; only commit POOL_SRC on success (never clobber a working setup)
     _build_pool "$_src"
-    cp -f "$_src" "$POOL_SRC" || fatal "could not store profile"
-    chmod 600 "$POOL_SRC"
+    atomic_write "$POOL_SRC" 600 < "$_src" || fatal "could not store profile"
     # a pool import supersedes any single link + subscription selection
     rm -f "$OUTBOUND_LINK" 2>/dev/null || true
-    [ "${_FROM_SUB:-0}" = "1" ] || rm -f "$SUB_SELECTED" 2>/dev/null || true
+    [ "${_FROM_SUB:-0}" = "1" ] || rm -f "$SUB_SELECTED" "$SUB_SELECTED_META" 2>/dev/null || true
     save_settings
-    if restart_service; then c_grn "Imported balancer profile and applied."
-    else c_ylw "Imported, but the service did not come up — check 'View logs'."; fi
-    echo
-    cmd_wg_config
+    restart_service || fatal "profile was valid, but the service failed its startup health check"
+    [ "$_cmd_owned" = 1 ] && txn_commit
+    if [ "${_QUIET:-0}" != 1 ]; then
+        c_grn "Imported balancer profile and applied."
+        echo
+        cmd_wg_config
+    fi
 }
 
 cmd_import() {
@@ -684,26 +1251,35 @@ cmd_import() {
         vless://*|vmess://*|trojan://*|ss://*|hysteria2://*|hy2://*|tuic://*) : ;;
         *) fatal "unsupported link (expected vless://, vmess://, trojan://, ss://, hysteria2:// or tuic://)" ;;
     esac
+    _bytes="$(LC_ALL=C printf '%s' "$link" | wc -c | tr -d ' ')"
+    [ "$_bytes" -le 8000 ] || fatal "proxy link is too long (maximum 8000 bytes)"
+    if LC_ALL=C printf '%s' "$link" | grep -q '[[:cntrl:]]'; then
+        fatal "proxy link contains control characters"
+    fi
     load_settings
-    # Build + validate the NEW link FIRST. On any failure this fatals before we
-    # touch link.txt, so a bad import never clobbers a working configuration.
-    _build_config "$link"
-    mkdir -p "$ETC_DIR"
-    printf '%s' "$link" > "$OUTBOUND_LINK"
-    chmod 600 "$OUTBOUND_LINK"
+    _cmd_owned=0
+    if [ -z "$TXN_DIR" ]; then txn_begin; _cmd_owned=1; fi
+    ensure_run_dir
+    _candidate_link="$RUN_DIR/link.candidate"
+    printf '%s' "$link" | atomic_write "$_candidate_link" 600 || fatal "could not stage proxy link"
+    _build_config_file "$_candidate_link"
+    atomic_write "$OUTBOUND_LINK" 600 < "$_candidate_link" || fatal "could not store proxy link"
     # a single-link import supersedes any active pool profile
     rm -rf "$POOL_DIR" "$POOL_SRC" 2>/dev/null || true
     save_settings
     # A manual import detaches any subscription selection (so a later 'sub refresh'
     # won't think this hand-picked link came from the subscription). sub_select sets
     # _FROM_SUB=1 to keep its own marker.
-    [ "${_FROM_SUB:-0}" = "1" ] || rm -f "$SUB_SELECTED" 2>/dev/null || true
+    [ "${_FROM_SUB:-0}" = "1" ] || rm -f "$SUB_SELECTED" "$SUB_SELECTED_META" 2>/dev/null || true
     # Apply immediately (starts the service even if autostart is off; the unit's
     # ConditionPathExists is now satisfied because config.json exists).
-    if restart_service; then c_grn "Imported and applied."
-    else c_ylw "Imported, but the service did not come up — check 'View logs'."; fi
-    echo
-    cmd_wg_config
+    restart_service || fatal "link was valid, but the service failed its startup health check"
+    [ "$_cmd_owned" = 1 ] && txn_commit
+    if [ "${_QUIET:-0}" != 1 ]; then
+        c_grn "Imported and applied."
+        echo
+        cmd_wg_config
+    fi
 }
 
 cmd_wg_config() {
@@ -764,7 +1340,7 @@ cmd_status() {
     # interfaces; a firewall rule blocks non-loopback access. Report what is
     # actually in effect rather than guessing.
     if [ "$_eng" = "singbox" ]; then
-        if have iptables && iptables -C INPUT -p udp --dport "$WG_PORT" ! -i lo -j DROP 2>/dev/null; then
+        if fw_is_locked "$WG_PORT"; then
             echo "wg listen: 0.0.0.0:${WG_PORT} (loopback only; LAN/WAN blocked by firewall)  mtu=${WG_MTU}"
         else
             c_ylw "wg listen: 0.0.0.0:${WG_PORT} (all interfaces; firewall rule NOT active)  mtu=${WG_MTU}"
@@ -773,7 +1349,7 @@ cmd_status() {
         echo "wg listen: ${WG_LISTEN}:${WG_PORT}  mtu=${WG_MTU}"
     fi
     if have ss; then
-        if ss -lun 2>/dev/null | grep -q ":${WG_PORT}\b"; then c_grn "udp/${WG_PORT}: listening"; else c_ylw "udp/${WG_PORT}: not listening"; fi
+        if socket_listening "$WG_PORT"; then c_grn "udp/${WG_PORT}: listening"; else c_ylw "udp/${WG_PORT}: not listening"; fi
     fi
 }
 
@@ -786,20 +1362,57 @@ cmd_restart() { systemctl restart "$SERVICE_NAME"; }
 # not claim success) if the unit is not active shortly after the restart, so a
 # crash-on-start is reported instead of being masked by '|| true'. A disabled-and-
 # stopped autostart state is treated as "intentionally not running" -> success.
+socket_listening() {
+    have ss || return 1
+    ss -lun 2>/dev/null | awk -v port="$1" '
+        NR > 1 {
+            if ($0 ~ (":" port "([[:space:]]|$)")) found=1
+        }
+        END { exit(found ? 0 : 1) }'
+}
+
+socket_owned_by_pid() {
+    _port="$1"; _pid="$2"
+    have ss || return 1
+    _ss_output="$(ss -lunp 2>/dev/null)" || return 1
+    printf '%s\n' "$_ss_output" | awk -v port="$_port" -v pid="$_pid" '
+            $0 ~ (":" port "([[:space:]]|$)") && $0 ~ ("pid=" pid "([,)]|$)") { found=1 }
+            END { exit(found ? 0 : 1) }'
+}
+
+service_healthy() {
+    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null || return 1
+    _main_pid="$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null || echo 0)"
+    case "$_main_pid" in ""|0|*[!0-9]*) return 1 ;; esac
+    kill -0 "$_main_pid" 2>/dev/null || return 1
+    socket_owned_by_pid "$WG_PORT" "$_main_pid"
+}
+
 restart_service() {
     [ -f "$CONFIG" ] || [ -f "$POOL_DIR/99-overlay.json" ] || return 0   # nothing to run yet
-    systemctl restart "$SERVICE_NAME" 2>/dev/null || systemctl start "$SERVICE_NAME" 2>/dev/null || true
+    systemctl restart "$SERVICE_NAME" 2>/dev/null || systemctl start "$SERVICE_NAME" 2>/dev/null || return 1
     _i=0
-    while [ "$_i" -lt 10 ]; do
-        systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && return 0
-        _i=$((_i + 1)); sleep 0.3 2>/dev/null || sleep 1
+    _stable=0
+    while [ "$_i" -lt 40 ]; do
+        if service_healthy; then
+            _stable=$((_stable + 1))
+            [ "$_stable" -ge 8 ] && return 0
+        else
+            _stable=0
+        fi
+        _i=$((_i + 1)); sleep 0.25 2>/dev/null || sleep 1
     done
-    # not active: only a failure if the unit is supposed to be running
-    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && return 0
     return 1
 }
+
+restart_if_previously_active() {
+    if [ -n "$TXN_DIR" ] && [ ! -f "$TXN_DIR/service-active" ]; then
+        return 0
+    fi
+    restart_service
+}
 # returns nonzero if the marker could not be persisted (caller must not claim success)
-_save_autostart() { mkdir -p "$ETC_DIR" && printf '%s' "$1" > "$AUTOSTART_FILE"; }
+_save_autostart() { mkdir -p "$ETC_DIR" && printf '%s' "$1" | atomic_write "$AUTOSTART_FILE" 600; }
 cmd_enable()  { systemctl enable "$SERVICE_NAME"; _save_autostart enabled; }
 cmd_disable() { systemctl disable "$SERVICE_NAME"; _save_autostart disabled; }   # autostart only; use 'stop' to stop now
 
@@ -819,10 +1432,12 @@ cmd_config()  {
 cmd_set() {
     load_settings
     key="$1"; val="$2"
+    _cmd_owned=0
+    if [ -z "$TXN_DIR" ]; then txn_begin; _cmd_owned=1; fi
     # 'ping' only changes a CLI default; it never touches the xray config.
     if [ "$key" = "ping" ]; then
         case "$val" in
-            get|head|tcp|icmp) PING_MODE="$val"; save_settings; c_grn "Default ping protocol = $val." ;;
+            get|head|tcp|icmp) PING_MODE="$val"; save_settings; [ "$_cmd_owned" = 1 ] && txn_commit; c_grn "Default ping protocol = $val." ;;
             *) fatal "ping protocol must be get|head|tcp|icmp" ;;
         esac
         return
@@ -863,10 +1478,12 @@ PYEOF
     save_settings
     if [ -f "$OUTBOUND_LINK" ] || [ -f "$POOL_SRC" ]; then
         regen_config
-        if restart_service; then c_grn "Updated $key and reloaded."
-        else c_ylw "Updated $key, but the service did not come up — check 'View logs'."; fi
+        restart_if_previously_active || fatal "updated config failed its startup health check; previous settings restored"
+        [ "$_cmd_owned" = 1 ] && txn_commit
+        c_grn "Updated $key and reloaded."
         case "$key" in port|mtu|dns) echo; c_ylw "Update your UniFi VPN Client to match:"; cmd_wg_config ;; esac
     else
+        [ "$_cmd_owned" = 1 ] && txn_commit
         c_grn "Updated $key (will apply when you import a link)."
     fi
     return 0
@@ -874,65 +1491,121 @@ PYEOF
 
 cmd_regen_keys() {
     load_settings
-    # Rotate atomically: if a link is configured, rebuild the config with the NEW
-    # keys and only keep them if that succeeds. On failure, restore the old keys so
-    # the key files always match the running config (never a silent mismatch).
-    if [ -f "$OUTBOUND_LINK" ]; then
-        _bk="$(mktemp -d)"
-        cp -p "$WG_DIR"/*.key "$_bk"/ 2>/dev/null || true
-        rm -f "$WG_DIR"/*.key
-        ensure_keys
-        # regen_config may call fatal() (which exits); run it in a subshell so a
-        # failure is caught here as a non-zero status instead of killing the CLI
-        # before we can roll the keys back. On success it has already written
-        # config.json (the mv inside it is atomic), so re-running it is not needed.
-        if ( regen_config ) >/dev/null 2>&1; then
-            rm -rf "$_bk"
-            systemctl restart "$SERVICE_NAME" 2>/dev/null || true
-        else
-            # roll back to the previous keypair
-            rm -f "$WG_DIR"/*.key
-            cp -p "$_bk"/*.key "$WG_DIR"/ 2>/dev/null || true
-            rm -rf "$_bk"
-            fatal "key regeneration failed (config rebuild error); previous keys kept"
-        fi
-    else
-        rm -f "$WG_DIR"/*.key
-        ensure_keys
+    txn_begin
+    rm -f "$WG_DIR"/*.key
+    ensure_keys
+    if [ -f "$OUTBOUND_LINK" ] || [ -f "$POOL_SRC" ]; then
+        regen_config
+        restart_if_previously_active || fatal "new-key config failed its startup health check; previous keys restored"
     fi
+    txn_commit
     c_ylw "New keys generated. You MUST update the UniFi VPN Client with the new config:"
     echo
     cmd_wg_config
 }
 
 cmd_update() {
-    cmd_install_binary
-    if restart_service; then c_grn "Updated and running."
-    else c_ylw "Updated, but the service did not come back up — check 'View logs'."; fi
+    ensure_run_dir
+    _update_was_active=0
+    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && _update_was_active=1
+    UPDATE_WAS_ACTIVE="$_update_was_active"
+    _backup="$RUN_DIR/update-backup"; mkdir -p "$_backup"
+    for _name in xray sing-box geoip.dat geosite.dat; do
+        if [ -e "$BIN_DIR/$_name" ]; then cp -p "$BIN_DIR/$_name" "$_backup/$_name" || fatal "could not back up $_name"
+        else : > "$_backup/$_name.absent"; fi
+    done
+    UPDATE_BACKUP="$_backup"
+    if ! ( _STRICT_UPDATE=1; cmd_install_binary ); then
+        _restore_update_backup "$_backup" || fatal "core update failed and the previous binaries/assets could not be fully restored"
+        UPDATE_BACKUP=""
+        fatal "core update failed; previous binaries/assets restored"
+    fi
+    if ! ( write_service ); then
+        _restore_update_backup "$_backup" || fatal "service regeneration failed and core rollback was incomplete"
+        UPDATE_BACKUP=""
+        ( write_service ) 2>/dev/null || true
+        if [ "$_update_was_active" = 1 ]; then systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+        else systemctl stop "$SERVICE_NAME" 2>/dev/null || true; fi
+        fatal "service regeneration failed; previous binaries/assets restored"
+    fi
+    if [ "$_update_was_active" = 1 ] && ! restart_service; then
+        _restore_update_backup "$_backup" || fatal "updated core failed and binary rollback was incomplete"
+        UPDATE_BACKUP=""
+        ( write_service ) || true
+        if [ "$_update_was_active" = 1 ]; then systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+        else systemctl stop "$SERVICE_NAME" 2>/dev/null || true; fi
+        fatal "updated core failed runtime health checks; rolled back"
+    fi
+    UPDATE_BACKUP=""
+    if [ "$_update_was_active" = 1 ]; then c_grn "Updated and running."
+    else c_grn "Updated. Service remains stopped."; fi
+}
+
+_restore_update_backup() {
+    _backup="$1"
+    _restore_rc=0
+    for _name in xray sing-box geoip.dat geosite.dat; do
+        if [ -f "$_backup/$_name.absent" ]; then rm -f "$BIN_DIR/$_name" || _restore_rc=1
+        elif [ -f "$_backup/$_name" ]; then
+            install -m "$( [ -x "$_backup/$_name" ] && echo 0755 || echo 0644 )" \
+                "$_backup/$_name" "$BIN_DIR/$_name" || _restore_rc=1
+        fi
+    done
+    return "$_restore_rc"
 }
 
 cmd_geo_update() {
     mkdir -p "$BIN_DIR"
+    ensure_run_dir
+    _tag="$(resolve_latest_tag "https://github.com/Loyalsoldier/v2ray-rules-dat/releases")"
+    [ -n "$_tag" ] || fatal "could not resolve geo-data release"
+    _backup="$RUN_DIR/geo-backup"; mkdir -p "$_backup"
+    _geo_was_active=0
+    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && _geo_was_active=1
+    GEO_WAS_ACTIVE="$_geo_was_active"
     for f in geoip.dat geosite.dat; do
-        info "downloading $f ..."
-        if have curl; then
-            curl -fsSL "$GEO_BASE/$f" -o "$BIN_DIR/$f.new" || { rm -f "$BIN_DIR/$f.new"; fatal "failed to fetch $f"; }
-        elif have wget; then
-            wget -qO "$BIN_DIR/$f.new" "$GEO_BASE/$f" || { rm -f "$BIN_DIR/$f.new"; fatal "failed to fetch $f"; }
+        if [ -f "$BIN_DIR/$f" ]; then
+            cp -p "$BIN_DIR/$f" "$_backup/$f" || fatal "could not back up $f"
         else
-            fatal "need curl or wget to download geo files"
+            : > "$_backup/$f.absent"
         fi
+        GEO_BACKUP="$_backup"
+        info "downloading $f ..."
+        download_to "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${_tag}/$f" "$BIN_DIR/$f.new" 209715200 \
+            || { rm -f "$BIN_DIR/$f.new"; _restore_geo_backup "$_backup" || fatal "download failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "failed to fetch $f"; }
+        _want="$(github_asset_digest Loyalsoldier/v2ray-rules-dat "$_tag" "$f" 2>/dev/null)" \
+            || { rm -f "$BIN_DIR/$f.new"; _restore_geo_backup "$_backup" || fatal "digest lookup failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "could not obtain digest for $f"; }
+        verify_sha256 "$BIN_DIR/$f.new" "$_want" \
+            || { rm -f "$BIN_DIR/$f.new"; _restore_geo_backup "$_backup" || fatal "checksum failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "checksum failed for $f"; }
         mv -f "$BIN_DIR/$f.new" "$BIN_DIR/$f"
     done
-    systemctl restart "$SERVICE_NAME" 2>/dev/null || true
-    c_grn "Geo files updated."
+    if [ "$_geo_was_active" = 1 ] && ! restart_service; then
+        _restore_geo_backup "$_backup" || fatal "geo runtime check failed and rollback was incomplete"
+        GEO_BACKUP=""
+        systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+        fatal "geo update failed runtime health checks; rolled back"
+    fi
+    GEO_BACKUP=""
+    if [ "$_geo_was_active" = 1 ]; then c_grn "Geo files updated and service restarted."
+    else c_grn "Geo files updated. Service remains stopped."; fi
+}
+
+_restore_geo_backup() {
+    _backup="$1"
+    _restore_rc=0
+    for _name in geoip.dat geosite.dat; do
+        if [ -f "$_backup/$_name.absent" ]; then rm -f "$BIN_DIR/$_name" || _restore_rc=1
+        elif [ -f "$_backup/$_name" ]; then install -m 0644 "$_backup/$_name" "$BIN_DIR/$_name" || _restore_rc=1
+        fi
+    done
+    return "$_restore_rc"
 }
 
 # Print 'host<TAB>port' for the current link using the engine-appropriate generator.
 _server_hp() {
     [ -f "$OUTBOUND_LINK" ] || return 1
     if [ "$(current_engine)" = "singbox" ]; then _gen="$MKSB"; else _gen="$MKXRAY"; fi
-    py "$_gen" --link "$(cat "$OUTBOUND_LINK")" --print-server 2>/dev/null
+    py "$_gen" --link-file "$OUTBOUND_LINK" --print-server 2>/dev/null
 }
 
 # Cached for menu speed: computing the server string spawns python (link parse
@@ -945,7 +1618,7 @@ current_server() {
     # Cache only once $ETC_DIR exists (it does not before the first import), and
     # put 2>/dev/null BEFORE '>' so a failed open can't leak a shell redirection
     # error onto the menu.
-    if [ -d "$ETC_DIR" ]; then printf '%s' "$_cs" 2>/dev/null > "$SERVER_CACHE" || true; fi
+    if [ -d "$ETC_DIR" ]; then printf '%s' "$_cs" | atomic_write "$SERVER_CACHE" 600 2>/dev/null || true; fi
     printf '%s\n' "$_cs"
 }
 _compute_server() {
@@ -976,38 +1649,39 @@ _free_port() {
 _ping_cleanup() {
     [ -n "${_pid:-}" ] && { kill "$_pid" 2>/dev/null || true; wait "$_pid" 2>/dev/null || true; }
     [ -n "${_cfg:-}" ] && rm -f "$_cfg"
-    _pid=""; _cfg=""
+    _pid=""; _cfg=""; BG_PID=""
 }
 
 ping_proxy() {   # $1 = get|head
+    have curl || { err "curl is required for proxy HTTP latency tests"; return 1; }
     _m="$1"; _e="$(current_engine)"
     _port="$(_free_port)"
-    _cfg="$(mktemp)"; _pid=""
-    # ensure the spawned engine + temp config are cleaned up even on Ctrl-C / error
-    trap '_ping_cleanup' EXIT INT TERM HUP
+    ensure_run_dir
+    _cfg="$RUN_DIR/ping.json"; _pid=""
     if [ "$_e" = "xraypool" ]; then
         # balancer/pool: expose the provider's outbounds through a local SOCKS
         # inbound so we measure latency through the same balancer xray uses live.
-        [ -x "$XRAY" ] || { err "xray binary not installed"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
-        [ -f "$POOL_SRC" ] || { err "no pool profile on disk"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
+        [ -x "$XRAY" ] || { err "xray binary not installed"; _ping_cleanup; return 1; }
+        [ -f "$POOL_SRC" ] || { err "no pool profile on disk"; _ping_cleanup; return 1; }
         py "$MKJSON" socksconfig --profile "$POOL_SRC" --socks-port "$_port" > "$_cfg" 2>/dev/null \
-            || { err "could not build test config"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
-        "$XRAY" run -config "$_cfg" -format json >/dev/null 2>&1 &
+            || { err "could not build test config"; _ping_cleanup; return 1; }
+        set -- "$XRAY" run -config "$_cfg" -format json
     elif [ "$_e" = "singbox" ]; then
-        _link="$(cat "$OUTBOUND_LINK")"
-        [ -x "$SBIN" ] || { err "sing-box not installed"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
-        py "$MKSB" --link "$_link" --socks-port "$_port" > "$_cfg" 2>/dev/null \
-            || { err "could not build test config"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
-        "$SBIN" run -c "$_cfg" >/dev/null 2>&1 &
+        [ -x "$SBIN" ] || { err "sing-box not installed"; _ping_cleanup; return 1; }
+        py "$MKSB" --link-file "$OUTBOUND_LINK" --socks-port "$_port" > "$_cfg" 2>/dev/null \
+            || { err "could not build test config"; _ping_cleanup; return 1; }
+        set -- "$SBIN" run -c "$_cfg"
     else
-        _link="$(cat "$OUTBOUND_LINK")"
-        [ -x "$XRAY" ] || { err "xray binary not installed"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
-        py "$MKXRAY" --link "$_link" --socks-port "$_port" > "$_cfg" 2>/dev/null \
-            || { err "could not build test config"; _ping_cleanup; trap - EXIT INT TERM HUP; return 1; }
-        # -format json: mktemp names have no extension for xray to infer the format from.
-        "$XRAY" run -config "$_cfg" -format json >/dev/null 2>&1 &
+        [ -x "$XRAY" ] || { err "xray binary not installed"; _ping_cleanup; return 1; }
+        py "$MKXRAY" --link-file "$OUTBOUND_LINK" --socks-port "$_port" > "$_cfg" 2>/dev/null \
+            || { err "could not build test config"; _ping_cleanup; return 1; }
+        set -- "$XRAY" run -config "$_cfg" -format json
     fi
-    _pid=$!
+    ensure_service_user
+    chown root:"$SERVICE_GROUP" "$RUN_DIR" "$_cfg"; chmod 750 "$RUN_DIR"; chmod 640 "$_cfg"
+    _ping_budget=$((PING_TIMEOUT + 15))
+    py "$SAFEEXEC" --user "$SERVICE_USER" --timeout "$_ping_budget" --memory-mb 256 --fsize-mb 16 -- "$@" >/dev/null 2>&1 &
+    _pid=$!; BG_PID="$_pid"
     # wait (max ~4.5s) for the SOCKS listener to come up
     _i=0
     while [ "$_i" -lt 15 ]; do
@@ -1022,7 +1696,6 @@ except Exception: sys.exit(1)' >/dev/null 2>&1; then break; fi
     _out="$(LC_ALL=C curl -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time "$PING_TIMEOUT" \
              "$@" --proxy "socks5h://127.0.0.1:${_port}" "$PING_URL" 2>/dev/null)" || _out=""
     _ping_cleanup
-    trap - EXIT INT TERM HUP
     if [ -z "$_out" ]; then c_red "${_label}: timeout (>${PING_TIMEOUT}s)"; return 1; fi
     _code="${_out%% *}"; _ms="$(_ms_from_seconds "${_out##* }")"
     case "$_code" in
@@ -1045,7 +1718,10 @@ ping_tcp() {
     _hp="$(_ping_target_hp)"
     _h="$(printf '%s' "$_hp" | cut -f1)"; _p="$(printf '%s' "$_hp" | cut -f2)"
     [ -n "$_h" ] || { err "could not parse server from link"; return 1; }
-    _ms="$(py - "$_h" "$_p" "$PING_TIMEOUT" <<'PYEOF'
+    ensure_service_user
+    if have python3; then _ping_python=python3; else _ping_python=python; fi
+    _ms="$(py "$SAFEEXEC" --user "$SERVICE_USER" --timeout "$((PING_TIMEOUT + 5))" \
+        --memory-mb 128 --fsize-mb 1 -- "$_ping_python" - "$_h" "$_p" "$PING_TIMEOUT" <<'PYEOF'
 import socket, time, sys
 host, port, timeout = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
 start = time.time()
@@ -1060,11 +1736,15 @@ PYEOF
 }
 
 ping_icmp() {
+    have ping || { err "ping is required for ICMP tests"; return 1; }
     _hp="$(_ping_target_hp)"
     _h="$(printf '%s' "$_hp" | cut -f1)"
     [ -n "$_h" ] || { err "could not parse server from link"; return 1; }
     # '--' so a server host starting with '-' can't be read as a ping option
-    _out="$(ping -c 1 -W "$PING_TIMEOUT" -- "$_h" 2>/dev/null)" || { c_red "ICMP ${_h}: timeout (>${PING_TIMEOUT}s)"; return 1; }
+    ensure_service_user
+    _out="$(py "$SAFEEXEC" --user "$SERVICE_USER" --timeout "$((PING_TIMEOUT + 5))" \
+        --memory-mb 128 --fsize-mb 1 -- ping -c 1 -W "$PING_TIMEOUT" -- "$_h" 2>/dev/null)" \
+        || { c_red "ICMP ${_h}: timeout (>${PING_TIMEOUT}s)"; return 1; }
     _ms="$(printf '%s\n' "$_out" | sed -n 's/.*time=\([0-9.]*\).*/\1/p' | head -1)"
     if [ -n "$_ms" ]; then c_grn "ICMP ${_h}: ${_ms} ms"; else c_red "ICMP ${_h}: no reply (host may block ICMP)"; fi
 }
@@ -1105,7 +1785,7 @@ print_menu() {
     # when it is empty (e.g. systemctl missing).
     svc="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)";  [ -n "$svc" ]  || svc=unknown
     auto="$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null)"; [ -n "$auto" ] || auto=disabled
-    lst="down"; if have ss && ss -lun 2>/dev/null | grep -q ":${WG_PORT}\b"; then lst="up"; fi
+    lst="down"; if socket_listening "$WG_PORT"; then lst="up"; fi
     ml() { printf '│ %-49s │\n' "$1"; }
     case "$svc" in active) svc_d="Running";; inactive) svc_d="Stopped";; *) svc_d="$svc";; esac
     case "$auto" in enabled) auto_d="Yes";; *) auto_d="No";; esac
@@ -1163,16 +1843,24 @@ menu_restart() {
     else c_red "Failed to restart - is a link imported? Check 'View logs'."; fi
 }
 menu_enable() {
-    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null || systemctl enable "$SERVICE_NAME" >/dev/null 2>&1; then
-        if _save_autostart enabled; then c_grn "Autostart enabled."
-        else c_red "Enabled, but could not persist the autostart marker."; fi
-    else c_red "Failed to enable autostart (is the service installed?)."; fi
+    txn_begin
+    if ! systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null \
+        && ! systemctl enable "$SERVICE_NAME" >/dev/null 2>&1; then
+        fatal "failed to enable autostart (is the service installed?)"
+    fi
+    _save_autostart enabled || fatal "enabled service, but could not persist autostart marker"
+    txn_commit
+    c_grn "Autostart enabled."
 }
 menu_disable() {
-    if ! systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null || systemctl disable "$SERVICE_NAME" >/dev/null 2>&1; then
-        if _save_autostart disabled; then c_ylw "Autostart disabled (service keeps running until stopped)."
-        else c_red "Disabled, but could not persist the autostart marker."; fi
-    else c_red "Failed to disable autostart."; fi
+    txn_begin
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null \
+        && ! systemctl disable "$SERVICE_NAME" >/dev/null 2>&1; then
+        fatal "failed to disable autostart"
+    fi
+    _save_autostart disabled || fatal "disabled service, but could not persist autostart marker"
+    txn_commit
+    c_ylw "Autostart disabled (service keeps running until stopped)."
 }
 
 menu_set_ping() {
@@ -1189,13 +1877,17 @@ menu_set_ping() {
         1) _m="get" ;; 2) _m="head" ;; 3) _m="tcp" ;; 4) _m="icmp" ;;
         *) c_red "invalid choice"; return ;;
     esac
-    cmd_set ping "$_m"
+    locked_call cmd_set ping "$_m"
 }
 
 cmd_menu() {
     # Interactive loop: turn off errexit and run each action in a subshell so a
     # failing action (including any fatal/exit) reports its error and returns to
     # the menu instead of killing the whole program.
+    need_root
+    # Repair an interrupted transaction before displaying any persisted state,
+    # but release the lock before waiting for the user's first selection.
+    ( locked_call true ) || fatal "could not recover interrupted state"
     set +e
     while true; do
         clear 2>/dev/null || true
@@ -1206,33 +1898,33 @@ cmd_menu() {
         case "$sel" in
             0)  exit 0 ;;
             1)  ( printf 'Paste proxy link (vless/vmess/trojan/ss/hysteria2/tuic): '; read -r _l || true
-                  if [ -n "${_l:-}" ]; then cmd_import "$_l"; else c_ylw "No link entered."; fi ) ;;
+                  if [ -n "${_l:-}" ]; then locked_call cmd_import "$_l"; else c_ylw "No link entered."; fi ) ;;
             2)  ( menu_sub ) ;;
             3)  ( menu_import_json ) ;;
             4)  ( cmd_config ) ;;
             5)  ( cmd_wg_config ) ;;
             6)  ( printf 'Regenerate keys? This breaks the current UniFi VPN Client until you re-paste the new config. [y/N]: '
                   read -r _c || true
-                  if [ "${_c:-}" = "y" ]; then cmd_regen_keys; else c_ylw "Cancelled."; fi ) ;;
+                  if [ "${_c:-}" = "y" ]; then locked_call cmd_regen_keys; else c_ylw "Cancelled."; fi ) ;;
             7)  ( menu_wg_settings ) ;;
             8)  ( cmd_ping ) ;;
             9)  ( menu_set_ping ) ;;
-            10) ( menu_start ) ;;
-            11) ( menu_stop ) ;;
-            12) ( menu_restart ) ;;
+            10) ( locked_call menu_start ) ;;
+            11) ( locked_call menu_stop ) ;;
+            12) ( locked_call menu_restart ) ;;
             13) ( cmd_status ) ;;
             14) ( printf 'Lines to show [100]: '; read -r _n || true
                   case "${_n:-}" in ""|*[!0-9]*) _n=100 ;; esac
                   cmd_logs logs -n "$_n" --no-pager ) ;;
-            15) ( menu_enable ) ;;
-            16) ( menu_disable ) ;;
-            17) ( cmd_update ) ;;
-            18) ( cmd_geo_update ) ;;
+            15) ( locked_call menu_enable ) ;;
+            16) ( locked_call menu_disable ) ;;
+            17) ( locked_call cmd_update ) ;;
+            18) ( locked_call cmd_geo_update ) ;;
             19) ( if [ -x "$XRAY" ]; then "$XRAY" version | head -1; else c_ylw "xray-core: not installed"; fi
                   if [ -x "$SBIN" ]; then "$SBIN" version 2>/dev/null | head -1; else c_ylw "sing-box: not installed"; fi
                   echo "proxy-unifi CLI 1.0.0" ) ;;
             20) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
-                if [ "${_c:-}" = "y" ]; then ( cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
+                if [ "${_c:-}" = "y" ]; then ( locked_call cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
             *)  c_red "Invalid selection." ;;
         esac
         pause
@@ -1251,11 +1943,11 @@ menu_wg_settings() {
     echo
     case "${_w:-}" in
         1) printf 'New WireGuard UDP port [%s]: ' "$WG_PORT"; read -r _v || true
-           if [ -n "${_v:-}" ]; then cmd_set port "$_v"; else c_ylw "Unchanged."; fi ;;
+           if [ -n "${_v:-}" ]; then locked_call cmd_set port "$_v"; else c_ylw "Unchanged."; fi ;;
         2) printf 'New tunnel MTU [%s]: ' "$WG_MTU"; read -r _v || true
-           if [ -n "${_v:-}" ]; then cmd_set mtu "$_v"; else c_ylw "Unchanged."; fi ;;
+           if [ -n "${_v:-}" ]; then locked_call cmd_set mtu "$_v"; else c_ylw "Unchanged."; fi ;;
         3) printf 'Tunnel DNS (comma-separated, empty to reset to 8.8.8.8) [%s]: ' "$INNER_DNS"; read -r _v || true
-           cmd_set dns "${_v:-}" ;;
+           locked_call cmd_set dns "${_v:-}" ;;
         0|"") c_ylw "Cancelled." ;;
         *) c_red "invalid choice" ;;
     esac
@@ -1269,19 +1961,18 @@ menu_import_json() {
     read -r _p || true
     if [ -n "${_p:-}" ]; then
         [ -f "$_p" ] || { c_red "no such file: $_p"; return; }
-        cmd_import_json "$_p"
+        locked_call cmd_import_json "$_p"
         return
     fi
-    _tmp="$(mktemp "$ETC_DIR/.paste.XXXXXX")" || { c_red "could not create temp file"; return; }
-    # shellcheck disable=SC2064
-    trap "rm -f '$_tmp'" EXIT INT TERM HUP
+    ensure_run_dir
+    _tmp="$RUN_DIR/pasted-profile.json"
     echo "Paste JSON now; finish with a single line containing only: EOF"
     while IFS= read -r _line; do
         [ "$_line" = "EOF" ] && break
         printf '%s\n' "$_line" >> "$_tmp"
     done
-    if [ -s "$_tmp" ]; then cmd_import_json "$_tmp"; else c_ylw "Nothing pasted."; fi
-    rm -f "$_tmp"; trap - EXIT INT TERM HUP
+    if [ -s "$_tmp" ]; then locked_call cmd_import_json "$_tmp"; else c_ylw "Nothing pasted."; fi
+    rm -f "$_tmp"
 }
 
 # Interactive subscription submenu (wraps the cmd_sub actions).
@@ -1292,27 +1983,33 @@ menu_sub() {
     echo "  2. List nodes"
     echo "  3. Select node"
     echo "  4. Refresh"
-    echo "  5. Remove"
+    echo "  5. Set automatic refresh interval"
+    echo "  6. Set provider compatibility User-Agent"
+    echo "  7. Remove"
     echo "  0. Back"
     printf 'Choice: '
     read -r _s || true
     echo
     case "${_s:-0}" in
         1) printf 'Subscription URL (https): '; read -r _u || true
-           if [ -n "${_u:-}" ]; then sub_add "$_u"; else c_ylw "Cancelled."; fi ;;
+           if [ -n "${_u:-}" ]; then locked_call sub_add "$_u"; else c_ylw "Cancelled."; fi ;;
         2) sub_list ;;
         3) sub_list; echo; printf 'Node number to select: '; read -r _n || true
-           if [ -n "${_n:-}" ]; then sub_select "$_n"; else c_ylw "Cancelled."; fi ;;
-        4) sub_refresh ;;
-        5) printf 'Remove the subscription? [y/N]: '; read -r _c || true
-           if [ "${_c:-}" = "y" ]; then sub_remove; else c_ylw "Cancelled."; fi ;;
+           if [ -n "${_n:-}" ]; then locked_call sub_select "$_n"; else c_ylw "Cancelled."; fi ;;
+        4) locked_call sub_refresh ;;
+        5) printf 'Refresh interval in hours [%s]: ' "$SUB_REFRESH_HOURS"; read -r _h || true
+           if [ -n "${_h:-}" ]; then locked_call sub_set_interval "$_h"; else c_ylw "Unchanged."; fi ;;
+        6) printf 'User-Agent [%s]: ' "$SUB_USER_AGENT"; read -r _ua || true
+           if [ -n "${_ua:-}" ]; then locked_call sub_set_user_agent "$_ua"; else c_ylw "Unchanged."; fi ;;
+        7) printf 'Remove the subscription? [y/N]: '; read -r _c || true
+           if [ "${_c:-}" = "y" ]; then locked_call sub_remove; else c_ylw "Cancelled."; fi ;;
         0|"") : ;;
         *) c_red "invalid choice" ;;
     esac
 }
 
 # --------------------------------------------------------------------------
-# Subscriptions (Base64 / plain link-list; single subscription, manual refresh)
+# Subscriptions (link lists and validated Xray JSON pools; scheduled refresh)
 # --------------------------------------------------------------------------
 sub_hwid() {
     # stable random UUID per install; NOT derived from any hardware identifier
@@ -1321,51 +2018,37 @@ sub_hwid() {
         _id="$(py -c 'import uuid;print(uuid.uuid4())' 2>/dev/null)"
         [ -n "$_id" ] || _id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)"
         [ -n "$_id" ] || fatal "could not generate an HWID"
-        printf '%s' "$_id" > "$SUB_HWID_FILE"; chmod 600 "$SUB_HWID_FILE"
+        printf '%s' "$_id" | atomic_write "$SUB_HWID_FILE" 600 || fatal "could not store HWID"
     fi
     cat "$SUB_HWID_FILE"
 }
 
 # Fetch a given URL into a candidate catalog file (does NOT touch stored state).
 # Secrets (URL, HWID) are passed via mode-600 files, never on the command line.
-# Temp files live under $SUB_DIR (same filesystem as $SUB_CATALOG -> atomic mv);
-# stderr goes to a private temp, never a shared /tmp path.
+# Temp files live in the per-command private run directory.
 # Args: <url> <dest-catalog-file>. Returns 0 and writes dest on success.
-# remove any stale temp files from a previously interrupted fetch
-sub_clean_temps() { rm -f "$SUB_DIR"/.url.* "$SUB_DIR"/.err.* "$SUB_DIR"/.cat.* "$SUB_DIR"/.newcat.* 2>/dev/null || true; }
-
 sub_fetch_to() {
     _f_url="$1"; _f_dest="$2"
     mkdir -p "$SUB_DIR" || { err "could not create $SUB_DIR"; return 1; }
     chmod 700 "$SUB_DIR" 2>/dev/null || true
-    sub_clean_temps
-    _f_urlf="$(mktemp "$SUB_DIR/.url.XXXXXX")" || { err "could not create temp file"; return 1; }
-    _f_err="$(mktemp "$SUB_DIR/.err.XXXXXX")"  || { rm -f "$_f_urlf"; err "could not create temp file"; return 1; }
-    _f_cat="$(mktemp "$SUB_DIR/.cat.XXXXXX")"  || { rm -f "$_f_urlf" "$_f_err"; err "could not create temp file"; return 1; }
-    # token-bearing temp files must never survive an interrupt
-    # shellcheck disable=SC2064
-    trap "rm -f '$_f_urlf' '$_f_err' '$_f_cat'" EXIT INT TERM HUP
-    chmod 600 "$_f_urlf"
-    printf '%s' "$_f_url" > "$_f_urlf" || { trap - EXIT INT TERM HUP; rm -f "$_f_urlf" "$_f_err" "$_f_cat"; err "could not stage URL"; return 1; }
-    sub_hwid >/dev/null || { trap - EXIT INT TERM HUP; rm -f "$_f_urlf" "$_f_err" "$_f_cat"; err "could not prepare HWID"; return 1; }
-    # HWID-gated providers (Remnawave) only serve real configs to a recognized
-    # client UA; an honest "proxy-unifi" UA gets the "App not supported"
-    # placeholder. Identify as Happ (on the HWID-only allowlist) -- mksub's
-    # default, so we no longer override it here.
-    if py "$MKSUB" fetch --url-file "$_f_urlf" --hwid-file "$SUB_HWID_FILE" \
+    ensure_run_dir
+    _fetch_dir="$RUN_DIR/subfetch"; rm -rf "$_fetch_dir"; mkdir -m 700 "$_fetch_dir"
+    _f_urlf="$_fetch_dir/url"; _f_err="$_fetch_dir/error"; _f_cat="$_fetch_dir/catalog"
+    printf '%s' "$_f_url" | atomic_write "$_f_urlf" 600 \
+        || { err "could not stage URL"; return 1; }
+    sub_hwid >/dev/null || { err "could not prepare HWID"; return 1; }
+    if py "$MKSUB" fetch --url-file "$_f_urlf" --hwid-file "$SUB_HWID_FILE" --ua "$SUB_USER_AGENT" \
             > "$_f_cat" 2>"$_f_err" && [ -s "$_f_cat" ]; then
         chmod 600 "$_f_cat"
         if mv -f "$_f_cat" "$_f_dest"; then
-            rm -f "$_f_urlf" "$_f_err"
-            trap - EXIT INT TERM HUP
+            rm -rf "$_fetch_dir"
             return 0
         fi
         err "could not write catalog"
     else
         err "$(head -1 "$_f_err" 2>/dev/null | sed 's/^mksub: error: //')"
     fi
-    rm -f "$_f_urlf" "$_f_err" "$_f_cat"
-    trap - EXIT INT TERM HUP
+    rm -rf "$_fetch_dir"
     return 1
 }
 
@@ -1379,21 +2062,22 @@ sub_add() {
     [ -n "${1:-}" ] || fatal "a subscription URL is required"
     case "$1" in https://*) : ;; *) fatal "subscription URL must start with https://" ;; esac
     mkdir -p "$SUB_DIR"; chmod 700 "$SUB_DIR"
+    txn_begin
     c_grn "Fetching subscription..."
     # Fetch to a candidate catalog FIRST; only commit the URL + catalog (and clear
     # any previous selection) once we have a valid non-empty result. A failed add
     # therefore never replaces a working subscription with a broken one.
-    _cand="$(mktemp "$SUB_DIR/.newcat.XXXXXX")" || fatal "could not create temp file"
+    ensure_run_dir; _cand="$RUN_DIR/new-catalog.json"
     if ! sub_fetch_to "$1" "$_cand"; then
         rm -f "$_cand"
         fatal "subscription not added (fetch/parse failed)"
     fi
     # commit URL + catalog only after a valid candidate exists; check every write
-    printf '%s' "$1" > "$SUB_URL_FILE" || { rm -f "$_cand"; fatal "could not store subscription URL"; }
-    chmod 600 "$SUB_URL_FILE"
-    mv -f "$_cand" "$SUB_CATALOG" || { rm -f "$_cand"; fatal "could not store catalog"; }
-    chmod 600 "$SUB_CATALOG"
-    rm -f "$SUB_SELECTED"            # a new subscription invalidates the old selection
+    printf '%s' "$1" | atomic_write "$SUB_URL_FILE" 600 || fatal "could not store subscription URL"
+    atomic_write "$SUB_CATALOG" 600 < "$_cand" || fatal "could not store catalog"
+    rm -f "$SUB_SELECTED" "$SUB_SELECTED_META"
+    enable_refresh_timer || fatal "subscription stored, but automatic refresh timer could not be enabled"
+    txn_commit
     c_grn "Subscription added."
     sub_list
 }
@@ -1408,6 +2092,7 @@ sub_select() {
     [ -n "${1:-}" ] || fatal "a node number is required"
     case "$1" in ""|*[!0-9]*) fatal "select takes a node NUMBER from the subscription list";; esac
     [ -f "$SUB_CATALOG" ] || fatal "no catalog yet (refresh the subscription first)"
+    txn_begin
     _row="$(py "$MKSUB" get --file "$SUB_CATALOG" --index "$1" 2>/dev/null)" \
         || fatal "no node #$1 in the subscription"
     _id="$(printf '%s' "$_row" | cut -f1)"
@@ -1416,51 +2101,94 @@ sub_select() {
     _kind="$(printf '%s' "$_row" | cut -f4)"
     _link="$(printf '%s' "$_row" | cut -f5-)"
     [ "$_ok" = "1" ] || fatal "node #$1 is unsupported${_reason:+ ($_reason)}"
+    [ -z "$_reason" ] || c_ylw "Provider profile warning: $_reason"
+    ensure_run_dir
+    _meta="$RUN_DIR/selection.json"
+    py "$MKSUB" selectmeta --file "$SUB_CATALOG" --index "$1" > "$_meta" 2>/dev/null \
+        || fatal "could not create selection metadata"
     if [ "$_kind" = "pool" ]; then
         # JSON balancer/pool profile: extract its raw JSON and import via the
         # -confdir balancer path (builds + validates + applies, state-safe).
-        _pf="$(mktemp "$ETC_DIR/.subpool.XXXXXX")" || fatal "could not create temp file"
-        # shellcheck disable=SC2064
-        trap "rm -f '$_pf'" EXIT INT TERM HUP
+        _pf="$RUN_DIR/selected-profile.json"
         py "$MKSUB" profile --file "$SUB_CATALOG" --id "$_id" > "$_pf" 2>/dev/null \
-            || { rm -f "$_pf"; trap - EXIT INT TERM HUP; fatal "could not extract the selected profile"; }
-        _FROM_SUB=1 cmd_import_json "$_pf"
-        rm -f "$_pf"; trap - EXIT INT TERM HUP
+            || fatal "could not extract the selected profile"
+        _FROM_SUB=1 _QUIET=1 cmd_import_json "$_pf"
     else
         # single share link: reuse the hardened single-link path. Verify it still
         # resolves to the catalog id first (guards against transport mangling).
         if ! py "$MKSUB" find --file "$SUB_CATALOG" --id "$_id" >/dev/null 2>&1; then
             fatal "selected node could not be confirmed in the catalog; refresh and retry"
         fi
-        _FROM_SUB=1 cmd_import "$_link"
+        _FROM_SUB=1 _QUIET=1 cmd_import "$_link"
     fi
     # record the selection only after a successful import; check the write
     mkdir -p "$SUB_DIR" || fatal "could not record selection"
-    printf '%s' "$_id" > "$SUB_SELECTED" || fatal "could not record selection marker"
-    chmod 600 "$SUB_SELECTED" 2>/dev/null || true
-    c_grn "Selected subscription node #$1 (id $_id)."
+    printf '%s' "$_id" | atomic_write "$SUB_SELECTED" 600 || fatal "could not record selection marker"
+    atomic_write "$SUB_SELECTED_META" 600 < "$_meta" || fatal "could not record selection metadata"
+    txn_commit
+    [ "${_QUIET:-0}" = 1 ] || c_grn "Selected subscription node #$1 (id $_id)."
 }
 
-# Refresh the catalog. The active tunnel is NEVER changed automatically: a node's
-# id is the hash of its canonical config, so if the selected id is still present
-# the config is identical (only the label could differ). If it is gone, the
-# provider changed or removed that node -- we keep the working tunnel and ask the
-# user to re-select, rather than silently activating a different config.
 sub_refresh() {
-    sub_fetch || { err "refresh failed; keeping the current catalog and tunnel"; return 1; }
-    c_grn "Catalog refreshed."
+    [ -s "$SUB_URL_FILE" ] || fatal "no subscription configured"
+    ensure_run_dir; _candidate="$RUN_DIR/refreshed-catalog.json"
+    sub_fetch_to "$(cat "$SUB_URL_FILE")" "$_candidate" \
+        || { err "refresh failed; keeping the current catalog and tunnel"; return 1; }
+    txn_begin
+    atomic_write "$SUB_CATALOG" 600 < "$_candidate" || fatal "could not install refreshed catalog"
+    [ "${_AUTO_REFRESH:-0}" = 1 ] || c_grn "Catalog refreshed."
     _sel="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
-    [ -n "$_sel" ] || { sub_list; return 0; }
-    if py "$MKSUB" find --file "$SUB_CATALOG" --id "$_sel" >/dev/null 2>&1; then
-        info "selected node (id $_sel) is unchanged."
+    if [ -z "$_sel" ] || [ ! -s "$SUB_SELECTED_META" ]; then
+        txn_commit
+        [ "${_AUTO_REFRESH:-0}" = 1 ] || sub_list
+        return 0
+    fi
+    _match="$(py "$MKSUB" match --file "$SUB_CATALOG" --selection-file "$SUB_SELECTED_META" 2>/dev/null || true)"
+    if [ -n "$_match" ]; then
+        _new_index="$(printf '%s' "$_match" | cut -f1)"
+        _new_id="$(printf '%s' "$_match" | cut -f2)"
+        if [ "$_new_id" = "$_sel" ]; then
+            _new_meta="$RUN_DIR/refreshed-selection.json"
+            py "$MKSUB" selectmeta --file "$SUB_CATALOG" --index "$_new_index" > "$_new_meta" \
+                || fatal "could not refresh selection metadata"
+            atomic_write "$SUB_SELECTED_META" 600 < "$_new_meta" \
+                || fatal "could not store refreshed selection metadata"
+            txn_commit
+            [ "${_AUTO_REFRESH:-0}" = 1 ] || info "selected node is unchanged."
+        else
+            _QUIET=1 sub_select "$_new_index"
+            info "selected node changed; validated and applied refreshed provider configuration."
+        fi
     else
-        c_ylw "Selected node (id $_sel) changed or was removed by the provider."
-        c_ylw "The active tunnel is unchanged. Re-open the subscription menu and re-select to apply."
+        txn_commit
+        c_ylw "Selected node was removed or refresh matching was ambiguous; active tunnel kept unchanged."
     fi
 }
 
+sub_set_interval() {
+    _uint "$1" && [ "$1" -ge 1 ] && [ "$1" -le 8760 ] \
+        || fatal "refresh interval must be 1-8760 hours"
+    txn_begin
+    SUB_REFRESH_HOURS="$1"; save_settings
+    enable_refresh_timer || fatal "could not update refresh timer"
+    txn_commit
+    c_grn "Automatic refresh interval set to ${SUB_REFRESH_HOURS}h."
+}
+
+sub_set_user_agent() {
+    case "$1" in ""|*\"*|*\\*|*[![:print:]]*) fatal "User-Agent contains unsafe characters" ;; esac
+    [ "${#1}" -le 120 ] || fatal "User-Agent is too long"
+    txn_begin
+    SUB_USER_AGENT="$1"; save_settings
+    txn_commit
+    c_grn "Subscription User-Agent updated. Refresh to test provider compatibility."
+}
+
 sub_remove() {
-    rm -f "$SUB_URL_FILE" "$SUB_CATALOG" "$SUB_SELECTED"
+    txn_begin
+    disable_refresh_timer
+    rm -f "$SUB_URL_FILE" "$SUB_CATALOG" "$SUB_SELECTED" "$SUB_SELECTED_META"
+    txn_commit
     c_ylw "Subscription removed (HWID kept). The active tunnel is unchanged."
     info "To also stop proxying, use the menu (Stop) or import a different link."
 }
@@ -1483,15 +2211,24 @@ PYEOF
     _sel="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
     echo "selected:     ${_sel:-(none)}"
     echo "hwid:         $([ -s "$SUB_HWID_FILE" ] && echo set || echo unset)"
+    echo "auto refresh: every ${SUB_REFRESH_HOURS}h"
+    echo "user-agent:   $SUB_USER_AGENT"
 }
 
 
 cmd_uninstall() {
     need_root
+    disable_refresh_timer
     systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
+    _i=0
+    while systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && [ "$_i" -lt 20 ]; do
+        sleep 0.25 2>/dev/null || sleep 1; _i=$((_i + 1))
+    done
+    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null \
+        && fatal "service is still running; refusing to remove its unit"
     systemctl disable --now "$PLUGIN_SERVICE_NAME" 2>/dev/null || true
     fw_unlock                       # drop the sing-box external-exposure rule, if any
-    rm -f "$SERVICE_FILE" "$PLUGIN_SERVICE_FILE" "$ONBOOT_DST"
+    rm -f "$SERVICE_FILE" "$PLUGIN_SERVICE_FILE" "$REFRESH_SERVICE_FILE" "$REFRESH_TIMER_FILE" "$ONBOOT_DST"
     remove_proxy_link
     systemctl daemon-reload 2>/dev/null || true
     c_ylw "Removed service + boot hook. Data kept at $ROOT (delete it manually to purge keys/config)."
@@ -1511,7 +2248,10 @@ Direct commands (quick ops / scripting):
   proxy stop         Stop the service
   proxy restart      Restart the service
   proxy status       Show engine / server / listener status
+  proxy ping [mode]  Test via get|head|tcp|icmp (default from settings)
   proxy logs [args]  Tail service logs (passes args to journalctl)
+  proxy update       Update cores/assets with runtime rollback
+  proxy geo-update   Update geo files with checksum + rollback
   proxy help         This help
 
 Everything else lives in the menu (run 'proxy').
@@ -1522,24 +2262,33 @@ EOF
 # --------------------------------------------------------------------------
 # Dispatch
 # --------------------------------------------------------------------------
-load_settings
 cmd="${1:-}"; [ $# -ge 1 ] && shift || true
+case "$cmd" in
+    ""|status|logs|ping|-h|--help|help|_fw-lock|_fw-unlock) : ;;
+    *) need_root; acquire_lock; recover_transaction ;;
+esac
+load_settings
 case "$cmd" in
     # interactive menu (default) — the menu is the full interface for everything:
     # import, subscriptions, keys, port/MTU/DNS, ping, autostart, update, uninstall.
-    "")           need_root; cmd_menu ;;
+    "")           cmd_menu ;;
     # kept direct commands (quick ops / scripting)
-    start)        need_root; cmd_start ;;
-    stop)         need_root; cmd_stop ;;
-    restart)      need_root; cmd_restart ;;
+    start)        cmd_start ;;
+    stop)         cmd_stop ;;
+    restart)      cmd_restart ;;
     status)       cmd_status ;;
     logs)         cmd_logs logs "$@" ;;
+    ping)         cmd_ping "${1:-}" ;;
+    update)       cmd_update ;;
+    geo-update)   cmd_geo_update ;;
     -h|--help|help) usage ;;
     # internal hooks (used only by install.sh, the boot hook, and the systemd
     # unit's ExecStartPre/ExecStopPost; not user-facing). The _fw-* hooks are
     # best-effort and always succeed so they can never block service start/stop.
-    install-binary)  need_root; cmd_install_binary ;;
-    install-service) need_root; install_service ;;
+    install-binary)  cmd_install_binary ;;
+    install-service) install_service ;;
+    boot-recover)    boot_recover ;;
+    sub-refresh-auto) _AUTO_REFRESH=1 sub_refresh ;;
     _fw-lock)        fw_lock ;;
     _fw-unlock)      fw_unlock ;;
     *) err "unknown command: $cmd"; echo; usage; exit 1 ;;

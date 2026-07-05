@@ -19,11 +19,152 @@ mksingbox.py. Stdlib only (Python 3.7+) so it runs on the gateway as shipped.
 import argparse
 import ipaddress
 import json
+import re
 import sys
 from urllib.parse import urlsplit, unquote
 
 from proxylib import (die, b64decode_any, flat_query, qg, safe_urlsplit,
-                      host_port, safe_port, valid_host, apply_input_file)
+                      host_port, safe_port, valid_host, apply_input_file,
+                      reject_unknown_query)
+
+
+_COMMON_QUERY = {
+    "type", "net", "security", "sni", "peer", "host", "fp", "fingerprint",
+    "alpn", "allowInsecure", "insecure", "ech", "pcs", "vcn", "pqv",
+    "pbk", "publicKey", "sid", "shortId", "spx", "spiderX", "headerType",
+    "path", "serviceName", "mode", "authority", "extra", "fm", "seed",
+    "mtu", "tti", "user_agent", "idle_timeout", "health_check_timeout",
+    "permit_without_stream", "initial_windows_size",
+    "ed", "eh", "packetEncoding",
+}
+_LOCAL_FIELD = {"certificateFile", "keyFile", "masterKeyLog", "socketPath",
+                "unixSocket", "unixSocketPath"}
+_PATHLIKE_KEY = re.compile(
+    r"(?:File|FilePath|SocketPath|KeyLog)$|(?:^|_)(?:file|file_path|socket_path|key_log)$")
+
+
+def _q_int(q, name, minimum=0, maximum=2147483647):
+    value = qg(q, name)
+    if value == "":
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        die("share-link option '%s' must be an integer" % name)
+    if parsed < minimum or parsed > maximum:
+        die("share-link option '%s' is out of range" % name)
+    return parsed
+
+
+def _q_bool(q, name):
+    value = qg(q, name)
+    if value == "":
+        return None
+    low = value.lower()
+    if low in ("1", "true", "yes"):
+        return True
+    if low in ("0", "false", "no"):
+        return False
+    die("share-link option '%s' must be true/false or 1/0" % name)
+
+
+def _is_non_public(host):
+    try:
+        return not ipaddress.ip_address(host.split("%", 1)[0]).is_global
+    except ValueError:
+        low = host.rstrip(".").lower()
+        return low == "localhost" or low.endswith(
+            (".localhost", ".local", ".internal", ".lan", ".home.arpa"))
+
+
+def _validate_json_option(value, path, depth=0):
+    if depth > 32:
+        die("share-link option '%s' is nested too deeply" % path)
+    if isinstance(value, dict):
+        if path.endswith(".downloadSettings"):
+            address = value.get("address")
+            if address not in (None, ""):
+                host = valid_host(str(address))
+                if _is_non_public(host):
+                    die("XHTTP downloadSettings targets a non-public address")
+            if value.get("port") not in (None, "", 0, "0"):
+                safe_port(value["port"])
+        for key, child in value.items():
+            if not isinstance(key, str):
+                die("share-link JSON option contains a non-string key")
+            if (key in _LOCAL_FIELD or _PATHLIKE_KEY.search(key)) \
+                    and child not in (None, "", []):
+                die("share-link JSON option contains an unsafe local path field")
+            if key in ("unixSettings", "dsSettings") and child not in (None, "", {}):
+                die("share-link JSON option requests a Unix-domain socket")
+            _validate_json_option(child, "%s.%s" % (path, key), depth + 1)
+    elif isinstance(value, list):
+        if len(value) > 256:
+            die("share-link JSON option contains an oversized array")
+        for index, child in enumerate(value):
+            _validate_json_option(child, "%s[%d]" % (path, index), depth + 1)
+
+
+def _q_json(q, name):
+    value = qg(q, name)
+    if value == "":
+        return None
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        die("share-link option '%s' is not valid JSON" % name)
+    if not isinstance(parsed, dict):
+        die("share-link option '%s' must contain a JSON object" % name)
+    _validate_json_option(parsed, name)
+    return parsed
+
+
+def _validate_option_relevance(q, security, net):
+    """Reject understood fields when they do not apply to this security layer or
+    transport. Accepting and then dropping them would make the generated config
+    differ silently from the provider's link."""
+    tls_only = {"alpn", "allowInsecure", "insecure", "ech", "pcs", "vcn"}
+    reality_only = {"pbk", "publicKey", "sid", "shortId", "spx", "spiderX", "pqv"}
+    shared_security = {"sni", "peer", "fp", "fingerprint"}
+    if security == "tls":
+        allowed_security = shared_security | tls_only
+    elif security == "reality":
+        allowed_security = shared_security | reality_only
+    else:
+        allowed_security = set()
+    for name in shared_security | tls_only | reality_only:
+        if q.get(name, "") != "" and name not in allowed_security:
+            die("share-link option '%s' does not apply to security '%s'"
+                % (name, security or "none"))
+
+    transport_fields = {
+        "headerType", "host", "path", "serviceName", "mode", "authority",
+        "extra", "seed", "mtu", "tti", "user_agent", "idle_timeout",
+        "health_check_timeout", "permit_without_stream", "initial_windows_size",
+        "ed", "eh",
+    }
+    allowed_by_transport = {
+        "tcp": {"headerType"},
+        "ws": {"host", "path", "ed", "eh"},
+        "httpupgrade": {"host", "path", "ed", "eh"},
+        "grpc": {"path", "serviceName", "mode", "authority", "user_agent",
+                 "idle_timeout", "health_check_timeout", "permit_without_stream",
+                 "initial_windows_size"},
+        "xhttp": {"host", "path", "mode", "extra"},
+        "splithttp": {"host", "path", "mode", "extra"},
+        "kcp": {"headerType", "seed", "mtu", "tti"},
+    }
+    allowed_transport = allowed_by_transport.get(net, set())
+    if net == "tcp" and qg(q, "headerType", default="none") == "http":
+        allowed_transport = allowed_transport | {"host", "path"}
+    for name in transport_fields:
+        value = q.get(name, "")
+        # Serializers commonly emit headerType=none for transports that do not
+        # use packet headers. It is an explicit no-op, not a discarded behavior.
+        if name == "headerType" and value == "none":
+            continue
+        if value != "" and name not in allowed_transport:
+            die("share-link option '%s' does not apply to transport '%s'" % (name, net))
 
 
 def build_stream(q, security, net, host):
@@ -38,37 +179,45 @@ def build_stream(q, security, net, host):
         die("legacy HTTP/2 (h2) transport was removed by Xray; not supported")
     if net == "quic":
         die("QUIC transport was removed by Xray; not supported")
+    _validate_option_relevance(q, security, net)
     stream = {"network": net, "security": security}
 
     # ---- security layer -------------------------------------------------
-    sni = qg(q, "sni", "peer", "host") or host
+    sni = qg(q, "sni", "peer") or host
     fp = qg(q, "fp", "fingerprint")
     alpn = qg(q, "alpn")
-    if qg(q, "allowInsecure", "insecure") in ("1", "true", "True"):
-        die("'allowInsecure' was removed by Xray and cannot be honored; "
-            "this link is not supported (it asks to skip certificate verification)")
-    # Security-relevant TLS/REALITY fields we don't map: reject rather than silently
-    # drop, so the link's intended security isn't quietly weakened.
-    for _fld, _desc in (("ech", "ECH"), ("pcs", "post-quantum cert signature"),
-                        ("pqv", "REALITY post-quantum verify")):
-        if qg(q, _fld):
-            die("share-link option '%s' (%s) is not supported by this build" % (_fld, _desc))
-
+    insecure = qg(q, "allowInsecure", "insecure")
+    if insecure:
+        lowered = insecure.lower()
+        if lowered in ("1", "true", "yes"):
+            die("'allowInsecure' was removed by Xray and cannot be honored; "
+                "this link is not supported (it asks to skip certificate verification)")
+        if lowered not in ("0", "false", "no"):
+            die("allowInsecure must be true/false or 1/0")
     if security == "tls":
         tls = {"serverName": sni}
         if fp:
             tls["fingerprint"] = fp
         if alpn:
             tls["alpn"] = [a for a in alpn.split(",") if a]
+        if qg(q, "ech"):
+            tls["echConfigList"] = qg(q, "ech")
+        if qg(q, "pcs"):
+            tls["pinnedPeerCertSha256"] = qg(q, "pcs")
+        if qg(q, "vcn"):
+            tls["verifyPeerCertByName"] = qg(q, "vcn")
         stream["tlsSettings"] = tls
     elif security == "reality":
-        stream["realitySettings"] = {
+        reality = {
             "serverName": sni,
             "fingerprint": fp or "chrome",
             "publicKey": qg(q, "pbk", "publicKey"),
             "shortId": qg(q, "sid", "shortId"),
             "spiderX": qg(q, "spx", "spiderX", default="/"),
         }
+        if qg(q, "pqv"):
+            reality["mldsa65Verify"] = qg(q, "pqv")
+        stream["realitySettings"] = reality
     elif security in ("", "none"):
         stream["security"] = "none"
     else:
@@ -80,6 +229,8 @@ def build_stream(q, security, net, host):
     path = qg(q, "path", default="/")
 
     if net == "tcp":
+        if header_type not in ("none", "http"):
+            die("unsupported TCP headerType '%s'" % header_type)
         if header_type == "http":
             req_host = [h for h in host_hdr.split(",") if h] or [host]
             stream["tcpSettings"] = {
@@ -92,17 +243,46 @@ def build_stream(q, security, net, host):
         ws = {"path": path or "/"}
         if host_hdr:
             ws["headers"] = {"Host": host_hdr}
+        early = _q_int(q, "ed", 0, 1048576)
+        if early is not None:
+            ws["maxEarlyData"] = early
+        if qg(q, "eh"):
+            ws["earlyDataHeaderName"] = qg(q, "eh")
         stream["wsSettings"] = ws
     elif net == "httpupgrade":
         hu = {"path": path or "/"}
         if host_hdr:
             hu["host"] = host_hdr
+        early = _q_int(q, "ed", 0, 1048576)
+        if early is not None:
+            hu["maxEarlyData"] = early
+        if qg(q, "eh"):
+            hu["earlyDataHeaderName"] = qg(q, "eh")
         stream["httpupgradeSettings"] = hu
     elif net == "grpc":
         grpc = {"serviceName": qg(q, "serviceName", "path", default="")}
         mode = qg(q, "mode")
-        if mode in ("multi", "gun"):
+        if mode not in ("", "gun", "multi"):
+            die("gRPC mode '%s' is not supported by the installed Xray config format" % mode)
+        if mode:
             grpc["multiMode"] = mode == "multi"
+        if "authority" in q:
+            grpc["authority"] = q["authority"]
+        for qname, cname, maximum in (("user_agent", "user_agent", None),
+                                     ("idle_timeout", "idle_timeout", 86400),
+                                     ("health_check_timeout", "health_check_timeout", 86400),
+                                     ("initial_windows_size", "initial_windows_size", 16777216)):
+            if qname in q and q[qname] != "":
+                if qname == "user_agent":
+                    if len(q[qname]) > 512 or any(ord(ch) < 0x20 or ord(ch) == 0x7f
+                                                  for ch in q[qname]):
+                        die("gRPC user_agent is too long or contains control characters")
+                    grpc[cname] = q[qname]
+                else:
+                    grpc[cname] = _q_int(q, qname, 0, maximum)
+        permit = _q_bool(q, "permit_without_stream")
+        if permit is not None:
+            grpc["permit_without_stream"] = permit
         stream["grpcSettings"] = grpc
     elif net in ("xhttp", "splithttp"):
         stream["network"] = "xhttp"
@@ -112,6 +292,9 @@ def build_stream(q, security, net, host):
         mode = qg(q, "mode")
         if mode:
             xh["mode"] = mode
+        extra = _q_json(q, "extra")
+        if extra is not None:
+            xh["extra"] = extra
         stream["xhttpSettings"] = xh
     elif net == "kcp":
         # mKCP is still supported, but its header/seed options were removed by Xray.
@@ -119,10 +302,20 @@ def build_stream(q, security, net, host):
             die("mKCP 'seed' was removed by Xray; this link is not supported")
         if header_type not in ("", "none"):
             die("mKCP header obfuscation was removed by Xray; this link is not supported")
-        stream["kcpSettings"] = {}
+        kcp = {}
+        mtu = _q_int(q, "mtu", 576, 65535)
+        tti = _q_int(q, "tti", 1, 1000)
+        if mtu is not None:
+            kcp["mtu"] = mtu
+        if tti is not None:
+            kcp["tti"] = tti
+        stream["kcpSettings"] = kcp
     else:
         die("unsupported transport type '%s'" % net)
 
+    finalmask = _q_json(q, "fm")
+    if finalmask is not None:
+        stream["finalmask"] = finalmask
     return stream
 
 
@@ -136,6 +329,7 @@ def parse_vless(link):
         die("vless link is missing the server host/port")
     host = valid_host(host); port = safe_port(port)
     q = flat_query(u)
+    reject_unknown_query(q, _COMMON_QUERY | {"encryption", "flow"})
 
     user = {"id": uuid, "encryption": qg(q, "encryption", default="none") or "none"}
     flow = qg(q, "flow")
@@ -146,10 +340,16 @@ def parse_vless(link):
     security = qg(q, "security", default="none") or "none"
     stream = build_stream(q, security, net, host)
 
+    settings = {"vnext": [{"address": host, "port": port, "users": [user]}]}
+    packet_encoding = qg(q, "packetEncoding")
+    if packet_encoding:
+        if packet_encoding not in ("none", "packet", "xudp"):
+            die("unsupported packetEncoding '%s'" % packet_encoding)
+        settings["packetEncoding"] = packet_encoding
     outbound = {
         "tag": "proxy",
         "protocol": "vless",
-        "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
+        "settings": settings,
         "streamSettings": stream,
     }
     return outbound, host, port
@@ -165,6 +365,9 @@ def parse_trojan(link):
         die("trojan link is missing the server host/port")
     host = valid_host(host); port = safe_port(port)
     q = flat_query(u)
+    reject_unknown_query(q, _COMMON_QUERY | {"flow"})
+    if qg(q, "flow"):
+        die("Trojan 'flow' was removed by Xray and cannot be honored")
 
     net = qg(q, "type", "net", default="tcp") or "tcp"
     security = qg(q, "security", default="tls") or "tls"   # trojan implies TLS
@@ -214,7 +417,9 @@ def _ss_creds(link):
 
 def ss_plugin_name(link):
     """Return the SIP003 plugin name for an ss:// link, or None if it has no plugin."""
-    raw = qg(flat_query(urlsplit(link)), "plugin")
+    query = flat_query(urlsplit(link))
+    reject_unknown_query(query, {"plugin"})
+    raw = qg(query, "plugin")
     if not raw:
         return None
     raw = unquote(raw)
@@ -242,10 +447,16 @@ def _vmess_outbound(host, port, uid, aid, scy, security, net, q):
         die("vmess link is missing the UUID")
     stream = build_stream(q, security, net, host)
     user = {"id": uid, "alterId": aid, "security": scy or "auto"}
+    settings = {"vnext": [{"address": host, "port": port, "users": [user]}]}
+    packet_encoding = qg(q, "packetEncoding")
+    if packet_encoding:
+        if packet_encoding not in ("none", "packet", "xudp"):
+            die("unsupported packetEncoding '%s'" % packet_encoding)
+        settings["packetEncoding"] = packet_encoding
     outbound = {
         "tag": "proxy",
         "protocol": "vmess",
-        "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
+        "settings": settings,
         "streamSettings": stream,
     }
     return outbound, host, port
@@ -262,6 +473,7 @@ def parse_vmess(link):
         if not host or not port:
             die("vmess link is missing the server host/port")
         q = flat_query(u)
+        reject_unknown_query(q, _COMMON_QUERY | {"aid", "scy", "encryption", "flow"})
         net = qg(q, "type", "net", default="tcp") or "tcp"
         security = qg(q, "security", default="none") or "none"
         try:
@@ -303,7 +515,8 @@ def parse_vmess(link):
             q[dst] = str(v[src])
     if v.get("path") not in (None, ""):
         q["path"] = str(v["path"])
-        q["serviceName"] = str(v["path"])   # grpc carries serviceName in "path"
+        if net == "grpc":
+            q["serviceName"] = str(v["path"])   # grpc carries serviceName in "path"
     try:
         aid = int(v.get("aid", 0) or 0)
     except (TypeError, ValueError):
@@ -413,6 +626,9 @@ def main():
     ap.add_argument("--input-file", default="",
                     help="JSON file with secret inputs (link/secret_key/peer_pubkey) so they "
                          "are not exposed in argv; values here override the matching flags")
+    ap.add_argument("--link-file", default="", help="read the proxy link from a file")
+    ap.add_argument("--secret-key-file", default="", help="read the WireGuard private key from a file")
+    ap.add_argument("--peer-pubkey-file", default="", help="read the peer public key from a file")
     args = ap.parse_args()
 
     # Secret inputs (proxy link + WireGuard private key) are read from a mode-600

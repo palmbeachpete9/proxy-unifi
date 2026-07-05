@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-mksub.py - subscription fetch/parse helper for proxy-unifi (MVP).
+mksub.py - subscription fetch/parse helper for proxy-unifi.
 
-Scope: Base64 or plain newline-separated share-link subscriptions only
-(Remnawave / 3x-ui style fallback format). Balancer/JSON-pool profiles are NOT
-handled here. The shell CLI ('proxy sub ...') drives this; node validation and
-activation reuse the existing single-link import path.
+Scope: Base64/plain newline-separated share links plus raw Xray JSON profile
+objects/arrays (including balancer pools). The shell CLI drives fetching,
+selection, scheduled refresh, and activation through the hardened link/profile
+import paths.
 
 Security: HTTPS-only, SSRF guard that pins the connection to a validated public
 IP (defeating DNS-rebinding), capped response size / node count / redirects /
@@ -26,10 +26,14 @@ Stdlib only (Python 3.7+).
 import argparse
 import base64
 import hashlib
+import ipaddress
 import json
 import os
+import re
 import sys
-from urllib.parse import urlsplit, unquote
+import unicodedata
+from urllib.parse import urlsplit, unquote, parse_qsl, urlencode, urlunsplit
+from proxylib import xray_outbound_servers
 # Network-only modules (ssl, http.client, socket, ipaddress, time, urljoin) are
 # imported lazily inside fetch_url()/_https_get()/_public_ips(); the hot local
 # subcommands (render/get/find, used on every menu render) never touch the
@@ -46,6 +50,9 @@ TIMEOUT = 15               # per-operation socket timeout (seconds)
 DEADLINE = 30              # overall wall-clock budget for a fetch (seconds)
 LABEL_MAX = 36             # display code points
 FIELD_MAX = 80             # generic display field cap
+MAX_PROFILE = 200000       # serialized bytes/chars per JSON profile
+MAX_JSON_DEPTH = 64
+MAX_EXPANSION_RATIO = 500
 
 SUPPORTED = ("vless", "vmess", "trojan", "ss", "hysteria2", "hy2", "tuic")
 SINGBOX_PLUGINS = ("obfs-local", "simple-obfs", "v2ray-plugin")
@@ -84,37 +91,65 @@ def _b64(text):
     return None
 
 
-def _is_emoji(o):
-    """True for emoji / pictographic symbol code points we discard from labels."""
-    return (0x1F000 <= o <= 0x1FAFF or       # emoji & pictographs (incl. flags)
-            0x2600 <= o <= 0x27BF or          # misc symbols + dingbats
-            0x2190 <= o <= 0x21FF or          # arrows
-            0x2B00 <= o <= 0x2BFF or          # misc symbols & arrows
-            0xFE00 <= o <= 0xFE0F or          # variation selectors
-            o in (0x20E3, 0x2122, 0x2139, 0x303D, 0x3030))
+def _repair_mojibake(value):
+    """Repair only high-confidence UTF-8-as-Latin-1 corruption.
+
+    Legitimate Latin-1 text must survive. We therefore try the reversal only
+    when common mojibake markers are present and the result contains a strong
+    signal (emoji/non-Latin text) while removing those markers.
+    """
+    if not any(x in value for x in ("Ã", "Â", "ð", "â€", "Ð", "Ñ")):
+        return value
+    markers = ("Ã", "Â", "ð", "â", "Ð", "Ñ")
+    def repair_part(part):
+        if not any(x in part for x in markers):
+            return part
+        try:
+            candidate = part.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return part
+        old_markers = sum(part.count(x) for x in markers)
+        new_markers = sum(candidate.count(x) for x in markers)
+        strong = any(ord(ch) > 0x2FF for ch in candidate)
+        return candidate if strong and new_markers < old_markers else part
+    repaired = repair_part(value)
+    if repaired != value:
+        return repaired
+    return re.sub(r"[\x00-\xff]+", lambda match: repair_part(match.group(0)), value)
+
+
+def _display_width(ch):
+    if unicodedata.combining(ch):
+        return 0
+    o = ord(ch)
+    if 0x1F000 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF:
+        return 2
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
 def clean(s, maxlen=FIELD_MAX):
-    """Make any provider-controlled string safe to print in a terminal, reducing
-    it to plain text. Discards: control/bidi/zero-width chars; the whole Latin-1
-    supplement (0x80-0xFF) -- on minimal/locale-broken gateways a flag emoji
-    routinely arrives UTF-8-as-Latin-1-mangled into this range ('ð©ðª') and is
-    not always recoverable, so we drop it rather than show garbage; and emoji /
-    pictographs. Keeps real text (ASCII, Cyrillic, Greek, CJK, Latin-Extended,
-    ...), collapses whitespace, caps length."""
+    """Return terminal-safe Unicode while preserving letters and emoji."""
     if not s:
         return ""
+    value = unicodedata.normalize("NFC", _repair_mojibake(str(s)))
+    value = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", value)
+    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
     out = []
-    for ch in str(s):
+    for ch in value:
         o = ord(ch)
-        if o in _BAD or 0x80 <= o <= 0xFF or _is_emoji(o):
+        if o in _BAD or unicodedata.category(ch) == "Cc":
             continue
         out.append(" " if ch in ("\t", "\n", "\r") else ch)
-    # collapse runs of whitespace left where emoji/mojibake were removed, and trim
     r = " ".join("".join(out).split())
-    if len(r) > maxlen:
-        r = r[:maxlen].rstrip() + "…"
-    return r
+    rendered = []
+    width = 0
+    for ch in r:
+        w = _display_width(ch)
+        if width + w > maxlen:
+            return "".join(rendered).rstrip() + "…"
+        rendered.append(ch)
+        width += w
+    return "".join(rendered)
 
 
 # ---- per-protocol shallow extraction --------------------------------------
@@ -125,29 +160,53 @@ def _host_port(u):
         return None, None
 
 
-def _server_of(link, scheme):
+def _destination_of(link, scheme):
+    """Return (host, display-server) for URI and legacy encoded forms."""
     if scheme == "vmess" and "@" not in link[len("vmess://"):].split("#", 1)[0]:
         # legacy base64(JSON) form
         dec = _b64(link[len("vmess://"):].split("#", 1)[0])
         if not dec:
-            return ""
+            return "", ""
         try:
             v = json.loads(dec)
         except Exception:
-            return ""
+            return "", ""
         if not isinstance(v, dict):
-            return ""
+            return "", ""
         h, p = str(v.get("add", "")), v.get("port", "")
-        return "%s:%s" % (h, p) if h else ""
+        return h, ("%s:%s" % (h, p) if h else "")
+    if scheme == "ss":
+        try:
+            u = urlsplit(link)
+            h, p = _host_port(u)
+        except ValueError:
+            return "", ""
+        if h and p and u.username is not None:
+            return h, "%s:%s" % (h, p)
+        dec = _b64(u.netloc)
+        if dec and "@" in dec:
+            hostport = dec.rsplit("@", 1)[1]
+            if hostport.startswith("[") and "]:" in hostport:
+                h, p = hostport[1:].rsplit("]:", 1)
+            elif ":" in hostport:
+                h, p = hostport.rsplit(":", 1)
+            else:
+                return "", ""
+            return h, "%s:%s" % (h, p)
+        return "", ""
     # URI form (vless/vmess-AEAD/trojan/ss/hysteria2/tuic)
     try:
         u = urlsplit(link)
         h, p = _host_port(u)
     except ValueError:
-        return ""
+        return "", ""
     if not h:
-        return ""
-    return "%s:%s" % (h, p) if p else h
+        return "", ""
+    return h, ("%s:%s" % (h, p) if p else h)
+
+
+def _server_of(link, scheme):
+    return _destination_of(link, scheme)[1]
 
 
 def _label_of(link, scheme):
@@ -167,6 +226,44 @@ def _label_of(link, scheme):
     except ValueError:
         return ""
     return unquote(frag) if frag else ""
+
+
+def _canonical_link(link):
+    """Canonical identity form, excluding display-only fragment."""
+    try:
+        u = urlsplit(link)
+        pairs = parse_qsl(u.query, keep_blank_values=True)
+        # Duplicate parameters are ambiguous and the generator rejects them.
+        keys = [k for k, _ in pairs]
+        if len(keys) != len(set(keys)):
+            return link.split("#", 1)[0]
+        query = urlencode(sorted(pairs), doseq=True)
+        host = (u.hostname or "").lower()
+        if ":" in host and not host.startswith("["):
+            host = "[" + host + "]"
+        userinfo = ""
+        if u.username is not None:
+            userinfo = u.username
+            if u.password is not None:
+                userinfo += ":" + u.password
+            userinfo += "@"
+        netloc = userinfo + host
+        if u.port is not None:
+            netloc += ":%d" % u.port
+        return urlunsplit((u.scheme.lower(), netloc, u.path, query, ""))
+    except (TypeError, ValueError):
+        return link.split("#", 1)[0]
+
+
+def _non_public_literal(host):
+    """True only when host is an IP literal that is not globally routable."""
+    if not host:
+        return False
+    try:
+        return not ipaddress.ip_address(host.split("%", 1)[0]).is_global
+    except ValueError:
+        low = host.rstrip(".").lower()
+        return low == "localhost" or low.endswith((".localhost", ".local"))
 
 
 def _ss_engine(link):
@@ -200,7 +297,7 @@ def node_from_link(link):
     # shell later activates (shell command-substitution silently drops NUL).
     if any(ord(c) < 0x20 or ord(c) == 0x7f for c in link):
         return None
-    if len(link) > MAX_LINK:
+    if len(link.encode("utf-8", "replace")) > MAX_LINK:
         return None
     scheme = link.split("://", 1)[0].lower()
     if scheme not in SUPPORTED:
@@ -212,7 +309,7 @@ def node_from_link(link):
             "recognized": True, "engine": "", "reason": ""}
     try:
         node["label"] = _label_of(link, scheme)
-        node["server"] = _server_of(link, scheme)
+        destination, node["server"] = _destination_of(link, scheme)
         if scheme in ("hysteria2", "hy2", "tuic"):
             node["engine"] = "singbox"
         elif scheme == "ss":
@@ -229,14 +326,15 @@ def node_from_link(link):
         # providers return a 0.0.0.0 placeholder ("App not supported" /
         # "Limit of devices reached") to unauthorized clients -- flag it clearly
         # instead of offering a dead node.
-        if node["recognized"] and node["server"].split(":", 1)[0] in ("0.0.0.0", "127.0.0.1"):
+        if node["recognized"] and _non_public_literal(destination):
             node["recognized"] = False
-            node["reason"] = "provider placeholder (%s)" % (clean(node["label"], 40) or "not authorized")
+            node["reason"] = "non-public provider destination (%s)" % (
+                clean(node["label"], 40) or destination or "not authorized")
     except Exception:
         node["recognized"] = False
         node["reason"] = "unparseable node"
     # stable id: full sha256 of the canonical link (without display fragment)
-    canonical = link.split("#", 1)[0]
+    canonical = _canonical_link(link)
     node["id"] = hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()
     return node
 
@@ -271,10 +369,16 @@ def _process_json(text, headers):
             break
         if not isinstance(prof, dict):
             continue
-        raw_json = json.dumps(prof, ensure_ascii=False, separators=(",", ":"))
-        if len(raw_json) > 200000:        # cap a single profile (sanity)
+        if _json_depth(prof) > MAX_JSON_DEPTH:
             continue
-        nid = hashlib.sha256(raw_json.encode("utf-8", "replace")).hexdigest()
+        raw_json = json.dumps(prof, ensure_ascii=False, separators=(",", ":"))
+        if len(raw_json) > MAX_PROFILE:
+            continue
+        identity = dict(prof)
+        identity.pop("remarks", None)
+        canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":"))
+        nid = hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()
         if nid in seen:
             continue
         seen.add(nid)
@@ -300,6 +404,16 @@ def _process_json(text, headers):
     return {"schema": SCHEMA_VERSION, "meta": meta, "nodes": nodes}
 
 
+def _json_depth(value, depth=0):
+    if depth > MAX_JSON_DEPTH:
+        return depth
+    if isinstance(value, dict):
+        return max([depth] + [_json_depth(v, depth + 1) for v in value.values()])
+    if isinstance(value, list):
+        return max([depth] + [_json_depth(v, depth + 1) for v in value])
+    return depth
+
+
 def _classify_profile(prof):
     """(recognized, reason, members, strategy, servers) for an Xray JSON profile.
     A profile is unrecognized if it has no outbounds, or its only proxy server is
@@ -308,38 +422,59 @@ def _classify_profile(prof):
     outs = prof.get("outbounds")
     if not isinstance(outs, list) or not outs:
         return False, "no outbounds", 0, "", []
+    if len(outs) > 256:
+        return False, "too many outbounds", 0, "", []
     servers = []
     for o in outs:
         if not isinstance(o, dict):
             continue
-        vn = o.get("settings", {}).get("vnext") if isinstance(o.get("settings"), dict) else None
-        if isinstance(vn, list):
-            for v in vn:
-                if isinstance(v, dict) and v.get("address"):
-                    servers.append(str(v["address"]))
-        elif o.get("server"):
-            servers.append(str(o["server"]))
-    real = [s for s in servers if s not in ("0.0.0.0", "127.0.0.1", "", "1")]
+        servers.extend(host for host, _port in xray_outbound_servers(o))
+    real = []
+    for server in servers:
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in server):
+            return False, "server contains control characters", 0, "", servers
+        if _non_public_literal(server):
+            return False, "non-public/placeholder provider destinations", 0, "", servers
+        real.append(server)
     if not real:
-        return False, "provider placeholder (app not authorized)", 0, "", servers
+        reason = "non-public/placeholder provider destinations" if servers else "no supported proxy servers"
+        return False, reason, 0, "", servers
     # source/user routing can't be reproduced by a WireGuard inbound
     routing = prof.get("routing", {})
     rules = routing.get("rules", []) if isinstance(routing, dict) else []
+    if not isinstance(rules, list):
+        return False, "routing.rules must be an array", 0, "", servers
     for r in rules:
         if isinstance(r, dict) and (r.get("user") or r.get("source") or r.get("sourcePort")):
             return False, "routing needs source/user identity", 0, "", servers
     bals = routing.get("balancers") if isinstance(routing, dict) else None
-    members, strat = 0, ""
-    if isinstance(bals, list) and bals and isinstance(bals[0], dict):
-        sels = bals[0].get("selector") or []
-        tags = [str(o.get("tag", "")) for o in outs if isinstance(o, dict)]
-        members = sum(1 for t in tags if any(t.startswith(s) for s in sels))
-        st = bals[0].get("strategy")
-        if isinstance(st, dict):
-            strat = str(st.get("type", "") or "")
-    else:
+    members, strategies = 0, []
+    if bals is not None and not isinstance(bals, list):
+        return False, "routing.balancers must be an array", 0, "", servers
+    if isinstance(bals, list) and len(bals) > 64:
+        return False, "too many balancers", 0, "", servers
+    tags = [str(o.get("tag", "")) for o in outs if isinstance(o, dict)]
+    for bal in bals or []:
+        if not isinstance(bal, dict):
+            return False, "malformed balancer", 0, "", servers
+        sels = bal.get("selector", [])
+        if not isinstance(sels, list) or not all(isinstance(s, str) for s in sels):
+            return False, "balancer selector must be an array of strings", 0, "", servers
+        members += sum(1 for tag in tags if any(tag.startswith(s) for s in sels))
+        strategy = bal.get("strategy")
+        if isinstance(strategy, dict) and strategy.get("type"):
+            strategies.append(str(strategy["type"]))
+    if not bals:
         members = len(real)
-    return True, "", members, strat or "single", real
+    direct_bypass = False
+    for bal in bals or []:
+        if isinstance(bal, dict) and bal.get("fallbackTag") == "direct":
+            direct_bypass = True
+    for rule in rules:
+        if isinstance(rule, dict) and rule.get("outboundTag") == "direct":
+            direct_bypass = True
+    warning = "provider routing permits direct bypass" if direct_bypass else ""
+    return True, warning, members, ",".join(dict.fromkeys(strategies)) or "single", real
 
 
 def process_body(raw, headers=None):
@@ -394,6 +529,32 @@ def _norm_origin(u):
     return (scheme, host, port)
 
 
+def _validate_fetch_url(url):
+    if not isinstance(url, str) or not url or len(url) > MAX_LINK:
+        die("subscription URL is empty or too long")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in url):
+        die("subscription URL contains control characters")
+    try:
+        parsed = urlsplit(url)
+        _ = parsed.port
+    except ValueError:
+        die("malformed subscription URL")
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        die("only https:// subscription URLs are allowed")
+    if parsed.username is not None or parsed.password is not None:
+        die("credentials in subscription URL authority are not supported")
+    if parsed.fragment:
+        die("subscription URL fragments are not supported")
+    return parsed
+
+
+def _validate_header_value(value, label, maximum):
+    if not isinstance(value, str) or len(value) > maximum \
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value):
+        die("%s contains invalid header characters" % label)
+    return value
+
+
 def _idna_host(host):
     """ASCII host suitable for a Host header / SNI; encode IDN names, else die."""
     try:
@@ -416,17 +577,38 @@ def _net():
     return _net._m
 
 
-def _public_ips(host):
+def _public_ips(host, deadline=None):
     """All validated public IPs for host (every resolved address), or die. A
     non-global/special-purpose address anywhere in the result set is rejected
     (CGNAT, private, loopback, link-local, reserved, multicast, etc.)."""
     socket, _ssl, _hc, ipaddress, _t, _uj = _net()
     # PROXY_UNIFI_SUB_ALLOW_PRIVATE=1 disables the SSRF guard (tests only).
     allow_private = os.environ.get("PROXY_UNIFI_SUB_ALLOW_PRIVATE") == "1"
-    try:
-        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
-    except Exception as e:
-        die("could not resolve host: %s" % e)
+    if deadline is None:
+        try:
+            infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+        except Exception as e:
+            die("could not resolve host: %s" % e)
+    else:
+        # getaddrinfo has no portable timeout. Resolve in a daemon thread and
+        # bound how long the fetch waits; a wedged libc resolver cannot hold the
+        # subscription worker past its global deadline.
+        import queue, threading
+        result = queue.Queue(maxsize=1)
+        def resolve():
+            try:
+                result.put((socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP), None))
+            except Exception as exc:
+                result.put((None, exc))
+        thread = threading.Thread(target=resolve)
+        thread.daemon = True
+        thread.start()
+        thread.join(_remaining(deadline))
+        if thread.is_alive():
+            die("DNS resolution exceeded the subscription time budget")
+        infos, resolve_error = result.get_nowait()
+        if resolve_error is not None:
+            die("could not resolve host: %s" % resolve_error)
     out = []
     seen = set()
     for info in infos:
@@ -456,9 +638,7 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
     blocking op uses the remaining overall budget. Returns
     (status, headers, body_or_None, redirect_location)."""
     socket, ssl, http_client, ipaddress, _t, _uj = _net()
-    u = urlsplit(url)
-    if (u.scheme or "").lower() != "https":
-        die("only https:// subscription URLs are allowed")
+    u = _validate_fetch_url(url)
     host = u.hostname
     if not host:
         die("subscription URL has no host")
@@ -469,12 +649,13 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
     # connect+TLS to the first address that works (within the shared deadline)
     tls = None
     last_err = "no address"
-    for fam, addr in _public_ips(host):
+    for fam, addr in _public_ips(host, deadline):
         try:
             raw = socket.create_connection((addr, port), timeout=_remaining(deadline))
         except OSError as e:
             last_err = str(e); continue
         try:
+            raw.settimeout(_remaining(deadline))
             tls = ctx.wrap_socket(raw, server_hostname=sni)
             break
         except (ssl.SSLError, OSError) as e:
@@ -499,9 +680,11 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
             pass
         if port != 443:
             hostport = "%s:%d" % (hostport, port)
-        hdrs = {"Host": hostport, "User-Agent": ua, "Accept": "*/*", "Connection": "close"}
+        hdrs = {"Host": hostport,
+                "User-Agent": _validate_header_value(ua, "User-Agent", 120),
+                "Accept": "*/*", "Connection": "close"}
         if send_hwid and hwid:
-            hdrs["x-hwid"] = hwid
+            hdrs["x-hwid"] = _validate_header_value(hwid, "HWID", 128)
         try:
             conn.putrequest("GET", path, skip_host=True, skip_accept_encoding=True)
             for k, v in hdrs.items():
@@ -516,38 +699,40 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
             return status, rheaders, None, rheaders.get("location")
         if status != 200:
             die("HTTP error %s from subscription server" % status)
-        # Set the read timeout ONCE on the underlying socket. Re-setting it on
-        # every iteration corrupts http.client's chunked/buffered reader and
-        # yields "Bad file descriptor", so do it before the read, not inside it.
-        try:
-            tls.settimeout(_remaining(deadline))
-        except OSError:
-            pass
-        try:
-            # resp.read() transparently handles chunked transfer-encoding; cap by
-            # reading one byte past the limit.
-            body = resp.read(MAX_BYTES + 1)
-        except (http_client.HTTPException, OSError) as e:
-            die("error reading subscription body: %s" % e)
+        content_length = rheaders.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_BYTES:
+                    die("subscription too large (> %d compressed bytes)" % MAX_BYTES)
+            except ValueError:
+                die("invalid Content-Length from subscription server")
+        chunks = []
+        total = 0
+        while True:
+            try:
+                tls.settimeout(_remaining(deadline))
+                # read1 returns after one buffered/socket read and still handles
+                # chunked framing, allowing the deadline to be checked per chunk.
+                chunk = resp.read1(min(65536, MAX_BYTES + 1 - total))
+            except (http_client.HTTPException, OSError) as e:
+                die("error reading subscription body: %s" % e)
+            _remaining(deadline)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_BYTES:
+                die("subscription too large (> %d compressed bytes)" % MAX_BYTES)
+        body = b"".join(chunks)
+        enc = (rheaders.get("content-encoding") or "").strip().lower()
+        if enc == "gzip":
+            body = _decompress_limited(body, "gzip")
+        elif enc == "deflate":
+            body = _decompress_limited(body, "deflate")
+        elif enc and enc != "identity":
+            die("unsupported Content-Encoding '%s'" % clean(enc, 40))
         if len(body) > MAX_BYTES:
-            die("subscription too large (> %d bytes)" % MAX_BYTES)
-        # transparently decompress gzip/deflate if the server used it
-        enc = (rheaders.get("content-encoding") or "").lower()
-        if "gzip" in enc:
-            import gzip
-            try:
-                body = gzip.decompress(body)
-            except Exception:
-                die("could not decompress gzip subscription body")
-        elif "deflate" in enc:
-            import zlib
-            try:
-                body = zlib.decompress(body)
-            except Exception:
-                try:
-                    body = zlib.decompress(body, -zlib.MAX_WBITS)
-                except Exception:
-                    die("could not decompress deflate subscription body")
+            die("subscription too large after decompression (> %d bytes)" % MAX_BYTES)
         return status, rheaders, body, None
     finally:
         try:
@@ -556,11 +741,51 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
             pass
 
 
+def _inflate(data, wbits):
+    import zlib
+    decoder = zlib.decompressobj(wbits)
+    output = bytearray()
+    for offset in range(0, len(data), 65536):
+        pending = data[offset:offset + 65536]
+        while pending:
+            room = MAX_BYTES + 1 - len(output)
+            if room <= 0:
+                die("subscription too large after decompression (> %d bytes)" % MAX_BYTES)
+            output.extend(decoder.decompress(pending, room))
+            pending = decoder.unconsumed_tail
+            if len(output) > MAX_BYTES:
+                die("subscription too large after decompression (> %d bytes)" % MAX_BYTES)
+    room = MAX_BYTES + 1 - len(output)
+    output.extend(decoder.flush(max(1, room)))
+    if len(output) > MAX_BYTES:
+        die("subscription too large after decompression (> %d bytes)" % MAX_BYTES)
+    if not decoder.eof or decoder.unused_data:
+        die("compressed subscription has trailing or incomplete data")
+    if data and len(output) > len(data) * MAX_EXPANSION_RATIO:
+        die("compressed subscription exceeds the expansion-ratio limit")
+    return bytes(output)
+
+
+def _decompress_limited(data, encoding):
+    import zlib
+    try:
+        if encoding == "gzip":
+            return _inflate(data, 16 + zlib.MAX_WBITS)
+        try:
+            return _inflate(data, zlib.MAX_WBITS)
+        except zlib.error:
+            return _inflate(data, -zlib.MAX_WBITS)
+    except SystemExit:
+        raise
+    except Exception:
+        die("could not decompress %s subscription body" % encoding)
+
+
 def fetch_url(url, hwid, ua):
     _s, _ssl, _hc, _ip, time, urljoin = _net()
     deadline = time.monotonic() + DEADLINE
     try:
-        origin = _norm_origin(urlsplit(url))
+        origin = _norm_origin(_validate_fetch_url(url))
     except ValueError:
         die("malformed subscription URL")
     cur = url
@@ -626,13 +851,14 @@ def _validate_node(nd):
     if nd.get("kind") == "pool" or sch == "json":
         # a JSON balancer/pool profile node: validate it carries raw profile JSON
         prof = nd.get("profile")
-        if not isinstance(prof, str) or not prof.strip() or len(prof) > 200000:
+        if not isinstance(prof, str) or not prof.strip() or len(prof) > MAX_PROFILE:
             die("catalog pool node has an invalid profile")
     else:
         if not isinstance(sch, str) or sch not in SUPPORTED:
             die("catalog node has an invalid scheme")
         link = nd.get("link")
-        if not isinstance(link, str) or "://" not in link or len(link) > MAX_LINK:
+        if not isinstance(link, str) or "://" not in link \
+                or len(link.encode("utf-8", "replace")) > MAX_LINK:
             die("catalog node has an invalid link")
         if any(ord(c) < 0x20 or ord(c) == 0x7f for c in link):
             die("catalog node link contains control characters")
@@ -658,6 +884,8 @@ def _migrate(cat):
 
 def _load(path):
     try:
+        if os.path.getsize(path) > MAX_BYTES * 8:
+            die("catalog is too large")
         with open(path, "r", encoding="utf-8") as fh:
             cat = json.load(fh)
     except Exception as e:
@@ -697,8 +925,9 @@ def cmd_render(args):
         scheme = clean(nd.get("scheme", "?"), 12)
         line = "%3d. [%s] %-9s %-24s %s" % (
             nd.get("n", 0), mark, scheme, server, label)
-        if not nd.get("recognized") and nd.get("reason"):
-            line += "  (%s)" % clean(nd["reason"], 40)
+        if nd.get("reason"):
+            prefix = "warning: " if nd.get("recognized") else ""
+            line += "  (%s%s)" % (prefix, clean(nd["reason"], 60))
         print(line)
 
 
@@ -739,6 +968,70 @@ def cmd_profile(args):
     sys.exit(1)
 
 
+def _selection_meta(nd):
+    return {
+        "schema": 1,
+        "id": nd.get("id", ""),
+        "n": nd.get("n", 0),
+        "kind": "pool" if (nd.get("kind") == "pool" or nd.get("scheme") == "json") else "link",
+        "scheme": nd.get("scheme", ""),
+        "label": nd.get("label", ""),
+        "server": nd.get("server", ""),
+    }
+
+
+def cmd_selectmeta(args):
+    cat = _load(args.file)
+    for nd in cat.get("nodes", []):
+        if nd.get("n") == args.index and nd.get("recognized"):
+            json.dump(_selection_meta(nd), sys.stdout, ensure_ascii=True, sort_keys=True)
+            sys.stdout.write("\n")
+            return
+    sys.exit(1)
+
+
+def cmd_match(args):
+    """Find one safe refresh replacement for a persisted selection.
+
+    Exact content identity always wins. Otherwise require a unique strong match;
+    ambiguity leaves the active tunnel unchanged instead of switching nodes.
+    """
+    cat = _load(args.file)
+    try:
+        with open(args.selection_file, "r", encoding="utf-8") as fh:
+            old = json.load(fh)
+    except Exception as e:
+        die("could not read selection metadata: %s" % e)
+    if not isinstance(old, dict):
+        die("selection metadata is malformed")
+    candidates = [nd for nd in cat.get("nodes", []) if nd.get("recognized")]
+    for nd in candidates:
+        if nd.get("id") == old.get("id"):
+            sys.stdout.write("%s\t%s\t100\n" % (nd["n"], nd["id"]))
+            return
+    scored = []
+    for nd in candidates:
+        meta = _selection_meta(nd)
+        if meta["kind"] != old.get("kind") or meta["scheme"] != old.get("scheme"):
+            continue
+        score = 30
+        if meta["label"] and meta["label"] == old.get("label"):
+            score += 40
+        if meta["server"] and meta["server"] == old.get("server"):
+            score += 30
+        if meta["n"] == old.get("n"):
+            score += 5
+        scored.append((score, nd))
+    if not scored:
+        sys.exit(1)
+    best = max(score for score, _ in scored)
+    matches = [nd for score, nd in scored if score == best]
+    if best < 70 or len(matches) != 1:
+        sys.exit(1)
+    nd = matches[0]
+    sys.stdout.write("%s\t%s\t%s\n" % (nd["n"], nd["id"], best))
+
+
 def main():
     _utf8_stdout()
     ap = argparse.ArgumentParser(description="proxy-unifi subscription helper")
@@ -749,10 +1042,9 @@ def main():
     f.add_argument("--url-file", default="")
     f.add_argument("--hwid", default="")
     f.add_argument("--hwid-file", default="")
-    # Default UA mimics a recognized client: HWID-gated providers (Remnawave)
-    # only serve the real config to allowlisted clients, returning an
-    # "App not supported" placeholder to anything else.
-    f.add_argument("--ua", default="Happ/1.0")
+    # Provider-specific compatibility UAs can be supplied explicitly by the
+    # caller; do not impersonate a third-party client by default.
+    f.add_argument("--ua", default="proxy-unifi/1.1")
     f.add_argument("--body-file", default="")
     f.set_defaults(fn=cmd_fetch)
 
@@ -775,6 +1067,16 @@ def main():
     p.add_argument("--file", required=True)
     p.add_argument("--id", required=True)
     p.set_defaults(fn=cmd_profile)
+
+    sm = sub.add_parser("selectmeta")
+    sm.add_argument("--file", required=True)
+    sm.add_argument("--index", type=int, required=True)
+    sm.set_defaults(fn=cmd_selectmeta)
+
+    mt = sub.add_parser("match")
+    mt.add_argument("--file", required=True)
+    mt.add_argument("--selection-file", required=True)
+    mt.set_defaults(fn=cmd_match)
 
     args = ap.parse_args()
     if not getattr(args, "fn", None):

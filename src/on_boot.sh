@@ -9,17 +9,17 @@ set -eu
 
 ROOT="/data/proxy-unifi"
 CLI="$ROOT/bin/proxy-unifi"
+LOG="$ROOT/boot.log"
 
 # nothing to do if the package isn't installed
 [ -x "$CLI" ] || exit 0
+umask 077
+mkdir -p "$ROOT"
+exec >>"$LOG" 2>&1
+printf '%s proxy-unifi boot recovery starting\n' "$(date -Iseconds 2>/dev/null || date)"
 
-# re-create the systemd unit + the /usr/bin/proxy symlink (install-service does
-# both, and safely: it won't clobber an unrelated /usr/bin/proxy). /usr is wiped
-# each boot, so this restores it.
-"$CLI" install-service || true
-
-# Start only if a config OR pool profile is present AND autostart isn't disabled.
-if { [ -f "$ROOT/etc/config.json" ] || [ -f "$ROOT/etc/pool/99-overlay.json" ]; } \
-   && [ "$(cat "$ROOT/etc/autostart" 2>/dev/null || echo enabled)" != "disabled" ]; then
-    systemctl restart proxy-unifi || systemctl start proxy-unifi || true
-fi
+# Recreate the unit/symlink/timer and recover the service under the CLI's global
+# mutation lock. The CLI performs the same stabilized PID/socket health check as
+# an interactive import instead of accepting a transient "active" state.
+"$CLI" boot-recover
+echo "proxy-unifi boot recovery completed"
