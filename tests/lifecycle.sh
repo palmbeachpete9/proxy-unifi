@@ -3,7 +3,10 @@
 # systemd/socket state; never touches /data, /etc/systemd, or /usr/bin.
 set -eu
 
-[ $# -eq 1 ] && [ -x "$1" ] || { echo "usage: lifecycle.sh /path/to/xray" >&2; exit 2; }
+if [ $# -ne 1 ] || [ ! -x "$1" ]; then
+    echo "usage: lifecycle.sh /path/to/xray" >&2
+    exit 2
+fi
 XRAY_SRC="$1"
 REPO="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 T="$(mktemp -d)"

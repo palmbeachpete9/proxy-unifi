@@ -98,17 +98,22 @@ load_settings() {
         case "$_value" in \"*\") _value="${_value#\"}"; _value="${_value%\"}" ;; esac
         case "$_key" in
             WG_LISTEN) case "$_value" in ""|*[!0-9A-Fa-f:.]*) : ;; *) WG_LISTEN="$_value" ;; esac ;;
-            WG_PORT) _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 65535 ] && WG_PORT="$_value" || true ;;
-            WG_MTU) _uint "$_value" && [ "$_value" -ge 576 ] && [ "$_value" -le 9000 ] && WG_MTU="$_value" || true ;;
-            WG_KEEPALIVE) _uint "$_value" && [ "$_value" -le 65535 ] && WG_KEEPALIVE="$_value" || true ;;
+            WG_PORT)
+                if _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 65535 ]; then WG_PORT="$_value"; fi ;;
+            WG_MTU)
+                if _uint "$_value" && [ "$_value" -ge 576 ] && [ "$_value" -le 9000 ]; then WG_MTU="$_value"; fi ;;
+            WG_KEEPALIVE)
+                if _uint "$_value" && [ "$_value" -le 65535 ]; then WG_KEEPALIVE="$_value"; fi ;;
             XRAY_ADDR) case "$_value" in ""|*[!0-9A-Fa-f:.,/]*) : ;; *) XRAY_ADDR="$_value" ;; esac ;;
             UNIFI_ADDR) case "$_value" in ""|*[!0-9A-Fa-f:.,/]*) : ;; *) UNIFI_ADDR="$_value" ;; esac ;;
             INNER_DNS) case "$_value" in *[!0-9A-Fa-f:.,]*) : ;; *) INNER_DNS="$_value" ;; esac ;;
             LOGLEVEL) case "$_value" in debug|info|warning|error|none) LOGLEVEL="$_value" ;; esac ;;
             PING_MODE) case "$_value" in get|head|tcp|icmp) PING_MODE="$_value" ;; esac ;;
             PING_URL) case "$_value" in https://*) PING_URL="$_value" ;; esac ;;
-            PING_TIMEOUT) _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 60 ] && PING_TIMEOUT="$_value" || true ;;
-            SUB_REFRESH_HOURS) _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 8760 ] && SUB_REFRESH_HOURS="$_value" || true ;;
+            PING_TIMEOUT)
+                if _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 60 ]; then PING_TIMEOUT="$_value"; fi ;;
+            SUB_REFRESH_HOURS)
+                if _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 8760 ]; then SUB_REFRESH_HOURS="$_value"; fi ;;
             SUB_USER_AGENT)
                 case "$_value" in ""|*\"*|*\\*|*[![:print:]]*) : ;; *) SUB_USER_AGENT="$_value" ;; esac ;;
         esac
@@ -190,7 +195,7 @@ remove_proxy_link() {
         c_ylw "note: $PROXY_LINK points elsewhere; not removing it."
         return 0
     fi
-    [ -L "$PROXY_LINK" ] && rm -f "$PROXY_LINK" || true
+    if [ -L "$PROXY_LINK" ]; then rm -f "$PROXY_LINK"; fi
 }
 
 py() {
@@ -264,7 +269,7 @@ acquire_lock() {
 release_lock() {
     [ "$LOCK_HELD" = 1 ] || return 0
     _owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-    [ "$_owner" = "$LOCK_OWNER" ] && rm -rf "$LOCK_DIR" 2>/dev/null || true
+    if [ "$_owner" = "$LOCK_OWNER" ]; then rm -rf "$LOCK_DIR" 2>/dev/null || true; fi
     LOCK_HELD=0
     LOCK_OWNER=""
 }
@@ -324,7 +329,7 @@ restore_transaction_files() {
             mv "$ETC_DIR" "$_rt_failed" || { rm -rf "$_rt_candidate"; return 1; }
         fi
         if ! mv "$_rt_candidate" "$ETC_DIR"; then
-            [ -e "$_rt_failed" ] && mv "$_rt_failed" "$ETC_DIR" 2>/dev/null || true
+            if [ -e "$_rt_failed" ]; then mv "$_rt_failed" "$ETC_DIR" 2>/dev/null || true; fi
             rm -rf "$_rt_candidate"
             return 1
         fi
@@ -396,12 +401,14 @@ txn_begin() {
         : > "$TXN_DIR/had-etc"
         cp -Rp "$ETC_DIR" "$TXN_DIR/etc" || fatal "could not snapshot current state"
     fi
-    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && : > "$TXN_DIR/service-active" || true
-    systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null && : > "$TXN_DIR/service-enabled" || true
-    systemctl is-active --quiet "${SERVICE_NAME}-refresh.timer" 2>/dev/null \
-        && : > "$TXN_DIR/timer-active" || true
-    systemctl is-enabled --quiet "${SERVICE_NAME}-refresh.timer" 2>/dev/null \
-        && : > "$TXN_DIR/timer-enabled" || true
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then : > "$TXN_DIR/service-active"; fi
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then : > "$TXN_DIR/service-enabled"; fi
+    if systemctl is-active --quiet "${SERVICE_NAME}-refresh.timer" 2>/dev/null; then
+        : > "$TXN_DIR/timer-active"
+    fi
+    if systemctl is-enabled --quiet "${SERVICE_NAME}-refresh.timer" 2>/dev/null; then
+        : > "$TXN_DIR/timer-enabled"
+    fi
     : > "$TXN_DIR/runtime-state"
     fsync_tree "$TXN_DIR" || fatal "could not persist state transaction snapshot"
     printf '%s\n' "$TXN_DIR" | atomic_write "$TXN_MARKER" 600 \
@@ -2166,8 +2173,9 @@ sub_refresh() {
 }
 
 sub_set_interval() {
-    _uint "$1" && [ "$1" -ge 1 ] && [ "$1" -le 8760 ] \
-        || fatal "refresh interval must be 1-8760 hours"
+    if ! _uint "$1" || [ "$1" -lt 1 ] || [ "$1" -gt 8760 ]; then
+        fatal "refresh interval must be 1-8760 hours"
+    fi
     txn_begin
     SUB_REFRESH_HOURS="$1"; save_settings
     enable_refresh_timer || fatal "could not update refresh timer"
@@ -2262,7 +2270,8 @@ EOF
 # --------------------------------------------------------------------------
 # Dispatch
 # --------------------------------------------------------------------------
-cmd="${1:-}"; [ $# -ge 1 ] && shift || true
+cmd="${1:-}"
+if [ $# -ge 1 ]; then shift; fi
 case "$cmd" in
     ""|status|logs|ping|-h|--help|help|_fw-lock|_fw-unlock) : ;;
     *) need_root; acquire_lock; recover_transaction ;;
