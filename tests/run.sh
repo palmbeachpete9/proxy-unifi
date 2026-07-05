@@ -24,6 +24,10 @@ PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+sha256_of() {
+    if have sha256sum; then sha256sum "$1" | awk '{print $1}'
+    else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
 
 # -------------------------------------------------------------------------
 # tier 1: static analysis
@@ -31,19 +35,75 @@ have() { command -v "$1" >/dev/null 2>&1; }
 static_tests() {
     echo "== static =="
     if have shellcheck; then
-        if shellcheck -s sh "$SRC/proxy-unifi" "$SRC/on_boot.sh" "$ROOT/install.sh" "$ROOT/tests/run.sh" >/dev/null 2>&1
+        if shellcheck -s sh "$SRC/proxy-unifi" "$SRC/on_boot.sh" "$ROOT/install.sh" \
+            "$ROOT/tests/run.sh" "$ROOT/tests/lifecycle.sh" >/dev/null 2>&1
         then ok "shellcheck"; else bad "shellcheck"; fi
     else printf '  skip shellcheck (not installed)\n'; fi
     if have dash; then
         _d=0
-        for f in "$SRC/proxy-unifi" "$SRC/on_boot.sh" "$ROOT/install.sh"; do
+        for f in "$SRC/proxy-unifi" "$SRC/on_boot.sh" "$ROOT/install.sh" "$ROOT/tests/lifecycle.sh"; do
             dash -n "$f" 2>/dev/null || _d=1
         done
         if [ "$_d" = 0 ]; then ok "dash -n"; else bad "dash -n"; fi
     else printf '  skip dash -n (not installed)\n'; fi
-    if python3 -m py_compile "$SRC"/mkxray.py "$SRC"/mksingbox.py "$SRC"/mksub.py "$SRC"/mkjson.py "$SRC"/proxylib.py 2>/dev/null
+    if python3 -m py_compile "$SRC"/mkxray.py "$SRC"/mksingbox.py "$SRC"/mksub.py "$SRC"/mkjson.py "$SRC"/proxylib.py "$SRC"/safeexec.py 2>/dev/null
     then ok "python compile"; else bad "python compile"; fi
     rm -rf "$SRC/__pycache__"
+
+    # A timed-out validator must terminate its complete process group, not leave
+    # a grandchild consuming resources after the wrapper returns.
+    _sd="$(mktemp -d)"
+    # shellcheck disable=SC2016 # $!/\$1 must expand inside the child shell
+    python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 1 --memory-mb 64 --fsize-mb 1 -- \
+        sh -c 'sleep 30 & echo $! > "$1/child"; wait' sh "$_sd" >/dev/null 2>"$_sd/error"
+    _src=$?; _child="$(cat "$_sd/child" 2>/dev/null || true)"; _dead=1
+    [ -n "$_child" ] && kill -0 "$_child" 2>/dev/null && _dead=0
+    if [ "$_src" = 124 ] && [ "$_dead" = 1 ]; then ok "safe validator timeout kills process group"
+    else bad "safe validator timeout kills process group"; [ "$_dead" = 1 ] || kill "$_child" 2>/dev/null || true; fi
+    rm -rf "$_sd"
+    if [ "$(uname -s)" = Linux ]; then
+        python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 10 --memory-mb 64 --fsize-mb 1 -- \
+            python3 -c 'x=bytearray(96*1024*1024); __import__("time").sleep(2)' >/dev/null 2>&1
+        [ "$?" = 125 ] && ok "safe validator enforces resident-memory limit" \
+            || bad "safe validator enforces resident-memory limit"
+    fi
+
+    if grep -E -- '--(link|secret-key|peer-pubkey)[[:space:]]+"?\$' "$SRC/proxy-unifi" >/dev/null 2>&1; then
+        bad "proxy credentials and keys stay out of child argv"
+    else
+        ok "proxy credentials and keys stay out of child argv"
+    fi
+
+    # The installer-wide rollback must restore scripts, both cores, and geo
+    # assets from one retained promotion backup.
+    _id="$(mktemp -d)"
+    mkdir -p "$_id/live" "$_id/backup"
+    for _f in proxy-unifi mkxray.py mksingbox.py mksub.py mkjson.py proxylib.py safeexec.py \
+              xray sing-box geoip.dat geosite.dat; do
+        printf old > "$_id/backup/$_f"; printf new > "$_id/live/$_f"
+    done
+    printf old > "$_id/backup/on_boot.sh"; printf new > "$_id/on_boot.sh"; : > "$_id/marker"
+    cat > "$_id/restore.sh" <<SH
+PROMOTION_MARKER='$_id/marker'
+PROMOTION_BACKUP='$_id/backup'
+BIN_DIR='$_id/live'
+ONBOOT_DST='$_id/on_boot.sh'
+SH
+    awk '/^restore_promotion\(\) \{/,/^}/' "$ROOT/install.sh" >> "$_id/restore.sh"
+    echo 'restore_promotion' >> "$_id/restore.sh"
+    _install_restore=1
+    if sh "$_id/restore.sh"; then
+        for _f in proxy-unifi xray sing-box geoip.dat geosite.dat; do
+            [ "$(cat "$_id/live/$_f")" = old ] || _install_restore=0
+        done
+        [ "$(cat "$_id/on_boot.sh")" = old ] || _install_restore=0
+        [ ! -e "$_id/marker" ] || _install_restore=0
+    else
+        _install_restore=0
+    fi
+    [ "$_install_restore" = 1 ] && ok "installer rollback restores scripts, cores, and assets" \
+        || bad "installer rollback restores scripts, cores, and assets"
+    rm -rf "$_id"
 
     # external-exposure guard: the rendered systemd unit must firewall the
     # sing-box (0.0.0.0) WG port BEFORE it binds, and must NOT firewall xray
@@ -53,18 +113,59 @@ static_tests() {
 SBIN=/b/sing-box; XRAY=/b/xray; CONFIG=/c/config.json; POOL_DIR=/c/pool
 BIN_DIR=/b; ROOT=/r; SERVICE_FILE="$WORK/unit"
 current_engine() { echo "$ENG"; }
+prepare_service_permissions() { :; }
+systemctl() { :; }
+atomic_write() { cat > "$1"; }
 SH
     awk '/^write_service\(\) \{/,/^}/' "$SRC/proxy-unifi" >> "$_ud/h.sh"
     echo 'write_service' >> "$_ud/h.sh"
     _fw_ok=1
     ENG=singbox  WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
-    grep -q '^ExecStartPre=-/b/proxy-unifi _fw-lock$'  "$_ud/unit" || _fw_ok=0
-    grep -q '^ExecStopPost=-/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
+    grep -q '^ExecStartPre=+/b/proxy-unifi _fw-lock$'  "$_ud/unit" || _fw_ok=0
+    grep -q '^ExecStopPost=-+/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
     ENG=xray     WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
-    grep -q '^ExecStartPre=-/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
+    grep -q '^ExecStartPre=-+/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
     grep -q '_fw-lock' "$_ud/unit" && _fw_ok=0          # xray must NOT lock a port
     [ "$_fw_ok" = 1 ] && ok "singbox WG port firewalled (unit)" || bad "singbox WG port firewalled (unit)"
     rm -rf "$_ud"
+
+    # Exercise firewall ownership and IPv6 fail-closed behavior against a stateful
+    # iptables mock rather than only grepping the rendered unit.
+    _fd="$(mktemp -d)"
+    cat > "$_fd/fw.sh" <<'SH'
+FW_CHAIN=PROXY_UNIFI_WG; WG_PORT=51821; D="$WORK"; FAIL6=0
+load_settings() { :; }; err() { :; }; have() { command -v "$1" >/dev/null 2>&1; }
+mock_iptables() {
+    _fam="$1"; shift; _base="$D/$_fam"
+    case "$1:$2" in
+        -N:*) [ ! -f "$_base.chain" ] || return 1; : > "$_base.chain" ;;
+        -F:*) [ -f "$_base.chain" ] || return 1; rm -f "$_base.rule" ;;
+        -A:*) printf '%s\n' "$6" > "$_base.rule" ;;
+        -C:INPUT) [ -f "$_base.jump" ] ;;
+        -C:*) [ -f "$_base.rule" ] && [ "$(cat "$_base.rule")" = "$6" ] ;;
+        -I:INPUT) : > "$_base.jump" ;;
+        -D:INPUT) rm -f "$_base.jump" ;;
+        -X:*) rm -f "$_base.chain" ;;
+        *) return 1 ;;
+    esac
+}
+iptables() { mock_iptables v4 "$@"; }
+ip6tables() { [ "$FAIL6" = 0 ] || return 1; mock_iptables v6 "$@"; }
+SH
+    sed -n '/^FW_CHAIN=/,/^ensure_service_user()/p' "$SRC/proxy-unifi" | sed '$d' >> "$_fd/fw.sh"
+    cat >> "$_fd/fw.sh" <<'SH'
+_ipv6_enabled() { return 0; }
+fw_lock && fw_is_locked 51821 || exit 1
+[ -f "$D/v4.jump" ] && [ -f "$D/v6.jump" ] || exit 1
+fw_unlock
+[ ! -e "$D/v4.jump" ] && [ ! -e "$D/v6.jump" ] || exit 1
+FAIL6=1
+if fw_lock; then exit 1; fi
+[ ! -e "$D/v4.jump" ] && [ ! -e "$D/v4.chain" ] || exit 1
+SH
+    if WORK="$_fd" sh "$_fd/fw.sh"; then ok "firewall guard owns rules and fails closed on IPv6"
+    else bad "firewall guard owns rules and fails closed on IPv6"; fi
+    rm -rf "$_fd"
 }
 
 # -------------------------------------------------------------------------
@@ -99,17 +200,47 @@ parser_tests() {
     expect mkxray.py "vless://u@h:443?security=tls&type=quic&sni=a" reject "quic rejected"
     expect mkxray.py "vless://u@h:443?type=kcp&seed=x" reject "mKCP seed rejected"
     expect mkxray.py "vless://u@-evil:443?security=tls&sni=a" reject "leading-hyphen host"
+    expect mkxray.py "vless://u@bad_name:443?security=tls&sni=a" reject "malformed domain host"
     expect mkxray.py "vless://u@h:notaport?security=tls&sni=a" reject "bad port"
     expect mkxray.py "ss://$(printf 'aes-256-gcm:pw@host:notaport' | base64 | tr -d '\n')" reject "ss legacy bad port"
     expect mkxray.py "naive+https://x@h:443" reject "unsupported scheme"
+    expect mkxray.py "vless://u@h:443?security=tls&sni=a&unknownSemantic=x" reject "unknown query field rejected"
+    expect mkxray.py "vless://u@h:443?security=tls&sni=a&sni=b" reject "duplicate query field rejected"
+    expect mkxray.py "vless://u@h:443?security=tls&type=ws&net=tcp&sni=a" reject "conflicting query aliases rejected"
+    expect mkxray.py "vless://u@h:443?security=tls&sni=a&allowInsecure=maybe" reject "invalid TLS boolean rejected"
+    expect mkxray.py "vless://u@h:443?security=none&type=tcp&pbk=$KEY" reject "irrelevant security field rejected"
+    expect mkxray.py "vless://u@h:443?security=tls&type=tcp&sni=a&authority=front.example" reject "irrelevant transport field rejected"
+    expect mkxray.py "trojan://pw@h:443?security=tls&sni=a&flow=xtls-rprx-vision" reject "removed Trojan flow rejected"
+    _unsafe_extra="$(python3 -c 'import json,urllib.parse; print(urllib.parse.quote(json.dumps({"downloadSettings":{"address":"127.0.0.1","port":80}})))')"
+    expect mkxray.py "vless://u@h:443?security=tls&type=xhttp&sni=a&extra=$_unsafe_extra" reject "private XHTTP extra target rejected"
+    expect mksingbox.py "hysteria2://pw@h:443?sni=h&obfs=salamander" reject "incomplete hysteria2 obfs rejected"
+    expect mksingbox.py "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?sni=h&udp_over_stream=maybe" reject "invalid TUIC boolean rejected"
 
     # host injection: ESC byte must be rejected (no traceback)
     out="$(python3 "$SRC/mkxray.py" --link "$(printf 'vless://u@h\033[2Jx:443?security=tls&sni=a')" --port 51821 --secret-key AAAA --peer-pubkey BBBB 2>&1)" || true
     if printf '%s' "$out" | grep -qi 'control\|unsafe\|malformed'; then ok "ESC host rejected"; else bad "ESC host rejected"; fi
 
+    python3 - "$SRC" <<'PY' && ok "current share-link fields preserved" || bad "current share-link fields preserved"
+import sys,urllib.parse
+sys.path.insert(0,sys.argv[1])
+import mkxray,mksingbox
+extra=urllib.parse.quote('{"scMaxEachPostBytes":1000000}',safe='')
+fm=urllib.parse.quote('{"tcp":[{"type":"sudoku"}]}',safe='')
+link="vless://u@h:443?security=tls&type=grpc&sni=a&authority=front.example&mode=multi&vcn=cert.example&pcs=abcd"
+out,_,_=mkxray.parse_vless(link)
+grpc=out["streamSettings"]["grpcSettings"]; tls=out["streamSettings"]["tlsSettings"]
+assert grpc["authority"]=="front.example" and grpc["multiMode"] is True
+assert tls["verifyPeerCertByName"]=="cert.example" and tls["pinnedPeerCertSha256"]=="abcd"
+out,_,_=mkxray.parse_vless("vless://u@h:443?security=tls&type=xhttp&sni=a&extra="+extra+"&fm="+fm)
+assert out["streamSettings"]["xhttpSettings"]["extra"]["scMaxEachPostBytes"]==1000000
+assert out["streamSettings"]["finalmask"]["tcp"][0]["type"]=="sudoku"
+out,_,_=mksingbox.parse_tuic("tuic://u:p@h:443?sni=h&network=tcp")
+assert out["network"]=="tcp"
+PY
+
     # mksub: classification + safety (pure python)
     python3 - "$SRC" <<'PY' && ok "mksub parser corpus" || bad "mksub parser corpus"
-import sys, base64, json
+import sys, base64, json, gzip
 sys.path.insert(0, sys.argv[1])
 import mksub
 def body(lines): return base64.b64encode(("\n".join(lines)).encode())
@@ -128,18 +259,24 @@ n = mksub.node_from_link("VLESS://u@h:443#x"); assert n["link"].startswith("vles
 # control bytes / oversize / dup dropped
 assert mksub.node_from_link("vless://u@h:443\x00evil") is None
 assert mksub.node_from_link("vless://u@h:443?x=" + "a"*9000) is None
-# label sanitization: ESC dropped, plain text kept
+assert mksub.node_from_link("vless://u@h:443#" + "🎯"*3000) is None
+# label sanitization: ANSI dropped, Unicode/emoji preserved
 got = mksub.clean("Ru \x1b[31mX")
-assert "\x1b" not in got and mksub.clean("Нидерланды 🇳🇱", 40) == "Нидерланды", got
-# emoji + mojibake residue are discarded, leaving only real text
-assert mksub.clean("🇩🇪🎯 Автовыбор | Германия", 40) == "Автовыбор | Германия"
-assert mksub.clean("🇺🇸 США", 40) == "США"
+assert got == "Ru X", got
+assert mksub.clean("Нидерланды 🇳🇱", 40) == "Нидерланды 🇳🇱"
+assert mksub.clean("🇩🇪🎯 Автовыбор | Германия", 80) == "🇩🇪🎯 Автовыбор | Германия"
+assert mksub.clean("🇺🇸 США", 40) == "🇺🇸 США"
+assert mksub.clean("München España Montréal", 80) == "München España Montréal"
 full = "🇩🇪🎯".encode("utf-8").decode("latin-1") + " Автовыбор"     # full mojibake
-assert mksub.clean(full, 40) == "Автовыбор", mksub.clean(full, 40)
-two = "ð©ðªð¯ Обход"                  # 2-char form (gateway)
-assert mksub.clean(two, 40) == "Обход", mksub.clean(two, 40)
+assert "🇩🇪🎯" in mksub.clean(full, 80), mksub.clean(full, 80)
 assert mksub.clean("日本 经由", 40) == "日本 经由"                     # CJK kept
 assert mksub.clean("plain ascii", 40) == "plain ascii"
+# compressed output is capped after inflation, not only before it
+try:
+    mksub._decompress_limited(gzip.compress(b"x"*(mksub.MAX_BYTES+1)),"gzip")
+    raise AssertionError("accepted decompression bomb")
+except SystemExit:
+    pass
 # empty / html / no-outbounds-json bodies rejected
 for b in [b"", base64.b64encode(b"nothing here"), b"<html></html>", base64.b64encode(b'{"x":1}')]:
     try:
@@ -167,6 +304,29 @@ except SystemExit:
     pass
 # a 0.0.0.0 placeholder LINK is also flagged unsupported
 assert mksub.node_from_link("vless://u@0.0.0.0:1#x")["recognized"] is False
+# private subscription destinations are not activatable by default
+assert mksub.node_from_link("vless://u@192.168.1.1:443#x")["recognized"] is False
+# private targets in legacy encoded formats must not bypass the same policy
+vm_private = "vmess://" + base64.b64encode(json.dumps({"add":"192.168.1.2","port":443,"id":"u"}).encode()).decode()
+ss_private = "ss://" + base64.b64encode(b"aes-256-gcm:pw@192.168.1.3:8388").decode()
+assert mksub.node_from_link(vm_private)["recognized"] is False
+assert mksub.node_from_link(ss_private)["recognized"] is False
+# Xray Trojan/SS profile shapes use settings.servers and must classify correctly
+for proto in ("trojan", "shadowsocks"):
+    shape={"outbounds":[{"protocol":proto,"tag":"proxy","settings":{"servers":[{"address":"public.example","port":443}]}}]}
+    assert mksub._classify_profile(shape)[0] is True, (proto,mksub._classify_profile(shape))
+# Current direct settings.address shape is also classified and safety-checked.
+http_shape={"outbounds":[{"protocol":"http","tag":"proxy","settings":{"address":"public.example","port":3128}}]}
+assert mksub._classify_profile(http_shape)[0] is True
+# cosmetic remarks/key ordering do not change JSON profile identity
+p1=dict(prof); p1["remarks"]="one"
+p2=json.loads(json.dumps(p1,sort_keys=True)); p2["remarks"]="two"
+c1=mksub.process_body(json.dumps([p1]).encode())["nodes"][0]["id"]
+c2=mksub.process_body(json.dumps([p2]).encode())["nodes"][0]["id"]
+assert c1==c2,(c1,c2)
+# malformed shapes are rejected cleanly, never traversed into a TypeError
+badshape=json.loads(json.dumps(prof)); badshape["routing"]["rules"]=None
+assert mksub._classify_profile(badshape)[0] is False
 # CGNAT blocked by SSRF guard
 import socket
 g = socket.getaddrinfo
@@ -177,6 +337,13 @@ except SystemExit:
     pass
 finally:
     socket.getaddrinfo = g
+# request/header ambiguities are rejected before any network operation
+for bad_url in ("http://example.com/sub", "https://u:p@example.com/sub",
+                "https://example.com/sub#fragment", "https://example.com/\r\nX: y"):
+    try:
+        mksub._validate_fetch_url(bad_url); raise AssertionError("accepted bad URL")
+    except SystemExit:
+        pass
 print("mksub-ok")
 PY
 
@@ -189,8 +356,8 @@ prof = {
   "log": {"loglevel": "warning", "access": "/Users/x/log"},
   "inbounds": [{"tag": "socks", "protocol": "socks", "port": 10808,
                 "sniffing": {"enabled": True, "destOverride": ["tls"]}}],
-  "outbounds": [{"protocol": "vless", "tag": "proxy"},
-                {"protocol": "vless", "tag": "proxy-2"},
+  "outbounds": [{"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{"address": "a.example", "port": 443}]}},
+                {"protocol": "vless", "tag": "proxy-2", "settings": {"vnext": [{"address": "b.example", "port": 443}]}},
                 {"protocol": "freedom", "tag": "direct"}],
   "routing": {"balancers": [{"tag": "B", "selector": ["proxy"],
                              "strategy": {"type": "leastPing"}}],
@@ -222,6 +389,74 @@ try:
     mkjson.validate_profile(bad); raise AssertionError("accepted source routing")
 except SystemExit:
     pass
+# nested local-file primitives must be rejected before Xray validation
+unsafe = json.loads(json.dumps(prof))
+unsafe["outbounds"][0]["streamSettings"]={"security":"tls","tlsSettings":{"certificates":[{"certificateFile":"/dev/zero"}]}}
+try:
+    mkjson.validate_profile(unsafe); raise AssertionError("accepted provider local file")
+except SystemExit:
+    pass
+# rules tied to a removed secondary inbound must not silently change semantics
+removed = json.loads(json.dumps(prof))
+removed["inbounds"].append({"tag":"http","protocol":"http"})
+removed["routing"]["rules"].append({"type":"field","inboundTag":["http"],"outboundTag":"proxy"})
+try:
+    mkjson.validate_profile(removed); raise AssertionError("accepted removed inbound dependency")
+except SystemExit:
+    pass
+# references to missing graph nodes must not survive into an ambiguously routed profile
+missing = json.loads(json.dumps(prof))
+missing["routing"]["rules"][0]["balancerTag"] = "missing"
+try:
+    mkjson.validate_profile(missing); raise AssertionError("accepted missing balancer reference")
+except SystemExit:
+    pass
+# provider-controlled DNS aliases and freedom redirects cannot tunnel into local networks
+for mutate in ("dns", "redirect"):
+    local = json.loads(json.dumps(prof))
+    if mutate == "dns":
+        local["dns"] = {"servers":["1.1.1.1"], "hosts":{"public.example":"169.254.169.254"}}
+    else:
+        local["outbounds"].append({"protocol":"freedom","tag":"redir",
+                                    "settings":{"redirect":"127.0.0.1:80"}})
+    try:
+        mkjson.validate_profile(local); raise AssertionError("accepted private %s target" % mutate)
+    except SystemExit:
+        pass
+dns_forms = json.loads(json.dumps(prof))
+dns_forms["dns"]={"servers":["tcp://1.1.1.1:53","tcp+local://8.8.8.8:53",
+                             "https+local://dns.google/dns-query","quic+local://dns.adguard.com"]}
+mkjson.validate_profile(dns_forms)
+private_dns = json.loads(json.dumps(prof)); private_dns["dns"]={"servers":["192.168.1.1:53"]}
+try:
+    mkjson.validate_profile(private_dns); raise AssertionError("accepted private DNS host:port")
+except SystemExit:
+    pass
+private_http = json.loads(json.dumps(prof))
+private_http["outbounds"].append({"protocol":"http","tag":"http-private",
+                                  "settings":{"address":"127.0.0.1","port":3128}})
+try:
+    mkjson.validate_profile(private_http); raise AssertionError("accepted private direct-address outbound")
+except SystemExit:
+    pass
+# An unknown proxy destination shape must not bypass address validation.
+unknown_target = json.loads(json.dumps(prof))
+unknown_target["outbounds"].append({"protocol":"future-proxy","tag":"future",
+                                    "settings":{"endpointHost":"127.0.0.1","endpointPort":443}})
+try:
+    mkjson.validate_profile(unknown_target); raise AssertionError("accepted unknown destination schema")
+except SystemExit:
+    pass
+# Xray XHTTP may carry a second dial target inside downloadSettings.
+xhttp = json.loads(json.dumps(prof))
+xhttp["outbounds"][0]["streamSettings"]={"xhttpSettings":{"downloadSettings":{"address":"127.0.0.1","port":80}}}
+try:
+    mkjson.validate_profile(xhttp); raise AssertionError("accepted private XHTTP download target")
+except SystemExit:
+    pass
+# provider geodata jobs can replace local assets and are never part of pool routing semantics
+with_geodata = json.loads(json.dumps(prof)); with_geodata["geodata"]={"cron":"* * * * *"}
+assert "geodata" not in mkjson.sanitize_provider(with_geodata)
 print("mkjson-ok")
 PY
 }
@@ -238,10 +473,39 @@ download_engines() {
     case "$_m" in arm64|aarch64) _xa=arm64-v8a; _sa=arm64;; x86_64|amd64) _xa=64; _sa=amd64;; *) echo "unknown arch"; return 1;; esac
     case "$_os" in darwin) _xos=macos; _sos=darwin;; linux) _xos=linux; _sos=linux;; *) echo "unknown os"; return 1;; esac
     echo "  downloading xray ($_xos-$_xa) ..."
-    curl -fsSL "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-${_xos}-${_xa}.zip" -o "$CACHE/x.zip" && unzip -oq "$CACHE/x.zip" -d "$CACHE" && chmod +x "$CACHE/xray"
-    _tag="$(curl -fsSLI https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | tr -d '\r' | awk -F'/tag/' 'tolower($0)~/location:/{print $2}' | awk '{print $1}' | tail -1)"; _v="${_tag#v}"
+    _xurl="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-${_xos}-${_xa}.zip"
+    curl -fsSL --connect-timeout 15 --max-time 300 --retry 3 "$_xurl" -o "$CACHE/x.zip" \
+        && curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 "$_xurl.dgst" -o "$CACHE/x.dgst" \
+        || return 1
+    _xwant="$(awk -F'= ' 'tolower($1)~/sha2-256/{print tolower($2)}' "$CACHE/x.dgst" | tr -d ' \r' | head -1)"
+    [ -n "$_xwant" ] && [ "$(sha256_of "$CACHE/x.zip")" = "$_xwant" ] || return 1
+    unzip -oq "$CACHE/x.zip" -d "$CACHE" && chmod +x "$CACHE/xray" \
+        && "$CACHE/xray" version >/dev/null 2>&1 || return 1
+    _tag="$(curl -fsSLI --connect-timeout 15 --max-time 60 --retry 3 https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | tr -d '\r' | awk -F'/tag/' 'tolower($0)~/location:/{print $2}' | awk '{print $1}' | tail -1)"; _v="${_tag#v}"
+    [ -n "$_v" ] || return 1
     echo "  downloading sing-box $_tag ($_sos-$_sa) ..."
-    curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/${_tag}/sing-box-${_v}-${_sos}-${_sa}.tar.gz" -o "$CACHE/sb.tgz" && tar xzf "$CACHE/sb.tgz" -C "$CACHE" && cp "$(find "$CACHE" -name sing-box -type f | head -1)" "$CACHE/sing-box"
+    _sbdir="$CACHE/sing-box-${_v}-${_sos}-${_sa}"
+    rm -rf "$_sbdir"
+    _sbname="sing-box-${_v}-${_sos}-${_sa}.tar.gz"
+    curl -fsSL --connect-timeout 15 --max-time 300 --retry 3 \
+        "https://github.com/SagerNet/sing-box/releases/download/${_tag}/${_sbname}" -o "$CACHE/sb.tgz" \
+        && curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 \
+        "https://api.github.com/repos/SagerNet/sing-box/releases/tags/${_tag}" -o "$CACHE/sb-release.json" \
+        || return 1
+    _sbwant="$(python3 - "$CACHE/sb-release.json" "$_sbname" <<'PY'
+import json,sys
+for asset in json.load(open(sys.argv[1],encoding="utf-8")).get("assets",[]):
+    if asset.get("name")==sys.argv[2] and str(asset.get("digest","")).startswith("sha256:"):
+        print(asset["digest"].split(":",1)[1]); break
+PY
+)"
+    [ -n "$_sbwant" ] && [ "$(sha256_of "$CACHE/sb.tgz")" = "$_sbwant" ] \
+        && tar xzf "$CACHE/sb.tgz" -C "$CACHE" \
+        && [ -x "$_sbdir/sing-box" ] \
+        && cp "$_sbdir/sing-box" "$CACHE/sing-box.new" \
+        && mv -f "$CACHE/sing-box.new" "$CACHE/sing-box" \
+        && chmod +x "$CACHE/sing-box" \
+        && "$CACHE/sing-box" version | grep -q "version $_v"
 }
 
 engine_tests() {
@@ -262,6 +526,13 @@ engine_tests() {
     gx "vless://u@h:443?security=reality&type=tcp&flow=xtls-rprx-vision&pbk=$KEY&sid=ab&sni=a&fp=chrome" && ok "xray vless reality" || bad "xray vless reality"
     gx "trojan://pw@h:443?security=tls&sni=a" && ok "xray trojan" || bad "xray trojan"
     gx "vless://u@h:443?type=kcp&security=none" && ok "xray mKCP" || bad "xray mKCP"
+    _pcs="$(printf '%064d' 0)"
+    gx "vless://u@h:443?security=tls&type=grpc&sni=a&authority=front.example&mode=multi&vcn=cert.example&pcs=$_pcs&user_agent=ua&idle_timeout=60&health_check_timeout=20&permit_without_stream=true&initial_windows_size=65536" \
+        && ok "xray current TLS/gRPC share fields" || bad "xray current TLS/gRPC share fields"
+    _xextra="$(python3 -c 'import json,urllib.parse; print(urllib.parse.quote(json.dumps({"scMaxEachPostBytes":1000000})))')"
+    _xfm="$(python3 -c 'import json,urllib.parse; print(urllib.parse.quote(json.dumps({"tcp":[]})))')"
+    gx "vless://u@h:443?security=tls&type=xhttp&sni=a&extra=$_xextra&fm=$_xfm" \
+        && ok "xray current XHTTP/FinalMask share fields" || bad "xray current XHTTP/FinalMask share fields"
     gs "hysteria2://pw@h:443?sni=h" && ok "singbox hysteria2" || bad "singbox hysteria2"
     gs "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?sni=h" && ok "singbox tuic" || bad "singbox tuic"
     # balancer pool: build overlay + validate merged confdir
@@ -278,6 +549,9 @@ EOF
        && ! grep -q '0\.0\.0\.0' "$_d/pool/01-provider.json"
     then ok "xray balancer pool (-confdir)"; else bad "xray balancer pool (-confdir)"; fi
     rm -rf "$_d"
+
+    if sh "$ROOT/tests/lifecycle.sh" "$XR" >/dev/null 2>&1; then ok "sandboxed CLI lifecycle + rollback"
+    else bad "sandboxed CLI lifecycle + rollback"; fi
 }
 
 # -------------------------------------------------------------------------
@@ -331,7 +605,7 @@ PYEOF
 }
 
 # -------------------------------------------------------------------------
-case "${1:-}" in --download) download_engines || echo "  (engine download failed)";; esac
+case "${1:-}" in --download) download_engines || { echo "  engine download failed"; exit 1; };; esac
 static_tests
 parser_tests
 engine_tests
