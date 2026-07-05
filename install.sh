@@ -50,7 +50,9 @@ restore_promotion() {
 }
 
 release_install_lock() {
-    [ "$(cat "$LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ] && rm -rf "$LOCK_DIR" 2>/dev/null || true
+    if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ]; then
+        rm -rf "$LOCK_DIR" 2>/dev/null || true
+    fi
 }
 
 cleanup() {
