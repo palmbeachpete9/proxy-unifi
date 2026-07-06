@@ -186,7 +186,7 @@ fetch() {
 # --------------------------------------------------------------------------
 STEP=0
 STEPS_TOTAL=5
-SPIN="$(printf '|/-\134')"   # | / - \  (CD-style spinner; \134 = backslash)
+BACKSLASH="$(printf '\134')"
 _bar() {
     _f=$(( $1 * 24 / 100 )); _b=""; _i=0
     while [ "$_i" -lt 24 ]; do
@@ -204,17 +204,18 @@ run_step() {
     _pid=$!
     ACTIVE_PID="$_pid"
     _i=0
+    _bar_text="$(_bar "$_pct")"
     while kill -0 "$_pid" 2>/dev/null; do
-        _sp=$(printf '%s' "$SPIN" | cut -c $(( _i % 4 + 1 )))
-        printf '\r  %s  %s  %-40s' "$_sp" "$(_bar "$_pct")" "$_label"
+        case $((_i % 4)) in 0) _sp='|' ;; 1) _sp='/' ;; 2) _sp='-' ;; *) _sp="$BACKSLASH" ;; esac
+        printf '\r  %s  %s  %-40s' "$_sp" "$_bar_text" "$_label"
         _i=$((_i + 1)); sleep 0.1 2>/dev/null || sleep 1
     done
     if wait "$_pid"; then
         ACTIVE_PID=""
-        printf '\r  \033[32m\342\234\223\033[0m  %s  %-40s\n' "$(_bar "$_pct")" "$_label"
+        printf '\r  \033[32m\342\234\223\033[0m  %s  %-40s\n' "$_bar_text" "$_label"
     else
         ACTIVE_PID=""
-        printf '\r  \033[31mx\033[0m  %s  %-40s\n' "$(_bar "$_pct")" "$_label"
+        printf '\r  \033[31mx\033[0m  %s  %-40s\n' "$_bar_text" "$_label"
         red "Install step failed: $_label"
         red "--- last log lines ---"
         tail -n 15 "$LOG" >&2 2>/dev/null || true

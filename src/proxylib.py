@@ -5,8 +5,8 @@ generators, mkxray.py (Xray) and mksingbox.py (sing-box).
 
 Both generators parse the same family of proxy URIs into an engine-specific
 outbound; only the generic plumbing (URL splitting, host/port validation,
-base64, query helpers, the secret --input-file loader, the error helper) is the
-same, so it lives here instead of being copy-pasted into each.
+base64, query helpers, secret-file loading, Shadowsocks credentials, and error
+handling) is shared here instead of being copy-pasted into each.
 
 It is imported, never run directly: each generator is invoked as
 `python3 .../mkxray.py`, and Python puts that script's directory on sys.path[0],
@@ -16,10 +16,13 @@ Stdlib only (Python 3.7+).
 """
 
 import base64
+import ipaddress
 import json
 import os
 import sys
-from urllib.parse import urlsplit, parse_qsl
+from urllib.parse import parse_qsl, unquote, urlsplit
+
+_B64_ALPHABET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_=")
 
 
 def die(msg):
@@ -38,13 +41,15 @@ def b64_pad(s):
 
 def b64decode_any(s):
     """Decode url-safe or standard base64, with or without padding; None on failure."""
-    s = s.strip()
-    for dec in (base64.urlsafe_b64decode, base64.b64decode):
-        try:
-            return dec(b64_pad(s)).decode("utf-8")
-        except Exception:
-            pass
-    return None
+    s = "".join(s.split())
+    if any(ch not in _B64_ALPHABET for ch in s):
+        return None
+    try:
+        # altchars accepts URL-safe (-_) and standard (+/) alphabets in one
+        # strict decoder pass.
+        return base64.b64decode(b64_pad(s), altchars=b"-_", validate=True).decode("utf-8")
+    except Exception:
+        return None
 
 
 def flat_query(u):
@@ -150,7 +155,6 @@ def valid_host(host):
     # Accept IP literals (including an IPv6 zone id) before domain validation.
     ip_candidate = host.split("%", 1)[0]
     try:
-        import ipaddress
         ipaddress.ip_address(ip_candidate)
         return host
     except ValueError:
@@ -167,6 +171,46 @@ def valid_host(host):
                        for x in labels):
         die("invalid server host (malformed domain name)")
     return ascii_host
+
+
+def is_non_public_host(host):
+    low = host.rstrip(".").lower()
+    if low == "localhost" or low in ("metadata.google.internal", "metadata.aws.internal") \
+            or low.endswith((".localhost", ".local", ".internal", ".lan", ".home.arpa")):
+        return True
+    candidate = host.split("%", 1)[0]
+    if ":" not in candidate and any(ch not in "0123456789." for ch in candidate):
+        return False
+    try:
+        return not ipaddress.ip_address(candidate).is_global
+    except ValueError:
+        return False
+
+
+def validate_xhttp_download_settings(value):
+    address = value.get("address")
+    if address not in (None, ""):
+        host = valid_host(str(address))
+        if is_non_public_host(host):
+            die("XHTTP downloadSettings targets a non-public address")
+    if value.get("port") not in (None, "", 0, "0"):
+        safe_port(value["port"])
+
+
+def nested_too_deep(value, maximum, depth=0):
+    """Return early when a JSON-like dict/list exceeds the nesting limit."""
+    if depth > maximum:
+        return True
+    if isinstance(value, dict):
+        children = value.values()
+    elif isinstance(value, list):
+        children = value
+    else:
+        return False
+    for child in children:
+        if nested_too_deep(child, maximum, depth + 1):
+            return True
+    return False
 
 
 def xray_outbound_servers(ob):
@@ -219,26 +263,33 @@ def xray_outbound_servers(ob):
     return result
 
 
-def apply_input_file(args):
-    """If --input-file was given, load the secret fields (link/secret_key/
-    peer_pubkey) from that mode-600 JSON and override the matching argv flags, so
-    secrets stay out of the process list and dodge ARG_MAX on very long links."""
-    path = getattr(args, "input_file", "")
-    if not path:
-        _apply_separate_input_files(args)
-        return
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            inp = json.load(fh)
-    except Exception as e:
-        die("could not read --input-file: %s" % e)
-    if not isinstance(inp, dict):
-        die("--input-file must contain a JSON object")
-    for k in ("link", "secret_key", "peer_pubkey"):
-        if k in inp:
-            setattr(args, k, str(inp[k]))
-
-    _apply_separate_input_files(args)
+def shadowsocks_credentials(link):
+    """Return (split URL, method, password, host, port) for SIP002 or legacy SS."""
+    parsed = safe_urlsplit(link)
+    host, port = host_port(parsed)
+    method = password = None
+    if parsed.username is not None and host and port:
+        if parsed.password is not None:
+            method, password = unquote(parsed.username), unquote(parsed.password)
+        else:
+            decoded = b64decode_any(parsed.username)
+            if decoded and ":" in decoded:
+                method, password = decoded.split(":", 1)
+    if method is None:
+        decoded = b64decode_any(parsed.netloc)
+        if decoded and "@" in decoded and ":" in decoded:
+            credentials, hostport = decoded.rsplit("@", 1)
+            method, password = credentials.split(":", 1)
+            try:
+                if hostport.startswith("[") and "]:" in hostport:
+                    host, port = hostport[1:].rsplit("]:", 1)
+                else:
+                    host, port = hostport.rsplit(":", 1)
+            except ValueError:
+                die("could not parse shadowsocks server host/port")
+    if not method or not password or not host or not port:
+        die("could not parse shadowsocks link")
+    return parsed, method, password, valid_host(host), safe_port(port)
 
 
 def _read_text_file(path, label):
@@ -249,7 +300,7 @@ def _read_text_file(path, label):
         die("could not read %s: %s" % (label, e))
 
 
-def _apply_separate_input_files(args):
+def apply_secret_files(args):
     """Load individual secret fields from files when those flags are present."""
     for attr, file_attr, label in (
             ("link", "link_file", "--link-file"),
@@ -258,3 +309,40 @@ def _apply_separate_input_files(args):
         path = getattr(args, file_attr, "")
         if path:
             setattr(args, attr, _read_text_file(path, label))
+
+
+def add_secret_file_arguments(parser):
+    parser.add_argument("--link-file", default="", help="read the proxy link from a file")
+    parser.add_argument("--secret-key-file", default="",
+                        help="read the WireGuard private key from a file")
+    parser.add_argument("--peer-pubkey-file", default="",
+                        help="read the peer public key from a file")
+
+
+def load_generator_inputs(args):
+    apply_secret_files(args)
+    if not args.link:
+        die("no link provided (use --link or --link-file)")
+
+
+def handle_common_generator_modes(args, parse_link, build_test_config):
+    """Handle shared print-server/test-config modes and bridge prerequisites."""
+    if args.print_server:
+        _, host, port = parse_link(args.link)
+        sys.stdout.write("%s\t%s\n" % (host, port))
+        return True
+    if args.socks_port:
+        json.dump(build_test_config(args), sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return True
+    if not args.secret_key or not args.peer_pubkey or not args.port:
+        die("--port, --secret-key and --peer-pubkey are required to build the bridge config")
+    return False
+
+
+def dispatch_subcommand(parser):
+    args = parser.parse_args()
+    if not getattr(args, "fn", None):
+        parser.print_help()
+        sys.exit(2)
+    args.fn(args)

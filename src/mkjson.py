@@ -32,14 +32,16 @@ Subcommands:
 """
 
 import argparse
-import ipaddress
 import json
 import os
 import re
 import sys
 from urllib.parse import urlsplit
 
-from proxylib import valid_host, safe_port, xray_outbound_servers
+from proxylib import (valid_host, safe_port, xray_outbound_servers,
+                      is_non_public_host as _is_non_public,
+                      validate_xhttp_download_settings, nested_too_deep,
+                      dispatch_subcommand)
 
 
 MAX_PROFILE_BYTES = 2000000
@@ -66,19 +68,9 @@ def _load(path):
             value = json.load(fh)
     except Exception as e:
         die("could not read profile: %s" % e)
-    if _depth(value) > MAX_DEPTH:
+    if nested_too_deep(value, MAX_DEPTH):
         die("profile nesting is too deep")
     return value
-
-
-def _depth(value, depth=0):
-    if depth > MAX_DEPTH:
-        return depth
-    if isinstance(value, dict):
-        return max([depth] + [_depth(v, depth + 1) for v in value.values()])
-    if isinstance(value, list):
-        return max([depth] + [_depth(v, depth + 1) for v in value])
-    return depth
 
 
 def _safe_text(value, label, maximum=256):
@@ -87,15 +79,6 @@ def _safe_text(value, label, maximum=256):
     if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value):
         die("%s contains control characters" % label)
     return value
-
-
-def _is_non_public(host):
-    try:
-        return not ipaddress.ip_address(host.split("%", 1)[0]).is_global
-    except ValueError:
-        low = host.rstrip(".").lower()
-        return low == "localhost" or low in ("metadata.google.internal", "metadata.aws.internal") \
-            or low.endswith((".localhost", ".local", ".internal", ".lan", ".home.arpa"))
 
 
 def _duration_seconds(value):
@@ -123,6 +106,8 @@ def _validate_remote_url(value, label, schemes=("http", "https")):
 
 def _validate_untrusted_tree(value, path="profile"):
     if isinstance(value, dict):
+        if path.endswith(".downloadSettings"):
+            validate_xhttp_download_settings(value)
         for key, child in value.items():
             if not isinstance(key, str):
                 die("%s has a non-string key" % path)
@@ -142,33 +127,15 @@ def _validate_untrusted_tree(value, path="profile"):
             die("external file-backed geodata references are not allowed")
 
 
-def _validate_nested_network_targets(value, path="profile"):
-    if isinstance(value, dict):
-        if path.endswith(".downloadSettings"):
-            address = value.get("address")
-            if address not in (None, ""):
-                host = valid_host(str(address))
-                if _is_non_public(host):
-                    die("XHTTP downloadSettings targets a non-public address")
-            if value.get("port") not in (None, "", 0, "0"):
-                safe_port(value["port"])
-        for key, child in value.items():
-            _validate_nested_network_targets(child, "%s.%s" % (path, key))
-    elif isinstance(value, list):
-        for index, child in enumerate(value):
-            _validate_nested_network_targets(child, "%s[%d]" % (path, index))
-
-
 def _primary_inbound(cfg):
     """The provider's local entry inbound that user traffic enters through.
     Prefer a socks inbound, else the first inbound. Returns (index, inbound)."""
     ibs = cfg.get("inbounds")
     if not isinstance(ibs, list) or not ibs:
         die("profile has no inbounds (not a runnable client profile)")
-    socks = [(i, b) for i, b in enumerate(ibs)
-             if isinstance(b, dict) and b.get("protocol") == "socks"]
-    if socks:
-        return socks[0]
+    for index, inbound in enumerate(ibs):
+        if isinstance(inbound, dict) and inbound.get("protocol") == "socks":
+            return index, inbound
     if not isinstance(ibs[0], dict):
         die("profile's primary inbound is malformed")
     return 0, ibs[0]
@@ -217,7 +184,6 @@ def validate_profile(cfg):
     if not all(isinstance(outbound, dict) for outbound in outs):
         die("profile has a malformed outbound")
     _validate_untrusted_tree(cfg)
-    _validate_nested_network_targets(cfg)
     idx, ib = _primary_inbound(cfg)
     # routing that depends on the source entry-point identity can't be reproduced
     # by a WireGuard inbound; reject those rather than silently changing behavior.
@@ -410,9 +376,10 @@ def validate_profile(cfg):
 
 def sanitize_provider(cfg):
     """Remove platform-specific fields that break on UniFi. Returns the cleaned
-    config (a copy of the provider's, inbounds left as-is for the overlay to
-    replace by tag)."""
-    out = json.loads(json.dumps(cfg))   # deep copy
+    config with provider inbounds removed; the overlay supplies the sole inbound."""
+    # Only top-level keys and the log object are changed, so a shallow copy
+    # avoids duplicating every outbound/balancer in a potentially large profile.
+    out = dict(cfg)
     # SECURITY: the provider's local entry inbound is replaced by our loopback
     # WireGuard inbound (the overlay supplies it, carrying the primary tag). Drop
     # ALL provider inbounds so a hostile/compromised profile cannot smuggle extra
@@ -427,6 +394,8 @@ def sanitize_provider(cfg):
         out.pop(k, None)
     log = out.get("log")
     if isinstance(log, dict):
+        log = dict(log)
+        out["log"] = log
         # absolute access/error log paths from a desktop export won't exist on
         # UniFi and make Xray fail; drop them, keep loglevel.
         for k in ("access", "error"):
@@ -495,7 +464,7 @@ def cmd_overlay(args):
             json.dump(overlay, fh, ensure_ascii=False)
     except Exception as e:
         die("could not write output: %s" % e)
-    members, strat, btag = _balancer_info(cfg)
+    members, strat, _ = _balancer_info(cfg)
     sys.stdout.write("ok\ttag=%s\tmembers=%s\tstrategy=%s\n"
                      % (primary_tag, members, strat or "-"))
 
@@ -531,8 +500,7 @@ def cmd_socksconfig(args):
     balancer/outbounds through a local SOCKS inbound -- used by the ping test
     so 'via proxy' latency can be measured for a pool the same way as a link."""
     cfg = _load(args.profile)
-    validate_profile(cfg)
-    idx, ib = _primary_inbound(cfg)
+    _, ib = validate_profile(cfg)
     primary_tag = str(ib.get("tag", "") or "socks") if isinstance(ib, dict) else "socks"
     sniffing = ib.get("sniffing") if isinstance(ib, dict) else None
     out = sanitize_provider(cfg)
@@ -590,11 +558,7 @@ def main():
     fs.add_argument("--profile", required=True)
     fs.set_defaults(fn=cmd_firstserver)
 
-    args = ap.parse_args()
-    if not getattr(args, "fn", None):
-        ap.print_help()
-        sys.exit(2)
-    args.fn(args)
+    dispatch_subcommand(ap)
 
 
 if __name__ == "__main__":

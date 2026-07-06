@@ -105,6 +105,26 @@ SH
         || bad "installer rollback restores scripts, cores, and assets"
     rm -rf "$_id"
 
+    _ld="$(mktemp -d)"
+    cat > "$_ld/listeners.sh" <<'SH'
+have() { return 0; }
+ss() {
+    echo 'State Recv-Q Send-Q Local Address:Port Peer Address:Port'
+    case "$1" in
+        -lun) echo 'UNCONN 0 0 127.0.0.1:51821 0.0.0.0:*' ;;
+        -ltn) echo 'LISTEN 0 4096 127.0.0.1:1080 0.0.0.0:*' ;;
+    esac
+}
+SH
+    sed -n '/^_socket_listening() {/,/^tcp_socket_listening()/p' "$SRC/proxy-unifi" >> "$_ld/listeners.sh"
+    cat >> "$_ld/listeners.sh" <<'SH'
+socket_listening 51821 && ! socket_listening 1080 \
+    && tcp_socket_listening 1080 && ! tcp_socket_listening 51821
+SH
+    if sh "$_ld/listeners.sh"; then ok "listener checks distinguish UDP and TCP"
+    else bad "listener checks distinguish UDP and TCP"; fi
+    rm -rf "$_ld"
+
     # external-exposure guard: the rendered systemd unit must firewall the
     # sing-box (0.0.0.0) WG port BEFORE it binds, and must NOT firewall xray
     # (loopback-only) -- clearing any stale rule instead.
@@ -191,8 +211,10 @@ parser_tests() {
     expect mkxray.py "vmess://b831381d-6324-4d53-ad4f-8cda48b30811@h:443?type=ws&security=tls&path=%2Fw&host=a&sni=a" accept "vmess URI form"
     expect mkxray.py "trojan://pw@h:443?security=tls&sni=a" accept "trojan"
     expect mkxray.py "ss://$(printf 'aes-256-gcm:pw' | base64 | tr -d '\n')@h:8388" accept "ss plain"
+    expect mkxray.py "ss://$(printf 'aes-256-gcm:pw@[2001:4860:4860::8888]:8388' | base64 | tr -d '\n')" accept "ss legacy IPv6"
     expect mkxray.py "vless://u@h:443?type=kcp&security=none" accept "mKCP plain"
     expect mksingbox.py "hysteria2://pw@h:443?sni=h" accept "hysteria2"
+    expect mksingbox.py "hysteria2://pw@h:443?mport=4000-5000" reject "hysteria2 port hopping"
     expect mksingbox.py "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?sni=h" accept "tuic"
     expect mksingbox.py "ss://$(printf 'aes-256-gcm:pw' | base64 | tr -d '\n')@h:8388?plugin=obfs-local%3Bobfs%3Dhttp" accept "ss+obfs"
     # rejected forms (security / removed transports / bad input)
@@ -211,8 +233,11 @@ parser_tests() {
     expect mkxray.py "vless://u@h:443?security=none&type=tcp&pbk=$KEY" reject "irrelevant security field rejected"
     expect mkxray.py "vless://u@h:443?security=tls&type=tcp&sni=a&authority=front.example" reject "irrelevant transport field rejected"
     expect mkxray.py "trojan://pw@h:443?security=tls&sni=a&flow=xtls-rprx-vision" reject "removed Trojan flow rejected"
+    expect mkxray.py "vmess://u@h:443?flow=xtls-rprx-vision" reject "irrelevant VMess flow rejected"
     _unsafe_extra="$(python3 -c 'import json,urllib.parse; print(urllib.parse.quote(json.dumps({"downloadSettings":{"address":"127.0.0.1","port":80}})))')"
     expect mkxray.py "vless://u@h:443?security=tls&type=xhttp&sni=a&extra=$_unsafe_extra" reject "private XHTTP extra target rejected"
+    _bad_vmess="$(printf '{"add":"h","port":443,"id":"u"}' | base64 | tr -d '\n' | sed 's/^/!/')"
+    expect mkxray.py "vmess://$_bad_vmess" reject "invalid base64 characters rejected"
     expect mksingbox.py "hysteria2://pw@h:443?sni=h&obfs=salamander" reject "incomplete hysteria2 obfs rejected"
     expect mksingbox.py "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?sni=h&udp_over_stream=maybe" reject "invalid TUIC boolean rejected"
 
@@ -240,7 +265,7 @@ PY
 
     # mksub: classification + safety (pure python)
     python3 - "$SRC" <<'PY' && ok "mksub parser corpus" || bad "mksub parser corpus"
-import sys, base64, json, gzip
+import sys, base64, json, gzip, contextlib, io, os, tempfile, types
 sys.path.insert(0, sys.argv[1])
 import mksub
 def body(lines): return base64.b64encode(("\n".join(lines)).encode())
@@ -256,10 +281,24 @@ assert cat["meta"]["supported"] == 2, cat
 assert all(len(n["id"]) == 64 for n in cat["nodes"])
 # uppercase scheme normalized
 n = mksub.node_from_link("VLESS://u@h:443#x"); assert n["link"].startswith("vless://"), n
+# URI-form VMess labels and legacy VMess identity are parsed without duplicate
+# base64/JSON work; display-only ps/key ordering must not change identity.
+n = mksub.node_from_link("vmess://u@h:443#Москва🎯"); assert n["label"] == "Москва🎯", n
+vm1 = {"v":"2","ps":"old","add":"public.example","port":443,"id":"u"}
+vm2 = {"id":"u","port":443,"add":"public.example","ps":"new","v":"2"}
+vl1 = "vmess://" + base64.b64encode(json.dumps(vm1).encode()).decode()
+vl2 = "vmess://" + base64.b64encode(json.dumps(vm2).encode()).decode()
+assert mksub.node_from_link(vl1)["id"] == mksub.node_from_link(vl2)["id"]
 # control bytes / oversize / dup dropped
 assert mksub.node_from_link("vless://u@h:443\x00evil") is None
 assert mksub.node_from_link("vless://u@h:443?x=" + "a"*9000) is None
 assert mksub.node_from_link("vless://u@h:443#" + "🎯"*3000) is None
+bad_encoded = body(["vless://u@h:443"]).decode()
+try:
+    mksub.process_body((bad_encoded[:4] + "!" + bad_encoded[4:]).encode())
+    raise AssertionError("accepted injected non-base64 character")
+except SystemExit:
+    pass
 # label sanitization: ANSI dropped, Unicode/emoji preserved
 got = mksub.clean("Ru \x1b[31mX")
 assert got == "Ru X", got
@@ -295,6 +334,29 @@ assert pcat["meta"]["format"] == "json" and pcat["meta"]["count"] == 1, pcat
 pn = pcat["nodes"][0]
 assert pn["kind"] == "pool" and pn["recognized"] and pn["members"] == 2 and pn["strategy"] == "leastLoad", pn
 assert json.loads(pn["profile"])["remarks"] == "DE Auto"
+# Selection extraction loads the catalog once and emits metadata + payload.
+with tempfile.TemporaryDirectory() as tmp:
+    catalog=os.path.join(tmp,"catalog"); meta=os.path.join(tmp,"meta"); payload=os.path.join(tmp,"payload")
+    with open(catalog,"w") as output: json.dump(pcat,output)
+    args=types.SimpleNamespace(file=catalog,index=1,meta_file=meta,payload_file=payload)
+    with contextlib.redirect_stdout(io.StringIO()) as output: mksub.cmd_extract(args)
+    assert output.getvalue().split("\t")[:2] == [pn["id"],"1"]
+    with open(meta) as source: assert json.load(source)["id"] == pn["id"]
+    with open(payload) as source: assert json.load(source)["remarks"] == "DE Auto"
+    assert oct(os.stat(meta).st_mode & 0o777) == "0o600"
+    assert oct(os.stat(payload).st_mode & 0o777) == "0o600"
+    assert not [name for name in os.listdir(tmp) if name.startswith(".write.")]
+    refreshed=os.path.join(tmp,"refreshed")
+    args=types.SimpleNamespace(file=catalog,selection_file=meta,meta_file=refreshed)
+    with contextlib.redirect_stdout(io.StringIO()) as output: mksub.cmd_match(args)
+    assert output.getvalue().split("\t")[:2] == ["1",pn["id"]]
+    with open(refreshed) as source: assert json.load(source)["id"] == pn["id"]
+    try:
+        args=types.SimpleNamespace(file=catalog,selection_file=meta,meta_file=tmp)
+        with contextlib.redirect_stdout(io.StringIO()): mksub.cmd_match(args)
+        raise AssertionError("accepted unwritable metadata target")
+    except SystemExit as e:
+        assert e.code == 2
 # a 0.0.0.0 placeholder profile (App-not-supported / device-limit) is rejected
 ph = {"remarks": "App not supported", "outbounds": [
           {"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{"address": "0.0.0.0", "port": 1}]}}]}
@@ -369,6 +431,7 @@ m, strat, tag = mkjson._balancer_info(prof)
 assert m == 2 and strat == "leastPing" and tag == "B", (m, strat, tag)
 clean = mkjson.sanitize_provider(prof)
 assert "access" not in clean["log"]      # platform path stripped
+assert prof["log"]["access"] == "/Users/x/log"  # source profile stays immutable
 # SECURITY: a hostile profile's extra inbounds (open relay / dokodemo to LAN) and
 # control-plane blocks must be dropped, leaving the overlay as the sole inbound.
 evil = json.loads(json.dumps(prof))

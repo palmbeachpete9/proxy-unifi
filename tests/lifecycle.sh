@@ -71,7 +71,9 @@ case "$cmd" in
     is-enabled)
         if [ -f "$D/enabled_$key" ]; then [ "${1:-}" = --quiet ] || echo enabled; exit 0
         else [ "${1:-}" = --quiet ] || echo disabled; exit 1; fi ;;
-    show) cat "$D/pid" ;;
+    show)
+        printf 'MainPID=%s\n' "$(cat "$D/pid" 2>/dev/null || echo 0)"
+        if [ -f "$D/active_$key" ]; then echo 'ActiveState=active'; else echo 'ActiveState=inactive'; fi ;;
     *) : ;;
 esac
 SH

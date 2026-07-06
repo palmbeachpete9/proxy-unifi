@@ -17,8 +17,8 @@ Subcommands:
   fetch  [--url-file F | --url U] [--hwid-file F] [--ua UA] [--body-file F]
                                        -> JSON catalog (stdout)
   render --file nodes.json             -> numbered human list (sanitized)
-  get    --file nodes.json --index N   -> 'id\\tsupported\\treason\\tscheme\\tlink'
-  find   --file nodes.json --id ID     -> 'link' (supported only) or exit 1
+  extract --file nodes.json --index N --meta-file F [--payload-file F]
+                                       -> validated selection metadata/payload
 
 Stdlib only (Python 3.7+).
 """
@@ -31,12 +31,14 @@ import json
 import os
 import re
 import sys
+import tempfile
 import unicodedata
 from urllib.parse import urlsplit, unquote, parse_qsl, urlencode, urlunsplit
-from proxylib import xray_outbound_servers
-# Network-only modules (ssl, http.client, socket, ipaddress, time, urljoin) are
+from proxylib import (dispatch_subcommand, is_non_public_host,
+                      nested_too_deep, xray_outbound_servers)
+# Network-only modules (ssl, http.client, socket, time, urljoin) are
 # imported lazily inside fetch_url()/_https_get()/_public_ips(); the hot local
-# subcommands (render/get/find, used on every menu render) never touch the
+# subcommands (render/extract/match) never touch the
 # network and so avoid that import cost.
 
 # ---- limits ---------------------------------------------------------------
@@ -44,7 +46,7 @@ SCHEMA_VERSION = 2         # catalog format version (bump on incompatible change
 MAX_BYTES = 2000000        # 2 MB response cap
 MAX_NODES = 1000           # accepted-node cap
 MAX_LINES = 100000         # input-line scan cap (independent of accepted nodes)
-MAX_LINK = 8000            # per-link byte/char cap (avoids ARG_MAX at activation)
+MAX_LINK = 8000            # per-link byte cap
 MAX_REDIRECTS = 3
 TIMEOUT = 15               # per-operation socket timeout (seconds)
 DEADLINE = 30              # overall wall-clock budget for a fetch (seconds)
@@ -64,6 +66,8 @@ _BAD = set(range(0x00, 0x20)) | {0x7f} | set(range(0x80, 0xa0)) | {
     0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
     0x2060, 0x2066, 0x2067, 0x2068, 0x2069, 0xfeff,
 }
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_B64_ALPHABET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_=")
 
 
 def die(msg):
@@ -82,13 +86,13 @@ def _utf8_stdout():
 def _b64(text):
     """Decode possibly-unpadded url/standard base64; None on failure."""
     s = "".join(text.split())
+    if any(ch not in _B64_ALPHABET for ch in s):
+        return None
     s += "=" * (-len(s) % 4)
-    for dec in (base64.urlsafe_b64decode, base64.b64decode):
-        try:
-            return dec(s).decode("utf-8", "replace")
-        except Exception:
-            pass
-    return None
+    try:
+        return base64.b64decode(s, altchars=b"-_", validate=True).decode("utf-8", "replace")
+    except Exception:
+        return None
 
 
 def _repair_mojibake(value):
@@ -101,6 +105,7 @@ def _repair_mojibake(value):
     if not any(x in value for x in ("Ã", "Â", "ð", "â€", "Ð", "Ñ")):
         return value
     markers = ("Ã", "Â", "ð", "â", "Ð", "Ñ")
+
     def repair_part(part):
         if not any(x in part for x in markers):
             return part
@@ -160,30 +165,40 @@ def _host_port(u):
         return None, None
 
 
-def _destination_of(link, scheme):
-    """Return (host, display-server) for URI and legacy encoded forms."""
-    if scheme == "vmess" and "@" not in link[len("vmess://"):].split("#", 1)[0]:
-        # legacy base64(JSON) form
-        dec = _b64(link[len("vmess://"):].split("#", 1)[0])
-        if not dec:
-            return "", ""
-        try:
-            v = json.loads(dec)
-        except Exception:
-            return "", ""
-        if not isinstance(v, dict):
-            return "", ""
-        h, p = str(v.get("add", "")), v.get("port", "")
-        return h, ("%s:%s" % (h, p) if h else "")
+def _legacy_vmess(link, scheme):
+    """Return (is_legacy, decoded_dict_or_none) without decoding twice."""
+    if scheme != "vmess":
+        return False, None
+    body = link[len("vmess://"):].split("#", 1)[0]
+    if "@" in body:
+        return False, None
+    decoded = _b64(body)
+    if not decoded:
+        return True, None
+    try:
+        value = json.loads(decoded)
+    except (TypeError, ValueError):
+        return True, None
+    return True, value if isinstance(value, dict) else None
+
+
+def _link_details(parsed, scheme, legacy_vmess):
+    """Return (label, host, display-server), decoding legacy forms only once."""
+    is_legacy, value = legacy_vmess
+    if is_legacy:
+        if value is None:
+            return "", "", ""
+        h, p = str(value.get("add", "")), value.get("port", "")
+        label = str(value.get("ps", ""))
+        return label, h, ("%s:%s" % (h, p) if h else "")
     if scheme == "ss":
-        try:
-            u = urlsplit(link)
-            h, p = _host_port(u)
-        except ValueError:
-            return "", ""
-        if h and p and u.username is not None:
-            return h, "%s:%s" % (h, p)
-        dec = _b64(u.netloc)
+        if parsed is None:
+            return "", "", ""
+        h, p = _host_port(parsed)
+        label = unquote(parsed.fragment) if parsed.fragment else ""
+        if h and p and parsed.username is not None:
+            return label, h, "%s:%s" % (h, p)
+        dec = _b64(parsed.netloc)
         if dec and "@" in dec:
             hostport = dec.rsplit("@", 1)[1]
             if hostport.startswith("[") and "]:" in hostport:
@@ -191,53 +206,43 @@ def _destination_of(link, scheme):
             elif ":" in hostport:
                 h, p = hostport.rsplit(":", 1)
             else:
-                return "", ""
-            return h, "%s:%s" % (h, p)
-        return "", ""
+                return "", "", ""
+            return label, h, "%s:%s" % (h, p)
+        return "", "", ""
     # URI form (vless/vmess-AEAD/trojan/ss/hysteria2/tuic)
-    try:
-        u = urlsplit(link)
-        h, p = _host_port(u)
-    except ValueError:
-        return "", ""
+    if parsed is None:
+        return "", "", ""
+    h, p = _host_port(parsed)
     if not h:
-        return "", ""
-    return h, ("%s:%s" % (h, p) if p else h)
+        return "", "", ""
+    label = unquote(parsed.fragment) if parsed.fragment else ""
+    return label, h, ("%s:%s" % (h, p) if p else h)
 
 
-def _server_of(link, scheme):
-    return _destination_of(link, scheme)[1]
-
-
-def _label_of(link, scheme):
-    if scheme == "vmess":
-        body = link[len("vmess://"):].split("#", 1)[0]
-        dec = _b64(body)
-        if dec:
-            try:
-                v = json.loads(dec)
-                if isinstance(v, dict):
-                    return str(v.get("ps", ""))
-            except Exception:
-                return ""
-        return ""
-    try:
-        frag = urlsplit(link).fragment
-    except ValueError:
-        return ""
-    return unquote(frag) if frag else ""
-
-
-def _canonical_link(link):
+def _canonical_link(link, parsed, legacy_vmess):
     """Canonical identity form, excluding display-only fragment."""
     try:
-        u = urlsplit(link)
+        is_legacy, value = legacy_vmess
+        if is_legacy:
+            if isinstance(value, dict):
+                value = dict(value)
+                value.pop("ps", None)
+                return "vmess://" + json.dumps(
+                    value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            return link.split("#", 1)[0]
+        if parsed is None:
+            return link.split("#", 1)[0]
+        u = parsed
         pairs = parse_qsl(u.query, keep_blank_values=True)
         # Duplicate parameters are ambiguous and the generator rejects them.
         keys = [k for k, _ in pairs]
         if len(keys) != len(set(keys)):
             return link.split("#", 1)[0]
         query = urlencode(sorted(pairs), doseq=True)
+        # A legacy SS authority is case-sensitive base64, not a hostname.
+        if u.scheme.lower() == "ss" and u.username is None:
+            netloc = u.netloc
+            return urlunsplit((u.scheme.lower(), netloc, u.path, query, ""))
         host = (u.hostname or "").lower()
         if ":" in host and not host.startswith("["):
             host = "[" + host + "]"
@@ -255,23 +260,11 @@ def _canonical_link(link):
         return link.split("#", 1)[0]
 
 
-def _non_public_literal(host):
-    """True only when host is an IP literal that is not globally routable."""
-    if not host:
-        return False
-    try:
-        return not ipaddress.ip_address(host.split("%", 1)[0]).is_global
-    except ValueError:
-        low = host.rstrip(".").lower()
-        return low == "localhost" or low.endswith((".localhost", ".local"))
-
-
-def _ss_engine(link):
+def _ss_engine(parsed):
     """(engine, reason) for an ss:// link mirroring the shell's engine routing."""
-    try:
-        q = urlsplit(link).query
-    except ValueError:
+    if parsed is None:
         return "", "unparseable link"
+    q = parsed.query
     plugin = ""
     for kv in q.split("&"):
         if kv.startswith("plugin="):
@@ -293,27 +286,35 @@ def node_from_link(link):
     link = link.strip()
     if "://" not in link:
         return None
-    # reject control bytes / NUL so the stored link can't differ from what the
-    # shell later activates (shell command-substitution silently drops NUL).
-    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in link):
+    scheme = link.split("://", 1)[0].lower()
+    if scheme not in SUPPORTED:
         return None
     if len(link.encode("utf-8", "replace")) > MAX_LINK:
         return None
-    scheme = link.split("://", 1)[0].lower()
-    if scheme not in SUPPORTED:
+    # Reject control bytes / NUL so the stored link can't differ from what the
+    # shell later activates (shell command-substitution silently drops NUL).
+    if _CONTROL_RE.search(link):
         return None
     # normalize the scheme casing so the stored/activated link matches what the
     # (case-sensitive) shell import accepts.
     link = scheme + link[len(scheme):]
+    legacy_vmess = _legacy_vmess(link, scheme)
+    if legacy_vmess[0]:
+        parsed = None
+    else:
+        try:
+            parsed = urlsplit(link)
+        except ValueError:
+            parsed = None
     node = {"scheme": scheme, "link": link, "label": "", "server": "",
             "recognized": True, "engine": "", "reason": ""}
     try:
-        node["label"] = _label_of(link, scheme)
-        destination, node["server"] = _destination_of(link, scheme)
+        node["label"], destination, node["server"] = _link_details(
+            parsed, scheme, legacy_vmess)
         if scheme in ("hysteria2", "hy2", "tuic"):
             node["engine"] = "singbox"
         elif scheme == "ss":
-            eng, reason = _ss_engine(link)
+            eng, reason = _ss_engine(parsed)
             node["engine"] = eng
             if not eng:
                 node["recognized"] = False
@@ -326,7 +327,7 @@ def node_from_link(link):
         # providers return a 0.0.0.0 placeholder ("App not supported" /
         # "Limit of devices reached") to unauthorized clients -- flag it clearly
         # instead of offering a dead node.
-        if node["recognized"] and _non_public_literal(destination):
+        if node["recognized"] and is_non_public_host(destination):
             node["recognized"] = False
             node["reason"] = "non-public provider destination (%s)" % (
                 clean(node["label"], 40) or destination or "not authorized")
@@ -334,7 +335,7 @@ def node_from_link(link):
         node["recognized"] = False
         node["reason"] = "unparseable node"
     # stable id: full sha256 of the canonical link (without display fragment)
-    canonical = _canonical_link(link)
+    canonical = _canonical_link(link, parsed, legacy_vmess)
     node["id"] = hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()
     return node
 
@@ -369,7 +370,7 @@ def _process_json(text, headers):
             break
         if not isinstance(prof, dict):
             continue
-        if _json_depth(prof) > MAX_JSON_DEPTH:
+        if nested_too_deep(prof, MAX_JSON_DEPTH):
             continue
         raw_json = json.dumps(prof, ensure_ascii=False, separators=(",", ":"))
         if len(raw_json) > MAX_PROFILE:
@@ -384,7 +385,7 @@ def _process_json(text, headers):
         seen.add(nid)
         label = prof.get("remarks") if isinstance(prof.get("remarks"), str) else ""
         # classify + count balancer members; reject profiles we can't host
-        recognized, reason, members, strat, servers = _classify_profile(prof)
+        recognized, reason, members, strat, _ = _classify_profile(prof)
         nodes.append({
             "kind": "pool", "scheme": "json", "label": label,
             "server": ("%d nodes, %s" % (members, strat)) if members else "profile",
@@ -396,22 +397,12 @@ def _process_json(text, headers):
         nd["n"] = n
     if not nodes:
         die("subscription JSON contained no usable profiles")
-    if sum(1 for x in nodes if x["recognized"]) == 0:
+    supported = sum(1 for node in nodes if node["recognized"])
+    if supported == 0:
         die("subscription JSON has no supported profiles")
-    meta = {"count": len(nodes), "supported": sum(1 for x in nodes if x["recognized"]),
-            "format": "json"}
+    meta = {"count": len(nodes), "supported": supported, "format": "json"}
     meta.update(_meta_from_headers(headers))
     return {"schema": SCHEMA_VERSION, "meta": meta, "nodes": nodes}
-
-
-def _json_depth(value, depth=0):
-    if depth > MAX_JSON_DEPTH:
-        return depth
-    if isinstance(value, dict):
-        return max([depth] + [_json_depth(v, depth + 1) for v in value.values()])
-    if isinstance(value, list):
-        return max([depth] + [_json_depth(v, depth + 1) for v in value])
-    return depth
 
 
 def _classify_profile(prof):
@@ -429,16 +420,13 @@ def _classify_profile(prof):
         if not isinstance(o, dict):
             continue
         servers.extend(host for host, _port in xray_outbound_servers(o))
-    real = []
     for server in servers:
-        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in server):
+        if _CONTROL_RE.search(server):
             return False, "server contains control characters", 0, "", servers
-        if _non_public_literal(server):
+        if is_non_public_host(server):
             return False, "non-public/placeholder provider destinations", 0, "", servers
-        real.append(server)
-    if not real:
-        reason = "non-public/placeholder provider destinations" if servers else "no supported proxy servers"
-        return False, reason, 0, "", servers
+    if not servers:
+        return False, "no supported proxy servers", 0, "", servers
     # source/user routing can't be reproduced by a WireGuard inbound
     routing = prof.get("routing", {})
     rules = routing.get("rules", []) if isinstance(routing, dict) else []
@@ -465,7 +453,7 @@ def _classify_profile(prof):
         if isinstance(strategy, dict) and strategy.get("type"):
             strategies.append(str(strategy["type"]))
     if not bals:
-        members = len(real)
+        members = len(servers)
     direct_bypass = False
     for bal in bals or []:
         if isinstance(bal, dict) and bal.get("fallbackTag") == "direct":
@@ -474,7 +462,7 @@ def _classify_profile(prof):
         if isinstance(rule, dict) and rule.get("outboundTag") == "direct":
             direct_bypass = True
     warning = "provider routing permits direct bypass" if direct_bypass else ""
-    return True, warning, members, ",".join(dict.fromkeys(strategies)) or "single", real
+    return True, warning, members, ",".join(dict.fromkeys(strategies)) or "single", servers
 
 
 def process_body(raw, headers=None):
@@ -530,9 +518,10 @@ def _norm_origin(u):
 
 
 def _validate_fetch_url(url):
-    if not isinstance(url, str) or not url or len(url) > MAX_LINK:
+    if not isinstance(url, str) or not url \
+            or len(url.encode("utf-8", "replace")) > MAX_LINK:
         die("subscription URL is empty or too long")
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in url):
+    if _CONTROL_RE.search(url):
         die("subscription URL contains control characters")
     try:
         parsed = urlsplit(url)
@@ -550,7 +539,7 @@ def _validate_fetch_url(url):
 
 def _validate_header_value(value, label, maximum):
     if not isinstance(value, str) or len(value) > maximum \
-            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value):
+            or _CONTROL_RE.search(value):
         die("%s contains invalid header characters" % label)
     return value
 
@@ -571,9 +560,12 @@ def _net():
     """Import and return the network-only stdlib modules on first use, so the
     purely-local subcommands never pay for them. Cached on the function object."""
     if not hasattr(_net, "_m"):
-        import socket, ssl, http.client, ipaddress, time
+        import http.client
+        import socket
+        import ssl
+        import time
         from urllib.parse import urljoin
-        _net._m = (socket, ssl, http.client, ipaddress, time, urljoin)
+        _net._m = (socket, ssl, http.client, time, urljoin)
     return _net._m
 
 
@@ -581,7 +573,7 @@ def _public_ips(host, deadline=None):
     """All validated public IPs for host (every resolved address), or die. A
     non-global/special-purpose address anywhere in the result set is rejected
     (CGNAT, private, loopback, link-local, reserved, multicast, etc.)."""
-    socket, _ssl, _hc, ipaddress, _t, _uj = _net()
+    socket, _ssl, _hc, _t, _uj = _net()
     # PROXY_UNIFI_SUB_ALLOW_PRIVATE=1 disables the SSRF guard (tests only).
     allow_private = os.environ.get("PROXY_UNIFI_SUB_ALLOW_PRIVATE") == "1"
     if deadline is None:
@@ -593,8 +585,10 @@ def _public_ips(host, deadline=None):
         # getaddrinfo has no portable timeout. Resolve in a daemon thread and
         # bound how long the fetch waits; a wedged libc resolver cannot hold the
         # subscription worker past its global deadline.
-        import queue, threading
+        import queue
+        import threading
         result = queue.Queue(maxsize=1)
+
         def resolve():
             try:
                 result.put((socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP), None))
@@ -619,14 +613,14 @@ def _public_ips(host, deadline=None):
         ip = ipaddress.ip_address(addr)
         if not allow_private and not ip.is_global:
             die("refusing to fetch: %s resolves to a non-public address" % host)
-        out.append((fam, addr))
+        out.append((fam, info[4]))
     if not out:
         die("host did not resolve to any address")
     return out
 
 
 def _remaining(deadline):
-    _s, _ssl, _hc, _ip, time, _uj = _net()
+    _s, _ssl, _hc, time, _uj = _net()
     r = deadline - time.monotonic()
     if r <= 0:
         die("subscription request exceeded the time budget")
@@ -635,9 +629,9 @@ def _remaining(deadline):
 
 def _https_get(url, send_hwid, hwid, ua, deadline):
     """One HTTPS GET. Tries every validated address (mixed IPv4/IPv6 safe). Each
-    blocking op uses the remaining overall budget. Returns
-    (status, headers, body_or_None, redirect_location)."""
-    socket, ssl, http_client, ipaddress, _t, _uj = _net()
+    blocking op uses the remaining overall budget. Returns headers, body (or
+    None for redirects), and the redirect location."""
+    socket, ssl, http_client, _t, _uj = _net()
     u = _validate_fetch_url(url)
     host = u.hostname
     if not host:
@@ -649,24 +643,31 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
     # connect+TLS to the first address that works (within the shared deadline)
     tls = None
     last_err = "no address"
-    for fam, addr in _public_ips(host, deadline):
+    for family, sockaddr in _public_ips(host, deadline):
+        raw = socket.socket(family, socket.SOCK_STREAM)
         try:
-            raw = socket.create_connection((addr, port), timeout=_remaining(deadline))
+            raw.settimeout(_remaining(deadline))
+            raw.connect(sockaddr[:1] + (port,) + sockaddr[2:])
         except OSError as e:
-            last_err = str(e); continue
+            raw.close()
+            last_err = str(e)
+            continue
         try:
             raw.settimeout(_remaining(deadline))
             tls = ctx.wrap_socket(raw, server_hostname=sni)
             break
         except (ssl.SSLError, OSError) as e:
-            raw.close(); tls = None; last_err = str(e); continue
+            raw.close()
+            tls = None
+            last_err = str(e)
+            continue
     if tls is None:
         die("could not connect to subscription host: %s" % last_err)
 
     try:
         tls.settimeout(_remaining(deadline))
         conn = http_client.HTTPConnection(sni, port, timeout=_remaining(deadline))
-        conn.sock = tls
+        conn.sock = tls  # noqa - HTTPConnection consumes this pinned TLS socket internally.
         path = u.path or "/"
         if u.query:
             path += "?" + u.query
@@ -696,7 +697,7 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
         status = resp.status
         rheaders = {k.lower(): v for k, v in resp.getheaders()}
         if status in (301, 302, 303, 307, 308):
-            return status, rheaders, None, rheaders.get("location")
+            return rheaders, None, rheaders.get("location")
         if status != 200:
             die("HTTP error %s from subscription server" % status)
         content_length = rheaders.get("content-length")
@@ -706,24 +707,22 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
                     die("subscription too large (> %d compressed bytes)" % MAX_BYTES)
             except ValueError:
                 die("invalid Content-Length from subscription server")
-        chunks = []
-        total = 0
+        body = bytearray()
         while True:
             try:
                 tls.settimeout(_remaining(deadline))
                 # read1 returns after one buffered/socket read and still handles
                 # chunked framing, allowing the deadline to be checked per chunk.
-                chunk = resp.read1(min(65536, MAX_BYTES + 1 - total))
+                chunk = resp.read1(min(65536, MAX_BYTES + 1 - len(body)))
             except (http_client.HTTPException, OSError) as e:
                 die("error reading subscription body: %s" % e)
             _remaining(deadline)
             if not chunk:
                 break
-            chunks.append(chunk)
-            total += len(chunk)
-            if total > MAX_BYTES:
+            body.extend(chunk)
+            if len(body) > MAX_BYTES:
                 die("subscription too large (> %d compressed bytes)" % MAX_BYTES)
-        body = b"".join(chunks)
+        body = bytes(body)
         enc = (rheaders.get("content-encoding") or "").strip().lower()
         if enc == "gzip":
             body = _decompress_limited(body, "gzip")
@@ -733,7 +732,7 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
             die("unsupported Content-Encoding '%s'" % clean(enc, 40))
         if len(body) > MAX_BYTES:
             die("subscription too large after decompression (> %d bytes)" % MAX_BYTES)
-        return status, rheaders, body, None
+        return rheaders, body, None
     finally:
         try:
             tls.close()
@@ -782,7 +781,7 @@ def _decompress_limited(data, encoding):
 
 
 def fetch_url(url, hwid, ua):
-    _s, _ssl, _hc, _ip, time, urljoin = _net()
+    _s, _ssl, _hc, time, urljoin = _net()
     deadline = time.monotonic() + DEADLINE
     try:
         origin = _norm_origin(_validate_fetch_url(url))
@@ -794,7 +793,7 @@ def fetch_url(url, hwid, ua):
             same_origin = _norm_origin(urlsplit(cur)) == origin
         except ValueError:
             die("malformed redirect URL")
-        status, headers, body, loc = _https_get(
+        headers, body, loc = _https_get(
             cur, same_origin, hwid, ua, deadline)
         if body is not None:
             return body, headers
@@ -860,7 +859,7 @@ def _validate_node(nd):
         if not isinstance(link, str) or "://" not in link \
                 or len(link.encode("utf-8", "replace")) > MAX_LINK:
             die("catalog node has an invalid link")
-        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in link):
+        if _CONTROL_RE.search(link):
             die("catalog node link contains control characters")
     for f in ("label", "server", "reason", "engine"):
         if not isinstance(nd.get(f, ""), str):
@@ -895,14 +894,16 @@ def _load(path):
     if _migrate(cat) is None:
         die("subscription catalog is from an older version; run a refresh "
             "(menu -> Import or replace -> subscription -> Refresh)")
-    seen_n = set(); seen_id = set()
+    seen_n = set()
+    seen_id = set()
     for nd in cat["nodes"]:
         _validate_node(nd)
         if nd["n"] in seen_n:
             die("catalog has a duplicate node index")
         if nd["id"] in seen_id:
             die("catalog has a duplicate node id")
-        seen_n.add(nd["n"]); seen_id.add(nd["id"])
+        seen_n.add(nd["n"])
+        seen_id.add(nd["id"])
     return cat
 
 
@@ -931,43 +932,6 @@ def cmd_render(args):
         print(line)
 
 
-def cmd_get(args):
-    cat = _load(args.file)
-    match = [x for x in cat.get("nodes", []) if x.get("n") == args.index]
-    if not match:
-        die("no node #%d in subscription" % args.index)
-    nd = match[0]
-    kind = "pool" if (nd.get("kind") == "pool" or nd.get("scheme") == "json") else "link"
-    # for a link node field 5 is the link; for a pool node it is the kind marker
-    payload = "" if kind == "pool" else nd.get("link", "")
-    sys.stdout.write("%s\t%s\t%s\t%s\t%s\n" % (
-        nd.get("id", ""), "1" if nd.get("recognized") else "0",
-        clean(nd.get("reason", ""), 60), kind, payload))
-
-
-def cmd_find(args):
-    for nd in _load(args.file).get("nodes", []):
-        if nd.get("id") == args.id and nd.get("recognized"):
-            if nd.get("kind") == "pool" or nd.get("scheme") == "json":
-                sys.stdout.write("pool\n")    # caller must use 'profile' to get JSON
-            else:
-                sys.stdout.write(nd.get("link", "") + "\n")
-            return
-    sys.exit(1)
-
-
-def cmd_profile(args):
-    """Write the raw JSON profile of a pool node (by id) to stdout, for the shell
-    to import via the balancer/-confdir path."""
-    for nd in _load(args.file).get("nodes", []):
-        if nd.get("id") == args.id and (nd.get("kind") == "pool" or nd.get("scheme") == "json"):
-            prof = nd.get("profile")
-            if isinstance(prof, str) and prof.strip():
-                sys.stdout.write(prof)
-                return
-    sys.exit(1)
-
-
 def _selection_meta(nd):
     return {
         "schema": 1,
@@ -980,14 +944,60 @@ def _selection_meta(nd):
     }
 
 
-def cmd_selectmeta(args):
+def _atomic_write_text(path, text):
+    directory = os.path.dirname(path) or "."
+    fd = -1
+    temporary = ""
+    try:
+        os.makedirs(directory, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".write.", dir=directory)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            fd = -1
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(directory, flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception as e:
+        if fd >= 0:
+            os.close(fd)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+        die("could not write selection output: %s" % e)
+
+
+def _write_selection_meta(nd, path):
+    payload = json.dumps(_selection_meta(nd), ensure_ascii=True, sort_keys=True) + "\n"
+    _atomic_write_text(path, payload)
+
+
+def cmd_extract(args):
     cat = _load(args.file)
-    for nd in cat.get("nodes", []):
-        if nd.get("n") == args.index and nd.get("recognized"):
-            json.dump(_selection_meta(nd), sys.stdout, ensure_ascii=True, sort_keys=True)
-            sys.stdout.write("\n")
-            return
-    sys.exit(1)
+    nd = next((node for node in cat.get("nodes", []) if node.get("n") == args.index), None)
+    if nd is None:
+        die("no node #%d in subscription" % args.index)
+    kind = "pool" if (nd.get("kind") == "pool" or nd.get("scheme") == "json") else "link"
+    sys.stdout.write("%s\t%s\t%s\t%s\n" % (
+        nd.get("id", ""), "1" if nd.get("recognized") else "0",
+        clean(nd.get("reason", ""), 60), kind))
+    if not nd.get("recognized"):
+        return
+    try:
+        _write_selection_meta(nd, args.meta_file)
+        if args.payload_file:
+            payload = nd.get("profile", "") if kind == "pool" else nd.get("link", "")
+            _atomic_write_text(args.payload_file, payload)
+    except OSError as e:
+        die("could not write selection output: %s" % e)
 
 
 def cmd_match(args):
@@ -1004,13 +1014,17 @@ def cmd_match(args):
         die("could not read selection metadata: %s" % e)
     if not isinstance(old, dict):
         die("selection metadata is malformed")
-    candidates = [nd for nd in cat.get("nodes", []) if nd.get("recognized")]
-    for nd in candidates:
+    best_score = -1
+    best_node = None
+    best_count = 0
+    for nd in cat.get("nodes", []):
+        if not nd.get("recognized"):
+            continue
         if nd.get("id") == old.get("id"):
+            if args.meta_file:
+                _write_selection_meta(nd, args.meta_file)
             sys.stdout.write("%s\t%s\t100\n" % (nd["n"], nd["id"]))
             return
-    scored = []
-    for nd in candidates:
         meta = _selection_meta(nd)
         if meta["kind"] != old.get("kind") or meta["scheme"] != old.get("scheme"):
             continue
@@ -1021,15 +1035,16 @@ def cmd_match(args):
             score += 30
         if meta["n"] == old.get("n"):
             score += 5
-        scored.append((score, nd))
-    if not scored:
+        if score > best_score:
+            best_score, best_node, best_count = score, nd, 1
+        elif score == best_score:
+            best_count += 1
+    if best_score < 70 or best_count != 1:
         sys.exit(1)
-    best = max(score for score, _ in scored)
-    matches = [nd for score, nd in scored if score == best]
-    if best < 70 or len(matches) != 1:
-        sys.exit(1)
-    nd = matches[0]
-    sys.stdout.write("%s\t%s\t%s\n" % (nd["n"], nd["id"], best))
+    nd = best_node
+    if args.meta_file:
+        _write_selection_meta(nd, args.meta_file)
+    sys.stdout.write("%s\t%s\t%s\n" % (nd["n"], nd["id"], best_score))
 
 
 def main():
@@ -1053,36 +1068,20 @@ def main():
     r.add_argument("--selected", default="")   # id of the active node -> "[*]"
     r.set_defaults(fn=cmd_render)
 
-    g = sub.add_parser("get")
-    g.add_argument("--file", required=True)
-    g.add_argument("--index", type=int, required=True)
-    g.set_defaults(fn=cmd_get)
-
-    n = sub.add_parser("find")
-    n.add_argument("--file", required=True)
-    n.add_argument("--id", required=True)
-    n.set_defaults(fn=cmd_find)
-
-    p = sub.add_parser("profile")
-    p.add_argument("--file", required=True)
-    p.add_argument("--id", required=True)
-    p.set_defaults(fn=cmd_profile)
-
-    sm = sub.add_parser("selectmeta")
-    sm.add_argument("--file", required=True)
-    sm.add_argument("--index", type=int, required=True)
-    sm.set_defaults(fn=cmd_selectmeta)
+    extract = sub.add_parser("extract")
+    extract.add_argument("--file", required=True)
+    extract.add_argument("--index", type=int, required=True)
+    extract.add_argument("--meta-file", required=True)
+    extract.add_argument("--payload-file", default="")
+    extract.set_defaults(fn=cmd_extract)
 
     mt = sub.add_parser("match")
     mt.add_argument("--file", required=True)
     mt.add_argument("--selection-file", required=True)
+    mt.add_argument("--meta-file", default="")
     mt.set_defaults(fn=cmd_match)
 
-    args = ap.parse_args()
-    if not getattr(args, "fn", None):
-        ap.print_help()
-        sys.exit(2)
-    args.fn(args)
+    dispatch_subcommand(ap)
 
 
 if __name__ == "__main__":

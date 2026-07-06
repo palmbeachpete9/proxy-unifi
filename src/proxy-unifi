@@ -73,6 +73,7 @@ PING_URL="https://www.gstatic.com/generate_204"
 PING_TIMEOUT="5"
 SUB_REFRESH_HOURS="6"
 SUB_USER_AGENT="proxy-unifi/1.1"
+TAB="$(printf '\t')"
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -121,29 +122,40 @@ load_settings() {
 }
 
 atomic_write() {
-    _aw_dest="$1"; _aw_mode="${2:-600}"; _aw_dir="$(dirname "$_aw_dest")"
-    mkdir -p "$_aw_dir" || return 1
-    _aw_tmp="$(mktemp "$_aw_dir/.write.XXXXXX")" || return 1
-    chmod "$_aw_mode" "$_aw_tmp" || { rm -f "$_aw_tmp"; return 1; }
-    if ! cat > "$_aw_tmp"; then rm -f "$_aw_tmp"; return 1; fi
-    if ! py - "$_aw_tmp" <<'PYEOF' 2>/dev/null
-import os,sys
-fd=os.open(sys.argv[1],os.O_RDONLY)
-try: os.fsync(fd)
-finally: os.close(fd)
-PYEOF
-    then
-        rm -f "$_aw_tmp"
-        return 1
-    fi
-    mv -f "$_aw_tmp" "$_aw_dest" || { rm -f "$_aw_tmp"; return 1; }
-    py - "$_aw_dir" <<'PYEOF' 2>/dev/null
-import os,sys
-flags=os.O_RDONLY|getattr(os,"O_DIRECTORY",0)
-fd=os.open(sys.argv[1],flags)
-try: os.fsync(fd)
-finally: os.close(fd)
-PYEOF
+    _aw_dest="$1"; _aw_mode="${2:-600}"
+    py -c '
+import os, sys, tempfile
+destination = sys.argv[1]
+directory = os.path.dirname(destination) or "."
+os.makedirs(directory, exist_ok=True)
+fd, temporary = tempfile.mkstemp(prefix=".write.", dir=directory)
+try:
+    os.fchmod(fd, int(sys.argv[2], 8))
+    with os.fdopen(fd, "wb") as output:
+        fd = -1
+        while True:
+            chunk = sys.stdin.buffer.read(1024 * 1024)
+            if not chunk:
+                break
+            output.write(chunk)
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, destination)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(directory, flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+except Exception:
+    if fd >= 0:
+        os.close(fd)
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+' "$_aw_dest" "$_aw_mode" 2>/dev/null
 }
 
 save_settings() {
@@ -167,6 +179,14 @@ EOF
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+core_version() {
+    "$1" version 2>/dev/null | {
+        _version_line=""
+        IFS= read -r _version_line || true
+        printf '%s\n' "$_version_line"
+    }
+}
 
 # D20: only create/remove /usr/bin/proxy if it is absent or already OUR symlink,
 # never clobbering an unrelated file someone else owns.
@@ -586,7 +606,7 @@ engine_for_link_file() {
         vless://*|vmess://*|trojan://*) echo xray; return ;;
         hysteria2://*|hy2://*|tuic://*) echo singbox; return ;;
         ss://*)
-            _pn="$(py "$MKXRAY" --link-file "$_ef_file" --print-plugin 2>/dev/null | cut -f1)"
+            _pn="$(py "$MKXRAY" --link-file "$_ef_file" --print-plugin 2>/dev/null)"
             if [ -z "$_pn" ]; then echo xray; return; fi   # plain SS -> xray
             case "$_pn" in
                 obfs-local|simple-obfs|v2ray-plugin) echo singbox ;;  # sing-box runs these in-process
@@ -658,17 +678,28 @@ download_to() {
 # Resolve the latest tag from a .../releases/latest redirect with the available tool.
 resolve_latest_tag() {
     if have curl; then
-        curl -fsSLI --connect-timeout 15 --max-time 60 --retry 3 "$1/latest" 2>/dev/null | tr -d '\r'
+        curl -fsSLI --connect-timeout 15 --max-time 60 --retry 3 "$1/latest" 2>/dev/null
     elif have wget; then
-        wget -qS --timeout=30 --tries=3 --max-redirect=0 "$1/latest" -O /dev/null 2>&1 | tr -d '\r'
-    fi | awk -F'/tag/' 'tolower($0) ~ /location:/ {print $2}' | awk '{print $1}' | tail -1
+        wget -qS --timeout=30 --tries=3 --max-redirect=0 "$1/latest" -O /dev/null 2>&1
+    fi | awk -F'/tag/' '
+        tolower($0) ~ /location:/ {
+            value=$2; sub(/[[:space:]\r].*$/, "", value); tag=value
+        }
+        END { if (tag != "") print tag }'
 }
 
 # compute the SHA-256 of a file with whatever tool exists; echoes the hex digest
 sha256_of() {
     if have sha256sum; then sha256sum "$1" | awk '{print $1}'
     elif have shasum;   then shasum -a 256 "$1" | awk '{print $1}'
-    else py -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$1" 2>/dev/null
+    else py - "$1" <<'PYEOF' 2>/dev/null
+import hashlib, sys
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as source:
+    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PYEOF
     fi
 }
 
@@ -731,7 +762,7 @@ with tarfile.open(src,"r:gz") as archive:
         if total>limit: raise SystemExit("archive is too large")
     archive.extractall(dest,members=members)
 PYEOF
-    _b="$(find "$_tmp" -name sing-box -type f | head -1)"
+    _b="$(find "$_tmp" -name sing-box -type f -print -quit)"
     [ -n "$_b" ] || { rm -rf "$_tmp"; err "sing-box binary not found in archive"; return 1; }
     chmod 0755 "$_b"
     # verify the staged binary runs
@@ -756,7 +787,7 @@ PYEOF
         rm -rf "$_tmp"; err "new sing-box failed to run; rolled back to the previous version"; return 1
     fi
     rm -rf "$_tmp"
-    c_grn "sing-box installed: $("$SBIN" version 2>/dev/null | head -1)"
+    c_grn "sing-box installed: $(core_version "$SBIN")"
 }
 
 ensure_singbox() {
@@ -780,7 +811,10 @@ cmd_install_binary() {
     # is integrity (catches corruption/truncation/MITM-without-cert), not signing.
     download_to "$url.dgst" "$tmp/xray.dgst" 1048576 2>/dev/null \
         || fatal "xray-core checksum file is unavailable; refusing unverified update"
-    _want="$(awk -F'= ' 'tolower($1) ~ /sha2-256/ {print tolower($2)}' "$tmp/xray.dgst" | tr -d ' \r' | head -1)"
+    _want="$(awk -F'= ' '
+        tolower($1) ~ /sha2-256/ {
+            value=tolower($2); gsub(/[[:space:]\r]/, "", value); print value; exit
+        }' "$tmp/xray.dgst")"
     verify_sha256 "$tmp/xray.zip" "$_want" \
         || fatal "xray-core download failed mandatory checksum verification"
     info "xray-core checksum verified."
@@ -849,7 +883,7 @@ PYEOF
         fi
     fi
     rm -rf "$tmp"
-    c_grn "xray-core installed: $("$XRAY" version 2>/dev/null | head -1)"
+    c_grn "xray-core installed: $(core_version "$XRAY")"
     # sing-box (~48 MB) is only needed for ss+obfs/v2ray-plugin, hysteria2 and
     # tuic links. Don't download it eagerly: it is installed on demand the first
     # time such a link is imported (ensure_singbox). On an update, refresh it only
@@ -1338,9 +1372,9 @@ cmd_status() {
     _eng="$(current_engine)"
     echo "engine:    $_eng"
     if [ "$_eng" = "singbox" ]; then
-        if [ -x "$SBIN" ]; then echo "core:      $("$SBIN" version 2>/dev/null | head -1)"; else echo "core:      sing-box not installed"; fi
+        if [ -x "$SBIN" ]; then echo "core:      $(core_version "$SBIN")"; else echo "core:      sing-box not installed"; fi
     else
-        if [ -x "$XRAY" ]; then echo "core:      $("$XRAY" version 2>/dev/null | head -1)"; else echo "core:      xray not installed"; fi
+        if [ -x "$XRAY" ]; then echo "core:      $(core_version "$XRAY")"; else echo "core:      xray not installed"; fi
     fi
     echo "server:    $(current_server)"
     # sing-box has no listen-address option, so it binds the WG port on all
@@ -1369,27 +1403,31 @@ cmd_restart() { systemctl restart "$SERVICE_NAME"; }
 # not claim success) if the unit is not active shortly after the restart, so a
 # crash-on-start is reported instead of being masked by '|| true'. A disabled-and-
 # stopped autostart state is treated as "intentionally not running" -> success.
-socket_listening() {
+_socket_listening() {
     have ss || return 1
-    ss -lun 2>/dev/null | awk -v port="$1" '
+    _ss_flags="$1"; _ss_port="$2"
+    ss "$_ss_flags" 2>/dev/null | awk -v port="$_ss_port" '
         NR > 1 {
             if ($0 ~ (":" port "([[:space:]]|$)")) found=1
         }
         END { exit(found ? 0 : 1) }'
 }
+socket_listening() { _socket_listening -lun "$1"; }
+tcp_socket_listening() { _socket_listening -ltn "$1"; }
 
 socket_owned_by_pid() {
     _port="$1"; _pid="$2"
     have ss || return 1
-    _ss_output="$(ss -lunp 2>/dev/null)" || return 1
-    printf '%s\n' "$_ss_output" | awk -v port="$_port" -v pid="$_pid" '
+    ss -lunp 2>/dev/null | awk -v port="$_port" -v pid="$_pid" '
             $0 ~ (":" port "([[:space:]]|$)") && $0 ~ ("pid=" pid "([,)]|$)") { found=1 }
             END { exit(found ? 0 : 1) }'
 }
 
 service_healthy() {
-    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null || return 1
-    _main_pid="$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null || echo 0)"
+    _unit_state="$(systemctl show -p ActiveState -p MainPID "$SERVICE_NAME" 2>/dev/null)" || return 1
+    case "$_unit_state" in *'ActiveState=active'*) : ;; *) return 1 ;; esac
+    _main_pid="${_unit_state#*MainPID=}"
+    _main_pid="${_main_pid%%[!0-9]*}"
     case "$_main_pid" in ""|0|*[!0-9]*) return 1 ;; esac
     kill -0 "$_main_pid" 2>/dev/null || return 1
     socket_owned_by_pid "$WG_PORT" "$_main_pid"
@@ -1420,8 +1458,6 @@ restart_if_previously_active() {
 }
 # returns nonzero if the marker could not be persisted (caller must not claim success)
 _save_autostart() { mkdir -p "$ETC_DIR" && printf '%s' "$1" | atomic_write "$AUTOSTART_FILE" 600; }
-cmd_enable()  { systemctl enable "$SERVICE_NAME"; _save_autostart enabled; }
-cmd_disable() { systemctl disable "$SERVICE_NAME"; _save_autostart disabled; }   # autostart only; use 'stop' to stop now
 
 cmd_config()  {
     # A balancer/pool profile runs from a -confdir, not a single config.json;
@@ -1632,20 +1668,26 @@ _compute_server() {
     # Pool mode has no single server: summarize the balancer instead.
     if [ "$(current_engine)" = "xraypool" ] && [ -f "$POOL_SRC" ]; then
         _pi="$(py "$MKJSON" info --profile "$POOL_SRC" 2>/dev/null)"
-        _m="$(printf '%s' "$_pi" | cut -f1)"; _s="$(printf '%s' "$_pi" | cut -f2)"
+        _m="${_pi%%"$TAB"*}"
+        _rest="${_pi#*"$TAB"}"
+        _s="${_rest%%"$TAB"*}"
         printf 'balancer pool (%s nodes, %s)' "${_m:-?}" "${_s:--}"
         return
     fi
     [ -f "$OUTBOUND_LINK" ] || { printf '(none imported)'; return; }
     hp="$(_server_hp)" || { printf '?'; return; }
     [ -n "$hp" ] || { printf '?'; return; }
-    printf '%s:%s' "$(printf '%s' "$hp" | cut -f1)" "$(printf '%s' "$hp" | cut -f2)"
+    _host="${hp%%"$TAB"*}"
+    _port="${hp#*"$TAB"}"
+    printf '%s:%s' "$_host" "$_port"
 }
 
 # --------------------------------------------------------------------------
 # Connectivity test (`proxy ping`)
 # --------------------------------------------------------------------------
-_ms_from_seconds() { py -c "print('%.0f'%(float('${1:-0}')*1000))" 2>/dev/null || echo "?"; }
+_ms_from_seconds() {
+    LC_ALL=C awk -v seconds="${1:-0}" 'BEGIN { printf "%.0f", seconds * 1000 }' 2>/dev/null || echo "?"
+}
 
 # ask the OS for a free loopback TCP port (avoids a fixed-port collision)
 _free_port() {
@@ -1692,12 +1734,14 @@ ping_proxy() {   # $1 = get|head
     # wait (max ~4.5s) for the SOCKS listener to come up
     _i=0
     while [ "$_i" -lt 15 ]; do
-        if py -c 'import socket,sys;s=socket.socket();s.settimeout(0.5)
-try:
-    s.connect(("127.0.0.1",'"$_port"'));s.close()
-except Exception: sys.exit(1)' >/dev/null 2>&1; then break; fi
+        if tcp_socket_listening "$_port"; then break; fi
         _i=$((_i + 1)); sleep 0.3 2>/dev/null || sleep 1
     done
+    if ! tcp_socket_listening "$_port"; then
+        _ping_cleanup
+        err "temporary proxy listener did not start"
+        return 1
+    fi
     if [ "$_m" = "head" ]; then _label="via proxy (HEAD)"; set -- -I; else _label="via proxy (GET)"; set -- -X GET; fi
     # LC_ALL=C so curl prints time_total with a '.' decimal regardless of locale
     _out="$(LC_ALL=C curl -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time "$PING_TIMEOUT" \
@@ -1723,7 +1767,7 @@ _ping_target_hp() {
 
 ping_tcp() {
     _hp="$(_ping_target_hp)"
-    _h="$(printf '%s' "$_hp" | cut -f1)"; _p="$(printf '%s' "$_hp" | cut -f2)"
+    _h="${_hp%%"$TAB"*}"; _p="${_hp#*"$TAB"}"
     [ -n "$_h" ] || { err "could not parse server from link"; return 1; }
     ensure_service_user
     if have python3; then _ping_python=python3; else _ping_python=python; fi
@@ -1745,14 +1789,14 @@ PYEOF
 ping_icmp() {
     have ping || { err "ping is required for ICMP tests"; return 1; }
     _hp="$(_ping_target_hp)"
-    _h="$(printf '%s' "$_hp" | cut -f1)"
+    _h="${_hp%%"$TAB"*}"
     [ -n "$_h" ] || { err "could not parse server from link"; return 1; }
     # '--' so a server host starting with '-' can't be read as a ping option
     ensure_service_user
     _out="$(py "$SAFEEXEC" --user "$SERVICE_USER" --timeout "$((PING_TIMEOUT + 5))" \
         --memory-mb 128 --fsize-mb 1 -- ping -c 1 -W "$PING_TIMEOUT" -- "$_h" 2>/dev/null)" \
         || { c_red "ICMP ${_h}: timeout (>${PING_TIMEOUT}s)"; return 1; }
-    _ms="$(printf '%s\n' "$_out" | sed -n 's/.*time=\([0-9.]*\).*/\1/p' | head -1)"
+    _ms="$(printf '%s\n' "$_out" | sed -n '/time=/{s/.*time=\([0-9.]*\).*/\1/p;q;}')"
     if [ -n "$_ms" ]; then c_grn "ICMP ${_h}: ${_ms} ms"; else c_red "ICMP ${_h}: no reply (host may block ICMP)"; fi
 }
 
@@ -1872,7 +1916,7 @@ menu_disable() {
 
 menu_set_ping() {
     load_settings
-    _cur="$(printf '%s' "$PING_MODE" | tr '[:lower:]' '[:upper:]')"
+    case "$PING_MODE" in get) _cur=GET ;; head) _cur=HEAD ;; tcp) _cur=TCP ;; icmp) _cur=ICMP ;; esac
     echo "Choose default ping protocol (currently selected: ${_cur}):"
     echo "  1. via proxy (GET)    - real delay through the proxy tunnel"
     echo "  2. via proxy (HEAD)   - same, HEAD request"
@@ -1927,8 +1971,8 @@ cmd_menu() {
             16) ( locked_call menu_disable ) ;;
             17) ( locked_call cmd_update ) ;;
             18) ( locked_call cmd_geo_update ) ;;
-            19) ( if [ -x "$XRAY" ]; then "$XRAY" version | head -1; else c_ylw "xray-core: not installed"; fi
-                  if [ -x "$SBIN" ]; then "$SBIN" version 2>/dev/null | head -1; else c_ylw "sing-box: not installed"; fi
+            19) ( if [ -x "$XRAY" ]; then core_version "$XRAY"; else c_ylw "xray-core: not installed"; fi
+                  if [ -x "$SBIN" ]; then core_version "$SBIN"; else c_ylw "sing-box: not installed"; fi
                   echo "proxy-unifi CLI 1.0.0" ) ;;
             20) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
                 if [ "${_c:-}" = "y" ]; then ( locked_call cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
@@ -2053,16 +2097,12 @@ sub_fetch_to() {
         fi
         err "could not write catalog"
     else
-        err "$(head -1 "$_f_err" 2>/dev/null | sed 's/^mksub: error: //')"
+        _f_message=""
+        IFS= read -r _f_message < "$_f_err" || true
+        err "${_f_message#mksub: error: }"
     fi
     rm -rf "$_fetch_dir"
     return 1
-}
-
-# Refresh the stored subscription into its catalog (atomic).
-sub_fetch() {
-    [ -s "$SUB_URL_FILE" ] || fatal "no subscription configured (menu -> Manage a multi-server subscription)"
-    sub_fetch_to "$(cat "$SUB_URL_FILE")" "$SUB_CATALOG"
 }
 
 sub_add() {
@@ -2100,32 +2140,26 @@ sub_select() {
     case "$1" in ""|*[!0-9]*) fatal "select takes a node NUMBER from the subscription list";; esac
     [ -f "$SUB_CATALOG" ] || fatal "no catalog yet (refresh the subscription first)"
     txn_begin
-    _row="$(py "$MKSUB" get --file "$SUB_CATALOG" --index "$1" 2>/dev/null)" \
-        || fatal "no node #$1 in the subscription"
-    _id="$(printf '%s' "$_row" | cut -f1)"
-    _ok="$(printf '%s' "$_row" | cut -f2)"
-    _reason="$(printf '%s' "$_row" | cut -f3)"
-    _kind="$(printf '%s' "$_row" | cut -f4)"
-    _link="$(printf '%s' "$_row" | cut -f5-)"
-    [ "$_ok" = "1" ] || fatal "node #$1 is unsupported${_reason:+ ($_reason)}"
-    [ -z "$_reason" ] || c_ylw "Provider profile warning: $_reason"
     ensure_run_dir
     _meta="$RUN_DIR/selection.json"
-    py "$MKSUB" selectmeta --file "$SUB_CATALOG" --index "$1" > "$_meta" 2>/dev/null \
-        || fatal "could not create selection metadata"
+    _payload="$RUN_DIR/selection.payload"
+    _row="$(py "$MKSUB" extract --file "$SUB_CATALOG" --index "$1" \
+        --meta-file "$_meta" --payload-file "$_payload" 2>/dev/null)" \
+        || fatal "no node #$1 in the subscription"
+    _id="${_row%%"$TAB"*}"; _row="${_row#*"$TAB"}"
+    _ok="${_row%%"$TAB"*}"; _row="${_row#*"$TAB"}"
+    _reason="${_row%%"$TAB"*}"; _kind="${_row#*"$TAB"}"
+    [ "$_ok" = "1" ] || fatal "node #$1 is unsupported${_reason:+ ($_reason)}"
+    [ -z "$_reason" ] || c_ylw "Provider profile warning: $_reason"
     if [ "$_kind" = "pool" ]; then
         # JSON balancer/pool profile: extract its raw JSON and import via the
         # -confdir balancer path (builds + validates + applies, state-safe).
-        _pf="$RUN_DIR/selected-profile.json"
-        py "$MKSUB" profile --file "$SUB_CATALOG" --id "$_id" > "$_pf" 2>/dev/null \
-            || fatal "could not extract the selected profile"
-        _FROM_SUB=1 _QUIET=1 cmd_import_json "$_pf"
+        _FROM_SUB=1 _QUIET=1 cmd_import_json "$_payload"
     else
-        # single share link: reuse the hardened single-link path. Verify it still
-        # resolves to the catalog id first (guards against transport mangling).
-        if ! py "$MKSUB" find --file "$SUB_CATALOG" --id "$_id" >/dev/null 2>&1; then
-            fatal "selected node could not be confirmed in the catalog; refresh and retry"
-        fi
+        # single share link: reuse the hardened single-link path.
+        _link=""
+        IFS= read -r _link < "$_payload" || [ -n "$_link" ] \
+            || fatal "selected node payload is empty"
         _FROM_SUB=1 _QUIET=1 cmd_import "$_link"
     fi
     # record the selection only after a successful import; check the write
@@ -2150,14 +2184,13 @@ sub_refresh() {
         [ "${_AUTO_REFRESH:-0}" = 1 ] || sub_list
         return 0
     fi
-    _match="$(py "$MKSUB" match --file "$SUB_CATALOG" --selection-file "$SUB_SELECTED_META" 2>/dev/null || true)"
-    if [ -n "$_match" ]; then
-        _new_index="$(printf '%s' "$_match" | cut -f1)"
-        _new_id="$(printf '%s' "$_match" | cut -f2)"
+    _new_meta="$RUN_DIR/refreshed-selection.json"
+    _match_err="$RUN_DIR/refreshed-selection.err"
+    if _match="$(py "$MKSUB" match --file "$SUB_CATALOG" --selection-file "$SUB_SELECTED_META" \
+        --meta-file "$_new_meta" 2>"$_match_err")"; then
+        _new_index="${_match%%"$TAB"*}"; _match_rest="${_match#*"$TAB"}"
+        _new_id="${_match_rest%%"$TAB"*}"
         if [ "$_new_id" = "$_sel" ]; then
-            _new_meta="$RUN_DIR/refreshed-selection.json"
-            py "$MKSUB" selectmeta --file "$SUB_CATALOG" --index "$_new_index" > "$_new_meta" \
-                || fatal "could not refresh selection metadata"
             atomic_write "$SUB_SELECTED_META" 600 < "$_new_meta" \
                 || fatal "could not store refreshed selection metadata"
             txn_commit
@@ -2167,6 +2200,12 @@ sub_refresh() {
             info "selected node changed; validated and applied refreshed provider configuration."
         fi
     else
+        _match_rc=$?
+        if [ "$_match_rc" != 1 ]; then
+            _match_msg=""
+            IFS= read -r _match_msg < "$_match_err" || true
+            fatal "could not match selected subscription node${_match_msg:+ (${_match_msg#mksub: error: })}"
+        fi
         txn_commit
         c_ylw "Selected node was removed or refresh matching was ambiguous; active tunnel kept unchanged."
     fi
@@ -2292,8 +2331,8 @@ case "$cmd" in
     geo-update)   cmd_geo_update ;;
     -h|--help|help) usage ;;
     # internal hooks (used only by install.sh, the boot hook, and the systemd
-    # unit's ExecStartPre/ExecStopPost; not user-facing). The _fw-* hooks are
-    # best-effort and always succeed so they can never block service start/stop.
+    # unit's ExecStartPre/ExecStopPost; not user-facing). _fw-lock is deliberately
+    # fail-closed for sing-box, while _fw-unlock is cleanup-only.
     install-binary)  cmd_install_binary ;;
     install-service) install_service ;;
     boot-recover)    boot_recover ;;
