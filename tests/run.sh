@@ -74,6 +74,26 @@ static_tests() {
         ok "proxy credentials and keys stay out of child argv"
     fi
 
+    _ud="$(mktemp -d)"
+    {
+        # shellcheck disable=SC2016 # $1 belongs to the generated helper script.
+        echo '_uint() { case "$1" in ""|*[!0-9]*) return 1;; *) return 0;; esac; }'
+        sed -n '/^load_settings() {/,/^}/p' "$SRC/proxy-unifi"
+        cat <<'SH'
+SETTINGS="$1"; SUB_USER_AGENT="proxy-unifi/1.1"
+load_settings
+[ "$SUB_USER_AGENT" = "proxy-unifi/1.1" ]
+SH
+    } > "$_ud/ua-settings.sh"
+    python3 - "$_ud/settings" <<'PY'
+import sys
+value = "".join(chr(x) for x in (0x43a, 0x438, 0x440, 0x438, 0x43b, 0x43b, 0x438, 0x446, 0x430))
+open(sys.argv[1], "w", encoding="utf-8").write('SUB_USER_AGENT="%s"\n' % value)
+PY
+    if sh "$_ud/ua-settings.sh" "$_ud/settings"; then ok "settings User-Agent rejects non-ASCII"
+    else bad "settings User-Agent rejects non-ASCII"; fi
+    rm -rf "$_ud"
+
     # The installer-wide rollback must restore scripts, both cores, and geo
     # assets from one retained promotion backup.
     _id="$(mktemp -d)"
@@ -404,6 +424,13 @@ for bad_url in ("http://example.com/sub", "https://u:p@example.com/sub",
                 "https://example.com/sub#fragment", "https://example.com/\r\nX: y"):
     try:
         mksub._validate_fetch_url(bad_url); raise AssertionError("accepted bad URL")
+    except SystemExit:
+        pass
+assert mksub._validate_header_value("proxy-unifi/1.0", "User-Agent", 120) == "proxy-unifi/1.0"
+for bad_header in ("bad\r\nX: y", "emoji-\U0001f600", "\u043a\u0438\u0440\u0438\u043b\u043b\u0438\u0446\u0430"):
+    try:
+        mksub._validate_header_value(bad_header, "User-Agent", 120)
+        raise AssertionError("accepted bad header")
     except SystemExit:
         pass
 print("mksub-ok")
