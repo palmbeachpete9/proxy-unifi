@@ -94,6 +94,20 @@ PY
     else bad "settings User-Agent rejects non-ASCII"; fi
     rm -rf "$_ud"
 
+    _ed="$(mktemp -d)"
+    {
+        sed -n '/^wg_endpoint() {/,/^}/p' "$SRC/proxy-unifi"
+        cat <<'SH'
+WG_LISTEN="127.0.0.1"; WG_PORT="51821"
+[ "$(wg_endpoint)" = "127.0.0.1:51821" ] || exit 1
+WG_LISTEN="2001:db8::1"; WG_PORT="51821"
+[ "$(wg_endpoint)" = "[2001:db8::1]:51821" ] || exit 1
+SH
+    } > "$_ed/endpoint.sh"
+    if sh "$_ed/endpoint.sh"; then ok "CLI WireGuard endpoint formats IPv6"
+    else bad "CLI WireGuard endpoint formats IPv6"; fi
+    rm -rf "$_ed"
+
     # The installer-wide rollback must restore scripts, both cores, and geo
     # assets from one retained promotion backup.
     _id="$(mktemp -d)"
