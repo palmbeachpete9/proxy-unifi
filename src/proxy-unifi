@@ -193,6 +193,13 @@ core_version() {
     }
 }
 
+wg_endpoint() {
+    case "$WG_LISTEN" in
+        *:*) printf '[%s]:%s' "$WG_LISTEN" "$WG_PORT" ;;
+        *)   printf '%s:%s' "$WG_LISTEN" "$WG_PORT" ;;
+    esac
+}
+
 # D20: only create/remove /usr/bin/proxy if it is absent or already OUR symlink,
 # never clobbering an unrelated file someone else owns.
 PROXY_LINK="/usr/bin/proxy"
@@ -1333,6 +1340,7 @@ cmd_wg_config() {
     load_settings
     upriv="$(cat "$WG_DIR/unifi_private.key")"
     xpub="$(cat "$WG_DIR/wg_public.key")"
+    endpoint="$(wg_endpoint)"
     c_bold "================  UniFi WireGuard VPN Client  ================"
     echo
     echo "In unifi.ui.com: Settings -> VPN -> VPN Client -> Create New (WireGuard)."
@@ -1340,7 +1348,7 @@ cmd_wg_config() {
     echo
     printf '%-19s %s\n' "Private Key:"        "$upriv"
     printf '%-19s %s\n' "Public Key (peer):"  "$xpub"
-    printf '%-19s %s\n' "Endpoint:"           "${WG_LISTEN}:${WG_PORT}"
+    printf '%-19s %s\n' "Endpoint:"           "$endpoint"
     printf '%-19s %s\n' "Pre-shared Key:"     "(leave empty)"
     printf '%-19s %s\n' "Address/Local IP:"   "$UNIFI_ADDR"
     printf '%-19s %s\n' "Allowed IPs:"        "0.0.0.0/0, ::/0"
@@ -1358,7 +1366,7 @@ MTU = $WG_MTU
 
 [Peer]
 PublicKey = $xpub
-Endpoint = ${WG_LISTEN}:${WG_PORT}
+Endpoint = $endpoint
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = $WG_KEEPALIVE
 EOF
@@ -1392,7 +1400,7 @@ cmd_status() {
             c_ylw "wg listen: 0.0.0.0:${WG_PORT} (all interfaces; firewall rule NOT active)  mtu=${WG_MTU}"
         fi
     else
-        echo "wg listen: ${WG_LISTEN}:${WG_PORT}  mtu=${WG_MTU}"
+        echo "wg listen: $(wg_endpoint)  mtu=${WG_MTU}"
     fi
     if have ss; then
         if socket_listening "$WG_PORT"; then c_grn "udp/${WG_PORT}: listening"; else c_ylw "udp/${WG_PORT}: not listening"; fi
@@ -1879,7 +1887,7 @@ print_menu() {
     printf '\n'
     printf 'Service:    %s\n' "$svc_d"
     printf 'Autostart:  %s\n' "$auto_d"
-    printf 'Listener:   udp %s:%s (%s)\n' "$WG_LISTEN" "$WG_PORT" "$lst"
+    printf 'Listener:   udp %s (%s)\n' "$(wg_endpoint)" "$lst"
     printf 'Server:     %s\n' "$(current_server)"
 }
 
