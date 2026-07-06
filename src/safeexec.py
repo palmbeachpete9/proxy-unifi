@@ -88,6 +88,7 @@ def main():
         proc = subprocess.Popen(command, preexec_fn=prepare)
     except (OSError, subprocess.SubprocessError) as exc:
         return fail("could not start validator: %s" % exc)
+
     def forward(signum, _frame):
         try:
             os.killpg(proc.pid, signum)

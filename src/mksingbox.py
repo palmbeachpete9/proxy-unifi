@@ -17,9 +17,10 @@ import json
 import sys
 from urllib.parse import unquote
 
-from proxylib import (die, b64decode_any, flat_query, qg, safe_urlsplit,
-                      host_port, safe_port, valid_host, apply_input_file,
-                      reject_unknown_query)
+from proxylib import (die, flat_query, qg, safe_urlsplit, host_port, safe_port,
+                      valid_host, reject_unknown_query, shadowsocks_credentials,
+                      add_secret_file_arguments, load_generator_inputs,
+                      handle_common_generator_modes)
 
 
 _TLS_QUERY = {"sni", "peer", "alpn", "insecure", "allowInsecure",
@@ -63,26 +64,7 @@ def plugin_alias(name):
 # Per-protocol outbound builders -> (outbound dict, host, port)
 # --------------------------------------------------------------------------
 def parse_ss(link):
-    u = safe_urlsplit(link)
-    host, port = host_port(u)
-    method = password = None
-    if u.username is not None and host and port:
-        if u.password is not None:
-            method, password = unquote(u.username), unquote(u.password)
-        else:
-            dec = b64decode_any(u.username)
-            if dec and ":" in dec:
-                method, password = dec.split(":", 1)
-    if method is None:
-        dec = b64decode_any(u.netloc)
-        if dec and "@" in dec and ":" in dec:
-            creds, hostport = dec.rsplit("@", 1)
-            method, password = creds.split(":", 1)
-            host, p = hostport.rsplit(":", 1)
-            port = p
-    if not method or not password or not host or not port:
-        die("could not parse shadowsocks link")
-    host = valid_host(host); port = safe_port(port)
+    u, method, password, host, port = shadowsocks_credentials(link)
 
     out = {"type": "shadowsocks", "tag": "proxy", "server": host,
            "server_port": port, "method": method, "password": password}
@@ -103,16 +85,17 @@ def parse_hysteria2(link):
     host, port = host_port(u)
     if port is None:
         port = 443                       # hysteria2 default port
-    host = valid_host(host); port = safe_port(port)
+    host = valid_host(host)
+    port = safe_port(port)
     auth = unquote(u.username or "")
     if u.password:                       # hysteria2://user:pass@ -> password is after ':'
         auth = auth + ":" + unquote(u.password) if auth else unquote(u.password)
     q = flat_query(u)
     reject_unknown_query(q, _TLS_QUERY | {"obfs", "obfs-password", "obfs_password",
-                                          "pinSHA256", "pinsha256"})
+                                          "pinSHA256", "pinsha256", "mport", "ports"})
     # Reject a multi-port / port-hopping form we don't implement, rather than
     # silently connecting to a single port.
-    if qg(q, "mport") or "-" in str(qg(q, "ports")) or "," in str(qg(q, "ports")):
+    if qg(q, "mport", "ports"):
         die("hysteria2 port-hopping (mport/ports) is not supported")
     sni = qg(q, "sni", "peer") or host
     tls = _tls(sni, q, default_alpn=["h3"])
@@ -143,7 +126,8 @@ def parse_tuic(link):
     password = unquote(u.password or "")
     if not uuid or not host or not port:
         die("tuic link is missing uuid/host/port")
-    host = valid_host(host); port = safe_port(port)
+    host = valid_host(host)
+    port = safe_port(port)
     q = flat_query(u)
     reject_unknown_query(q, _TLS_QUERY | {
         "congestion_control", "congestion", "udp_relay_mode", "udp_over_stream",
@@ -195,9 +179,15 @@ def build_test_config(args):
     outbound, _, _ = parse_link(args.link)
     return {
         "log": {"level": "warn"},
-        "inbounds": [{"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": args.socks_port}],
+        "inbounds": [{
+            "type": "socks", "tag": "socks-in", "listen": "127.0.0.1",
+            "listen_port": args.socks_port,
+        }],
         "outbounds": [outbound],
-        "route": {"rules": [{"inbound": ["socks-in"], "outbound": "proxy"}], "final": "proxy"},
+        "route": {
+            "rules": [{"inbound": ["socks-in"], "outbound": "proxy"}],
+            "final": "proxy",
+        },
     }
 
 
@@ -228,8 +218,10 @@ def build_config(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Build sing-box config for the UniFi WireGuard bridge")
-    ap.add_argument("--link", default="", help="proxy share link (ss:// w/ plugin, hysteria2://, tuic://)")
+    ap = argparse.ArgumentParser(
+        description="Build sing-box config for the UniFi WireGuard bridge")
+    ap.add_argument("--link", default="",
+                    help="proxy share link (ss:// w/ plugin, hysteria2://, tuic://)")
     ap.add_argument("--port", type=int, default=0, help="UDP port for the WireGuard endpoint")
     ap.add_argument("--secret-key", default="", help="local WireGuard private key, base64")
     ap.add_argument("--peer-pubkey", default="", help="UniFi WireGuard public key, base64")
@@ -238,32 +230,15 @@ def main():
     ap.add_argument("--mtu", type=int, default=1340)
     ap.add_argument("--loglevel", default="warn")
     ap.add_argument("--print-server", action="store_true", help="print 'host<TAB>port' and exit")
-    ap.add_argument("--socks-port", type=int, default=0, help="emit a SOCKS test config on this port instead")
-    ap.add_argument("--input-file", default="",
-                    help="JSON file with secret inputs (link/secret_key/peer_pubkey), keeping "
-                         "them out of argv; values here override the matching flags")
-    ap.add_argument("--link-file", default="", help="read the proxy link from a file")
-    ap.add_argument("--secret-key-file", default="", help="read the WireGuard private key from a file")
-    ap.add_argument("--peer-pubkey-file", default="", help="read the peer public key from a file")
+    ap.add_argument("--socks-port", type=int, default=0,
+                    help="emit a SOCKS test config on this port instead")
+    add_secret_file_arguments(ap)
     args = ap.parse_args()
 
     # Secrets via a mode-600 file instead of argv (process-list safety + no ARG_MAX).
-    apply_input_file(args)
-    if not args.link:
-        die("no link provided (use --link or --input-file)")
-
-    if args.print_server:
-        _, host, port = parse_link(args.link)
-        sys.stdout.write("%s\t%s\n" % (host, port))
+    load_generator_inputs(args)
+    if handle_common_generator_modes(args, parse_link, build_test_config):
         return
-
-    if args.socks_port:
-        json.dump(build_test_config(args), sys.stdout, indent=2)
-        sys.stdout.write("\n")
-        return
-
-    if not args.secret_key or not args.peer_pubkey or not args.port:
-        die("--port, --secret-key and --peer-pubkey are required to build the bridge config")
 
     json.dump(build_config(args), sys.stdout, indent=2)
     sys.stdout.write("\n")

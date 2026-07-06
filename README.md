@@ -79,7 +79,7 @@ This package is compatible with UniFi OS 4.x or newer and is known to work on th
 | UniFi Express 7 | `UX7` |
 | UniFi Enterprise Fortress Gateway | `EFG` |
 
-> **Note:** Some UniFi OS updates (i.e. UniFi OS 5.1.12 that introduced several CVE patches) may completely wipe the script & its data from onboard memory. 
+> **Note:** Some UniFi OS updates (i.e. UniFi OS 5.1.12 that introduced several CVE patches) may completely wipe the script & its data from onboard memory.
 > Keep your proxy link saved for cases like that, and reinstall proxy-unifi.
 
 The proxy engine is chosen automatically based on the imported link:

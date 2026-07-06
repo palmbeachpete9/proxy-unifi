@@ -11,8 +11,8 @@ It parses a proxy share link into an Xray outbound and emits a full config that
 terminates a WireGuard peer (the UniFi gateway) locally and forwards everything
 out through that proxy server.
 
-Generic link-parsing helpers (URL split, host/port validation, base64, query
-helpers, the --input-file loader, die) live in proxylib.py, shared with
+Generic link-parsing helpers (URL split, host/port validation, base64, query,
+secret-file loading, Shadowsocks credentials, and die) live in proxylib.py, shared with
 mksingbox.py. Stdlib only (Python 3.7+) so it runs on the gateway as shipped.
 """
 
@@ -21,11 +21,13 @@ import ipaddress
 import json
 import re
 import sys
-from urllib.parse import urlsplit, unquote
+from urllib.parse import unquote
 
 from proxylib import (die, b64decode_any, flat_query, qg, safe_urlsplit,
-                      host_port, safe_port, valid_host, apply_input_file,
-                      reject_unknown_query)
+                      host_port, safe_port, valid_host, reject_unknown_query,
+                      shadowsocks_credentials, add_secret_file_arguments,
+                      load_generator_inputs, handle_common_generator_modes,
+                      validate_xhttp_download_settings)
 
 
 _COMMON_QUERY = {
@@ -68,27 +70,12 @@ def _q_bool(q, name):
     die("share-link option '%s' must be true/false or 1/0" % name)
 
 
-def _is_non_public(host):
-    try:
-        return not ipaddress.ip_address(host.split("%", 1)[0]).is_global
-    except ValueError:
-        low = host.rstrip(".").lower()
-        return low == "localhost" or low.endswith(
-            (".localhost", ".local", ".internal", ".lan", ".home.arpa"))
-
-
 def _validate_json_option(value, path, depth=0):
     if depth > 32:
         die("share-link option '%s' is nested too deeply" % path)
     if isinstance(value, dict):
         if path.endswith(".downloadSettings"):
-            address = value.get("address")
-            if address not in (None, ""):
-                host = valid_host(str(address))
-                if _is_non_public(host):
-                    die("XHTTP downloadSettings targets a non-public address")
-            if value.get("port") not in (None, "", 0, "0"):
-                safe_port(value["port"])
+            validate_xhttp_download_settings(value)
         for key, child in value.items():
             if not isinstance(key, str):
                 die("share-link JSON option contains a non-string key")
@@ -268,10 +255,11 @@ def build_stream(q, security, net, host):
             grpc["multiMode"] = mode == "multi"
         if "authority" in q:
             grpc["authority"] = q["authority"]
-        for qname, cname, maximum in (("user_agent", "user_agent", None),
-                                     ("idle_timeout", "idle_timeout", 86400),
-                                     ("health_check_timeout", "health_check_timeout", 86400),
-                                     ("initial_windows_size", "initial_windows_size", 16777216)):
+        for qname, cname, maximum in (
+                ("user_agent", "user_agent", None),
+                ("idle_timeout", "idle_timeout", 86400),
+                ("health_check_timeout", "health_check_timeout", 86400),
+                ("initial_windows_size", "initial_windows_size", 16777216)):
             if qname in q and q[qname] != "":
                 if qname == "user_agent":
                     if len(q[qname]) > 512 or any(ord(ch) < 0x20 or ord(ch) == 0x7f
@@ -327,7 +315,8 @@ def parse_vless(link):
         die("vless link is missing the UUID")
     if not host or not port:
         die("vless link is missing the server host/port")
-    host = valid_host(host); port = safe_port(port)
+    host = valid_host(host)
+    port = safe_port(port)
     q = flat_query(u)
     reject_unknown_query(q, _COMMON_QUERY | {"encryption", "flow"})
 
@@ -363,7 +352,8 @@ def parse_trojan(link):
         die("trojan link is missing the password")
     if not host or not port:
         die("trojan link is missing the server host/port")
-    host = valid_host(host); port = safe_port(port)
+    host = valid_host(host)
+    port = safe_port(port)
     q = flat_query(u)
     reject_unknown_query(q, _COMMON_QUERY | {"flow"})
     if qg(q, "flow"):
@@ -373,8 +363,6 @@ def parse_trojan(link):
     security = qg(q, "security", default="tls") or "tls"   # trojan implies TLS
     stream = build_stream(q, security, net, host)
 
-    # Note: xray removed the "flow" field for Trojan, so it is intentionally not
-    # emitted here even if the link carries one.
     server = {"address": host, "port": port, "password": password}
 
     outbound = {
@@ -386,38 +374,8 @@ def parse_trojan(link):
     return outbound, host, port
 
 
-def _ss_creds(link):
-    """Decode (method, password, host, port) from an ss:// link (no plugin logic)."""
-    u = safe_urlsplit(link)
-    host, port = host_port(u)
-    method = password = None
-
-    # SIP002: ss://base64(method:password)@host:port  (or plain method:password)
-    if u.username is not None and host and port:
-        if u.password is not None:
-            method, password = unquote(u.username), unquote(u.password)
-        else:
-            dec = b64decode_any(u.username)
-            if dec and ":" in dec:
-                method, password = dec.split(":", 1)
-
-    # Legacy: ss://base64(method:password@host:port)
-    if method is None:
-        dec = b64decode_any(u.netloc)
-        if dec and "@" in dec and ":" in dec:
-            creds, hostport = dec.rsplit("@", 1)
-            method, password = creds.split(":", 1)
-            host, p = hostport.rsplit(":", 1)
-            port = p
-
-    if not method or not password or not host or not port:
-        die("could not parse shadowsocks link")
-    return method, password, valid_host(host), safe_port(port)
-
-
-def ss_plugin_name(link):
-    """Return the SIP003 plugin name for an ss:// link, or None if it has no plugin."""
-    query = flat_query(urlsplit(link))
+def _ss_plugin_name(parsed):
+    query = flat_query(parsed)
     reject_unknown_query(query, {"plugin"})
     raw = qg(query, "plugin")
     if not raw:
@@ -426,10 +384,15 @@ def ss_plugin_name(link):
     return raw.split(";", 1)[0] if ";" in raw else raw
 
 
+def ss_plugin_name(link):
+    """Return the SIP003 plugin name for an ss:// link, or None if it has no plugin."""
+    return _ss_plugin_name(safe_urlsplit(link))
+
+
 def parse_ss(link):
-    method, password, host, port = _ss_creds(link)
+    parsed, method, password, host, port = shadowsocks_credentials(link)
     # SIP003-plugin Shadowsocks is handled by sing-box, never by xray.
-    if ss_plugin_name(link):
+    if _ss_plugin_name(parsed):
         die("shadowsocks SIP003 plugin links are handled by sing-box, not xray")
     outbound = {
         "tag": "proxy",
@@ -442,7 +405,8 @@ def parse_ss(link):
 
 
 def _vmess_outbound(host, port, uid, aid, scy, security, net, q):
-    host = valid_host(host); port = safe_port(port)
+    host = valid_host(host)
+    port = safe_port(port)
     if not uid:
         die("vmess link is missing the UUID")
     stream = build_stream(q, security, net, host)
@@ -473,7 +437,7 @@ def parse_vmess(link):
         if not host or not port:
             die("vmess link is missing the server host/port")
         q = flat_query(u)
-        reject_unknown_query(q, _COMMON_QUERY | {"aid", "scy", "encryption", "flow"})
+        reject_unknown_query(q, _COMMON_QUERY | {"aid", "scy", "encryption"})
         net = qg(q, "type", "net", default="tcp") or "tcp"
         security = qg(q, "security", default="none") or "none"
         try:
@@ -607,36 +571,34 @@ def build_config(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Build Xray config for the UniFi WireGuard bridge")
-    ap.add_argument("--link", default="", help="proxy share link (vless:// / vmess:// / trojan:// / ss://)")
+    ap = argparse.ArgumentParser(
+        description="Build Xray config for the UniFi WireGuard bridge")
+    ap.add_argument("--link", default="",
+                    help="proxy share link (vless:// / vmess:// / trojan:// / ss://)")
     ap.add_argument("--listen", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=0, help="UDP port for the WireGuard inbound")
     ap.add_argument("--secret-key", default="", help="Xray (server) WireGuard private key, base64")
     ap.add_argument("--peer-pubkey", default="", help="UniFi (client) WireGuard public key, base64")
     ap.add_argument("--address", default="10.7.0.1/32", help="Xray tunnel interface address(es)")
-    ap.add_argument("--peer-allowed", default="0.0.0.0/0,::/0", help="allowedIPs accepted from the UniFi peer")
+    ap.add_argument("--peer-allowed", default="0.0.0.0/0,::/0",
+                    help="allowedIPs accepted from the UniFi peer")
     ap.add_argument("--mtu", type=int, default=1340)
     ap.add_argument("--keepalive", type=int, default=25)
     ap.add_argument("--dns", default="", help="comma-separated inner DNS servers (optional)")
     ap.add_argument("--loglevel", default="warning")
-    ap.add_argument("--socks-port", type=int, default=0, help="emit a SOCKS test config on this port instead")
-    ap.add_argument("--print-server", action="store_true", help="print 'host<TAB>port' of the server and exit")
+    ap.add_argument("--socks-port", type=int, default=0,
+                    help="emit a SOCKS test config on this port instead")
+    ap.add_argument("--print-server", action="store_true",
+                    help="print 'host<TAB>port' of the server and exit")
     ap.add_argument("--print-plugin", action="store_true",
                     help="print the SIP003 plugin name for an ss:// link, else nothing")
-    ap.add_argument("--input-file", default="",
-                    help="JSON file with secret inputs (link/secret_key/peer_pubkey) so they "
-                         "are not exposed in argv; values here override the matching flags")
-    ap.add_argument("--link-file", default="", help="read the proxy link from a file")
-    ap.add_argument("--secret-key-file", default="", help="read the WireGuard private key from a file")
-    ap.add_argument("--peer-pubkey-file", default="", help="read the peer public key from a file")
+    add_secret_file_arguments(ap)
     args = ap.parse_args()
 
     # Secret inputs (proxy link + WireGuard private key) are read from a mode-600
     # file instead of argv to keep them out of the process list, and to avoid the
     # ARG_MAX limit on very long links.
-    apply_input_file(args)
-    if not args.link:
-        die("no link provided (use --link or --input-file)")
+    load_generator_inputs(args)
 
     if args.print_plugin:
         if args.link.strip().lower().startswith("ss://"):
@@ -645,18 +607,8 @@ def main():
                 sys.stdout.write("%s\n" % name)
         return
 
-    if args.print_server:
-        _, host, port = parse_link(args.link)
-        sys.stdout.write("%s\t%s\n" % (host, port))
+    if handle_common_generator_modes(args, parse_link, build_test_config):
         return
-
-    if args.socks_port:
-        json.dump(build_test_config(args), sys.stdout, indent=2)
-        sys.stdout.write("\n")
-        return
-
-    if not args.secret_key or not args.peer_pubkey or not args.port:
-        die("--port, --secret-key and --peer-pubkey are required to build the bridge config")
 
     for a in args.address.split(","):
         a = a.strip()
