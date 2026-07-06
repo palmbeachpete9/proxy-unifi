@@ -539,8 +539,9 @@ def _validate_fetch_url(url):
 
 def _validate_header_value(value, label, maximum):
     if not isinstance(value, str) or len(value) > maximum \
-            or _CONTROL_RE.search(value):
-        die("%s contains invalid header characters" % label)
+            or _CONTROL_RE.search(value) or any(ord(ch) < 0x20 or ord(ch) > 0x7e
+                                                for ch in value):
+        die("%s must contain printable ASCII only" % label)
     return value
 
 

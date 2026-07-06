@@ -116,7 +116,12 @@ load_settings() {
             SUB_REFRESH_HOURS)
                 if _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 8760 ]; then SUB_REFRESH_HOURS="$_value"; fi ;;
             SUB_USER_AGENT)
-                case "$_value" in ""|*\"*|*\\*|*[![:print:]]*) : ;; *) SUB_USER_AGENT="$_value" ;; esac ;;
+                case "$_value" in ""|*\"*|*\\*) : ;;
+                    *) if [ "${#_value}" -le 120 ] \
+                          && ! LC_ALL=C printf '%s' "$_value" | grep -q '[^ -~]'; then
+                           SUB_USER_AGENT="$_value"
+                       fi ;;
+                esac ;;
         esac
     done < "$SETTINGS"
 }
@@ -1504,7 +1509,7 @@ cmd_set() {
             # The value is rendered into the UniFi WireGuard client's "DNS =" field,
             # which must be IP addresses (not DoH URLs / hostnames). Validate each
             # comma-separated entry as an IPv4/IPv6 literal; this also blocks any
-            # shell-metachar injection (settings.env is sourced).
+            # shell-metachar/control-byte injection before settings.env is rendered.
             py - "$val" <<'PYEOF' || fatal "DNS must be a comma-separated list of IP addresses (e.g. 8.8.8.8,1.1.1.1)"
 import ipaddress, sys
 items = [x for x in sys.argv[1].split(",") if x]
@@ -2223,8 +2228,14 @@ sub_set_interval() {
 }
 
 sub_set_user_agent() {
-    case "$1" in ""|*\"*|*\\*|*[![:print:]]*) fatal "User-Agent contains unsafe characters" ;; esac
-    [ "${#1}" -le 120 ] || fatal "User-Agent is too long"
+    py - "$1" <<'PYEOF' || fatal "User-Agent must contain printable ASCII only and cannot include quotes or backslashes"
+import sys
+value = sys.argv[1]
+if not value or len(value) > 120:
+    raise SystemExit(1)
+if any(ord(ch) < 0x20 or ord(ch) > 0x7e or ch in '"\\' for ch in value):
+    raise SystemExit(1)
+PYEOF
     txn_begin
     SUB_USER_AGENT="$1"; save_settings
     txn_commit
