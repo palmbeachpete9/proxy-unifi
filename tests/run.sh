@@ -78,20 +78,29 @@ static_tests() {
     {
         # shellcheck disable=SC2016 # $1 belongs to the generated helper script.
         echo '_uint() { case "$1" in ""|*[!0-9]*) return 1;; *) return 0;; esac; }'
+        echo 'SUB_USER_AGENT_DEFAULT="Happ/2.0"'
+        echo 'SUB_USER_AGENT_LEGACY_DEFAULT="proxy-unifi/1.1"'
         sed -n '/^load_settings() {/,/^}/p' "$SRC/proxy-unifi"
-        cat <<'SH'
-SETTINGS="$1"; SUB_USER_AGENT="proxy-unifi/1.1"
+    } > "$_ud/ua-lib.sh"
+    cat > "$_ud/ua-check.sh" <<'SH'
+. "$1"
+SETTINGS="$2"; SUB_USER_AGENT="$SUB_USER_AGENT_DEFAULT"
 load_settings
-[ "$SUB_USER_AGENT" = "proxy-unifi/1.1" ]
+[ "$SUB_USER_AGENT" = "$3" ]
 SH
-    } > "$_ud/ua-settings.sh"
     python3 - "$_ud/settings" <<'PY'
 import sys
 value = "".join(chr(x) for x in (0x43a, 0x438, 0x440, 0x438, 0x43b, 0x43b, 0x438, 0x446, 0x430))
 open(sys.argv[1], "w", encoding="utf-8").write('SUB_USER_AGENT="%s"\n' % value)
 PY
-    if sh "$_ud/ua-settings.sh" "$_ud/settings"; then ok "settings User-Agent rejects non-ASCII"
+    if sh "$_ud/ua-check.sh" "$_ud/ua-lib.sh" "$_ud/settings" "Happ/2.0"; then ok "settings User-Agent rejects non-ASCII"
     else bad "settings User-Agent rejects non-ASCII"; fi
+    printf '%s\n' 'SUB_USER_AGENT="proxy-unifi/1.1"' > "$_ud/settings"
+    if sh "$_ud/ua-check.sh" "$_ud/ua-lib.sh" "$_ud/settings" "Happ/2.0"; then ok "settings User-Agent migrates legacy default"
+    else bad "settings User-Agent migrates legacy default"; fi
+    printf '%s\n' 'SUB_USER_AGENT="Streisand/1.0"' > "$_ud/settings"
+    if sh "$_ud/ua-check.sh" "$_ud/ua-lib.sh" "$_ud/settings" "Streisand/1.0"; then ok "settings User-Agent preserves custom value"
+    else bad "settings User-Agent preserves custom value"; fi
     rm -rf "$_ud"
 
     _ed="$(mktemp -d)"

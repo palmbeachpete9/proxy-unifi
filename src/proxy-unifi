@@ -72,7 +72,9 @@ PING_MODE="get"
 PING_URL="https://www.gstatic.com/generate_204"
 PING_TIMEOUT="5"
 SUB_REFRESH_HOURS="6"
-SUB_USER_AGENT="proxy-unifi/1.1"
+SUB_USER_AGENT_DEFAULT="Happ/2.0"
+SUB_USER_AGENT_LEGACY_DEFAULT="proxy-unifi/1.1"
+SUB_USER_AGENT="$SUB_USER_AGENT_DEFAULT"
 TAB="$(printf '\t')"
 
 # --------------------------------------------------------------------------
@@ -116,7 +118,14 @@ load_settings() {
             SUB_REFRESH_HOURS)
                 if _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 8760 ]; then SUB_REFRESH_HOURS="$_value"; fi ;;
             SUB_USER_AGENT)
-                case "$_value" in ""|*\"*|*\\*) : ;;
+                case "$_value" in
+                    "$SUB_USER_AGENT_LEGACY_DEFAULT")
+                        # The old neutral default makes Happ/Remnawave-style
+                        # providers return generic ss:// rows instead of JSON.
+                        # Treat it as unset during upgrades, while preserving
+                        # any user-chosen compatibility UA.
+                        : ;;
+                    ""|*\"*|*\\*) : ;;
                     *) if [ "${#_value}" -le 120 ] \
                           && ! LC_ALL=C printf '%s' "$_value" | grep -q '[^ -~]'; then
                            SUB_USER_AGENT="$_value"
