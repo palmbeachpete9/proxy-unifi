@@ -95,32 +95,57 @@ def _b64(text):
         return None
 
 
-def _repair_mojibake(value):
-    """Repair only high-confidence UTF-8-as-Latin-1 corruption.
+_CP1252_MOJIBAKE_CHARS = set(
+    "\u20ac\u201a\u0192\u201e\u2026\u2020\u2021\u02c6\u2030\u0160"
+    "\u2039\u0152\u017D\u2018\u2019\u201C\u201D\u2022\u2013\u2014"
+    "\u02dc\u2122\u0161\u203A\u0153\u017E\u0178")
 
-    Legitimate Latin-1 text must survive. We therefore try the reversal only
-    when common mojibake markers are present and the result contains a strong
-    signal (emoji/non-Latin text) while removing those markers.
+
+def _repair_mojibake(value):
+    """Repair only high-confidence UTF-8 mojibake.
+
+    Providers and terminals commonly corrupt UTF-8 either as ISO-8859-1
+    (``ð\x9f...``) or Windows-1252 (``ðŸ...``). Legitimate Latin text must
+    survive, so reversal is attempted only when common mojibake markers are
+    present and the decoded result has a strong Unicode signal while removing
+    those markers.
     """
-    if not any(x in value for x in ("Ã", "Â", "ð", "â€", "Ð", "Ñ")):
+    markers = ("Ã", "Â", "ð", "â", "Ð", "Ñ", "Ÿ", "‡", "€", "œ")
+    if not any(x in value for x in markers):
         return value
-    markers = ("Ã", "Â", "ð", "â", "Ð", "Ñ")
 
     def repair_part(part):
         if not any(x in part for x in markers):
             return part
-        try:
-            candidate = part.encode("latin-1").decode("utf-8")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            return part
         old_markers = sum(part.count(x) for x in markers)
-        new_markers = sum(candidate.count(x) for x in markers)
-        strong = any(ord(ch) > 0x2FF for ch in candidate)
-        return candidate if strong and new_markers < old_markers else part
+        for enc in ("latin-1", "cp1252"):
+            try:
+                candidate = part.encode(enc).decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                continue
+            new_markers = sum(candidate.count(x) for x in markers)
+            strong = any(ord(ch) > 0x2FF for ch in candidate)
+            if strong and new_markers < old_markers:
+                return candidate
+        return part
+
+    def flush(buf, out):
+        if buf:
+            out.append(repair_part("".join(buf)))
+            del buf[:]
+
     repaired = repair_part(value)
     if repaired != value:
         return repaired
-    return re.sub(r"[\x00-\xff]+", lambda match: repair_part(match.group(0)), value)
+    out, buf = [], []
+    for ch in value:
+        if ord(ch) <= 0xff or ch in _CP1252_MOJIBAKE_CHARS:
+            buf.append(ch)
+        else:
+            flush(buf, out)
+            out.append(ch)
+    flush(buf, out)
+    return "".join(out)
 
 
 def _display_width(ch):
@@ -283,6 +308,104 @@ def _ss_engine(parsed):
     return "", "unsupported SIP003 plugin"
 
 
+def _profile_catalog_node(prof, label_hint="", identity_salt="",
+                          prefer_label_hint=False):
+    """Build one selectable catalog node from an Xray JSON profile dict."""
+    if not isinstance(prof, dict):
+        return None
+    if nested_too_deep(prof, MAX_JSON_DEPTH):
+        return None
+    raw_json = json.dumps(prof, ensure_ascii=False, separators=(",", ":"))
+    if len(raw_json) > MAX_PROFILE:
+        return None
+    identity = dict(prof)
+    identity.pop("remarks", None)
+    canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"))
+    if identity_salt:
+        canonical += "\0" + identity_salt
+    remarks = prof.get("remarks")
+    profile_label = remarks if isinstance(remarks, str) else ""
+    if prefer_label_hint and label_hint:
+        label = label_hint
+    else:
+        label = profile_label or label_hint
+    recognized, reason, members, strat, _ = _classify_profile(prof)
+    return {
+        "kind": "pool", "scheme": "json", "label": label,
+        "server": ("%d nodes, %s" % (members, strat)) if members else "profile",
+        "recognized": recognized, "engine": "xraypool", "reason": reason,
+        "members": members, "strategy": strat,
+        "id": hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest(),
+        "profile": raw_json,
+    }
+
+
+def _json_profile_from_text(text):
+    text = text.strip()
+    if text[:1] not in ("{", "["):
+        return None
+    try:
+        data = json.loads(text)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
+        return data[0]
+    return None
+
+
+def _profile_text_candidates(value):
+    if value in (None, ""):
+        return []
+    raw = unquote(str(value)).strip()
+    if not raw:
+        return []
+    out = [raw]
+    first = _b64(raw)
+    if first:
+        out.append(first.strip())
+        second = _b64(first)
+        if second:
+            out.append(second.strip())
+    return out
+
+
+def _json_profile_from_ss_wrapper(link, parsed, label_hint):
+    """Detect subscription rows that disguise an Xray profile as ss://.
+
+    Some providers emit ``ss://payload@host:port#name`` wrappers where the
+    payload is an encoded Xray JSON profile. Treating those rows as ordinary
+    Shadowsocks makes selection import the wrong thing, so probe only fields
+    that can legally carry opaque credentials and require valid profile JSON.
+    """
+    if parsed is None:
+        return None
+    fields = [parsed.username, parsed.password, parsed.path.lstrip("/")]
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key in ("profile", "config", "json", "payload", "data", "link"):
+            fields.append(value)
+    decoded_legacy = _b64(parsed.netloc)
+    if decoded_legacy:
+        fields.append(decoded_legacy)
+        credentials = decoded_legacy.rsplit("@", 1)[0]
+        fields.append(credentials)
+        if ":" in credentials:
+            fields.append(credentials.split(":", 1)[1])
+    seen = set()
+    for field in fields:
+        for text in _profile_text_candidates(field):
+            if text in seen:
+                continue
+            seen.add(text)
+            prof = _json_profile_from_text(text)
+            if prof is None:
+                continue
+            return _profile_catalog_node(prof, label_hint, link, True)
+    return None
+
+
 def node_from_link(link):
     """Return a node dict for a recognized proxy URI, or None to skip the line.
 
@@ -312,6 +435,13 @@ def node_from_link(link):
             parsed = urlsplit(link)
         except ValueError:
             parsed = None
+    if scheme == "ss":
+        label = ""
+        if parsed is not None and parsed.fragment:
+            label = unquote(parsed.fragment)
+        profile_node = _json_profile_from_ss_wrapper(link, parsed, label)
+        if profile_node is not None:
+            return profile_node
     node = {"scheme": scheme, "link": link, "label": "", "server": "",
             "recognized": True, "engine": "", "reason": ""}
     try:
@@ -340,7 +470,7 @@ def node_from_link(link):
     except Exception:
         node["recognized"] = False
         node["reason"] = "unparseable node"
-    # stable id: full sha256 of the canonical link (without display fragment)
+    # stable id: full sha256 of the canonical link, including display identity
     canonical = _canonical_link(link, parsed, legacy_vmess)
     node["id"] = hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()
     return node
