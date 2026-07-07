@@ -421,6 +421,16 @@ assert mksub.clean("🇺🇸 США", 40) == "🇺🇸 США"
 assert mksub.clean("München España Montréal", 80) == "München España Montréal"
 full = "🇩🇪🎯".encode("utf-8").decode("latin-1") + " Автовыбор"     # full mojibake
 assert "🇩🇪🎯" in mksub.clean(full, 80), mksub.clean(full, 80)
+old_safe = os.environ.get("PROXY_UNIFI_TERMINAL_SAFE_EMOJI")
+os.environ["PROXY_UNIFI_TERMINAL_SAFE_EMOJI"] = "1"
+try:
+    assert mksub.clean("🇩🇪🛜 Москва", 80) == "[DE] Wi-Fi Москва"
+    assert mksub.clean("🇺🇸⭐ VPN | США", 80) == "[US] ⭐ VPN | США"
+finally:
+    if old_safe is None:
+        os.environ.pop("PROXY_UNIFI_TERMINAL_SAFE_EMOJI", None)
+    else:
+        os.environ["PROXY_UNIFI_TERMINAL_SAFE_EMOJI"] = old_safe
 assert mksub.clean("日本 经由", 40) == "日本 经由"                     # CJK kept
 assert mksub.clean("plain ascii", 40) == "plain ascii"
 # compressed output is capped after inflation, not only before it
@@ -447,6 +457,14 @@ assert pcat["meta"]["format"] == "json" and pcat["meta"]["count"] == 1, pcat
 pn = pcat["nodes"][0]
 assert pn["kind"] == "pool" and pn["recognized"] and pn["members"] == 2 and pn["strategy"] == "leastLoad", pn
 assert json.loads(pn["profile"])["remarks"] == "DE Auto"
+same_a = dict(prof); same_a["remarks"] = "⬆️ Автовыбор по алгоритму ⬆️"
+same_b = json.loads(json.dumps(same_a, sort_keys=True))
+same_cat = mksub.process_body(json.dumps([same_a, same_b]).encode())
+assert same_cat["meta"]["count"] == 1, same_cat
+same_b["remarks"] = "⬇️ Выбор ближайшего города ⬇️"
+same_cat = mksub.process_body(json.dumps([same_a, same_b]).encode())
+assert same_cat["meta"]["count"] == 2, same_cat
+assert len({node["id"] for node in same_cat["nodes"]}) == 2
 # Some providers wrap a full Xray JSON profile inside an ss:// row. The catalog
 # must expose that row as a JSON pool, not as an ordinary Shadowsocks link.
 encoded_prof = base64.urlsafe_b64encode(json.dumps(prof).encode()).decode().rstrip("=")
@@ -509,12 +527,15 @@ for proto in ("trojan", "shadowsocks"):
 # Current direct settings.address shape is also classified and safety-checked.
 http_shape={"outbounds":[{"protocol":"http","tag":"proxy","settings":{"address":"public.example","port":3128}}]}
 assert mksub._classify_profile(http_shape)[0] is True
-# cosmetic remarks/key ordering do not change JSON profile identity
+# JSON profile key ordering does not change identity, but provider remarks do.
 p1=dict(prof); p1["remarks"]="one"
-p2=json.loads(json.dumps(p1,sort_keys=True)); p2["remarks"]="two"
+p2=json.loads(json.dumps(p1,sort_keys=True))
 c1=mksub.process_body(json.dumps([p1]).encode())["nodes"][0]["id"]
 c2=mksub.process_body(json.dumps([p2]).encode())["nodes"][0]["id"]
 assert c1==c2,(c1,c2)
+p2["remarks"]="two"
+c3=mksub.process_body(json.dumps([p2]).encode())["nodes"][0]["id"]
+assert c1!=c3,(c1,c3)
 # malformed shapes are rejected cleanly, never traversed into a TypeError
 badshape=json.loads(json.dumps(prof)); badshape["routing"]["rules"]=None
 assert mksub._classify_profile(badshape)[0] is False
