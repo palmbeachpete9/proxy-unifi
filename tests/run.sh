@@ -368,6 +368,7 @@ cat = mksub.process_body(body([
 assert cat["schema"] == 2, cat
 assert cat["meta"]["count"] == 3, cat
 assert cat["meta"]["supported"] == 2, cat
+assert cat["nodes"][2]["reason"] == "unsupported SIP003 plugin", cat
 assert all(len(n["id"]) == 64 for n in cat["nodes"])
 # uppercase scheme normalized
 n = mksub.node_from_link("VLESS://u@h:443#x"); assert n["link"].startswith("vless://"), n
@@ -389,6 +390,8 @@ cat_same = mksub.process_body(body(same_server))
 assert cat_same["meta"]["count"] == 8, cat_same
 assert len({n["id"] for n in cat_same["nodes"]}) == 8
 mojibake_de = bytes.fromhex("f09f87a9f09f87aa").decode("latin-1") + "⭐ VPN | Германия ♾️"
+assert mksub.clean(mojibake_de, 80).startswith("🇩🇪⭐"), mksub.clean(mojibake_de, 80)
+mojibake_de = bytes.fromhex("f09f87a9f09f87aa").decode("cp1252") + "⭐ VPN | Германия ♾️"
 assert mksub.clean(mojibake_de, 80).startswith("🇩🇪⭐"), mksub.clean(mojibake_de, 80)
 # control bytes / oversize / dup dropped
 assert mksub.node_from_link("vless://u@h:443\x00evil") is None
@@ -435,6 +438,22 @@ assert pcat["meta"]["format"] == "json" and pcat["meta"]["count"] == 1, pcat
 pn = pcat["nodes"][0]
 assert pn["kind"] == "pool" and pn["recognized"] and pn["members"] == 2 and pn["strategy"] == "leastLoad", pn
 assert json.loads(pn["profile"])["remarks"] == "DE Auto"
+# Some providers wrap a full Xray JSON profile inside an ss:// row. The catalog
+# must expose that row as a JSON pool, not as an ordinary Shadowsocks link.
+encoded_prof = base64.urlsafe_b64encode(json.dumps(prof).encode()).decode().rstrip("=")
+wrapped = "ss://%s@max.ru:1234#%s" % (encoded_prof, mojibake_de)
+wn = mksub.node_from_link(wrapped)
+assert wn["kind"] == "pool" and wn["scheme"] == "json" and wn["members"] == 2, wn
+assert wn["engine"] == "xraypool" and json.loads(wn["profile"])["remarks"] == "DE Auto"
+wcat = mksub.process_body(body([wrapped]))
+assert wcat["meta"]["format"] == "links" and wcat["nodes"][0]["kind"] == "pool", wcat
+with contextlib.redirect_stdout(io.StringIO()) as output:
+    with tempfile.TemporaryDirectory() as tmp:
+        catalog=os.path.join(tmp,"wrapped-catalog")
+        with open(catalog,"w") as f: json.dump(wcat,f)
+        mksub.cmd_render(types.SimpleNamespace(file=catalog,selected=""))
+rendered = output.getvalue()
+assert "json" in rendered and "🇩🇪⭐" in rendered, rendered
 # Selection extraction loads the catalog once and emits metadata + payload.
 with tempfile.TemporaryDirectory() as tmp:
     catalog=os.path.join(tmp,"catalog"); meta=os.path.join(tmp,"meta"); payload=os.path.join(tmp,"payload")
