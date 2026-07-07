@@ -12,6 +12,7 @@ set -eu
 umask 077
 
 REPO_RAW="${PROXY_UNIFI_RAW:-https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/main}"
+PROJECT_REPO="palmbeachpete9/proxy-unifi"
 ROOT="/data/proxy-unifi"
 BIN_DIR="$ROOT/bin"
 ONBOOT_DIR="/data/on_boot.d"
@@ -152,6 +153,8 @@ PY
 )"
         [ -n "$_sha" ] || { echo "could not resolve immutable project commit" >&2; return 1; }
         printf '%s\n' "https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/${_sha}" > "$WORKDIR/repo-raw"
+        printf '%s\n' "https://cdn.jsdelivr.net/gh/palmbeachpete9/proxy-unifi@${_sha}" > "$WORKDIR/repo-cdn"
+        printf '%s\n' "$_sha" > "$WORKDIR/repo-sha"
     fi
 }
 
@@ -162,22 +165,88 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || echo ""
 # otherwise pull a STALE script (this is exactly what made an emoji fix look
 # like it "didn't apply"). A unique query string is a fresh cache key => fresh file.
 CACHEBUST="$(date +%s 2>/dev/null || echo $$)"
+SOURCE_DIR=""
+
+prepare_source_bundle() {
+    [ -z "${PROXY_UNIFI_RAW:-}" ] || return 1
+    [ -s "$WORKDIR/repo-sha" ] || return 1
+    _sha="$(cat "$WORKDIR/repo-sha")"
+    case "$_sha" in ""|*[!0-9a-f]*) return 1 ;; esac
+    [ "${#_sha}" = 40 ] || return 1
+    _bundle="$WORKDIR/source.tar.gz"
+    _source="$WORKDIR/source"
+    if [ -d "$_source/src" ]; then SOURCE_DIR="$_source"; return 0; fi
+    bounded_curl "https://codeload.github.com/${PROJECT_REPO}/tar.gz/${_sha}" \
+        "$_bundle" 10485760 || return 1
+    rm -rf "$_source"
+    mkdir -p "$_source/src" || return 1
+    "$PYTHON" - "$_bundle" "$_source/src" <<'PY' || { rm -rf "$_source"; return 1; }
+import os
+import shutil
+import sys
+import tarfile
+
+archive_path, outdir = sys.argv[1], sys.argv[2]
+needed = set("proxy-unifi mkxray.py mksingbox.py mksub.py mkjson.py proxylib.py "
+             "safeexec.py on_boot.sh".split())
+found = set()
+limit = 2 * 1024 * 1024
+root = os.path.realpath(outdir)
+with tarfile.open(archive_path, "r:gz") as archive:
+    for member in archive.getmembers():
+        parts = member.name.split("/")
+        if len(parts) != 3 or parts[1] != "src" or parts[2] not in needed:
+            continue
+        if member.issym() or member.islnk() or member.isdev() or member.isfifo() \
+                or not member.isfile():
+            raise SystemExit("unsafe archive member")
+        if member.size < 0 or member.size > limit:
+            raise SystemExit("archive member too large")
+        dest = os.path.realpath(os.path.join(outdir, parts[2]))
+        if dest != root and not dest.startswith(root + os.sep):
+            raise SystemExit("unsafe archive path")
+        source = archive.extractfile(member)
+        if source is None:
+            raise SystemExit("could not extract archive member")
+        with source, open(dest, "wb") as output:
+            shutil.copyfileobj(source, output, 1024 * 1024)
+        found.add(parts[2])
+missing = sorted(needed - found)
+if missing:
+    raise SystemExit("archive missing: " + ", ".join(missing))
+PY
+    SOURCE_DIR="$_source"
+}
+
+fetch_remote() {
+    _base="$1"; _src="$2"; _dst="$3"; _mode="${4:-0755}"
+    if have curl; then
+        bounded_curl "$_base/src/$_src?cb=$CACHEBUST" "$_dst" 2097152 \
+            && chmod "$_mode" "$_dst"
+    elif have wget; then
+        ( ulimit -f 4096 2>/dev/null || exit 1
+          wget -q --timeout=30 --tries=3 -O "$_dst" "$_base/src/$_src?cb=$CACHEBUST" ) \
+            && [ "$(wc -c < "$_dst" | tr -d ' ')" -le 2097152 ] \
+            && chmod "$_mode" "$_dst"
+    else
+        return 1
+    fi
+}
+
 fetch() {
     # fetch <relative-path> <dest> [mode]
     src="$1"; dst="$2"
     _raw="$REPO_RAW"; [ -s "$WORKDIR/repo-raw" ] && _raw="$(cat "$WORKDIR/repo-raw")"
     if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/src/$src" ]; then
         install -m "${3:-0755}" "$SCRIPT_DIR/src/$src" "$dst"
-    elif have curl; then
-        bounded_curl "$_raw/src/$src?cb=$CACHEBUST" "$dst" 2097152 \
-            && chmod "${3:-0755}" "$dst"
-    elif have wget; then
-        ( ulimit -f 4096 2>/dev/null || exit 1
-          wget -q --timeout=30 --tries=3 -O "$dst" "$_raw/src/$src?cb=$CACHEBUST" ) \
-            && [ "$(wc -c < "$dst" | tr -d ' ')" -le 2097152 ] \
-            && chmod "${3:-0755}" "$dst"
+    elif [ -n "$SOURCE_DIR" ] && [ -f "$SOURCE_DIR/src/$src" ]; then
+        install -m "${3:-0755}" "$SOURCE_DIR/src/$src" "$dst"
+    elif [ -s "$WORKDIR/repo-cdn" ] && fetch_remote "$(cat "$WORKDIR/repo-cdn")" "$src" "$dst" "${3:-0755}"; then
+        :
+    elif fetch_remote "$_raw" "$src" "$dst" "${3:-0755}"; then
+        :
     else
-        echo "need curl or wget" >&2; return 1
+        echo "need curl/wget or a usable source archive" >&2; return 1
     fi
 }
 
@@ -259,6 +328,10 @@ EOF
 _install_files_locked() {
     mkdir -p "$BIN_DIR"
     _stage="$(mktemp -d "$WORKDIR/stage.XXXXXX")" || { echo "could not stage" >&2; return 1; }
+    if [ -z "${PROXY_UNIFI_RAW:-}" ]; then
+        prepare_source_bundle \
+            || echo "project source archive unavailable; falling back to per-file downloads" >&2
+    fi
     for f in proxy-unifi mkxray.py mksingbox.py mksub.py mkjson.py proxylib.py safeexec.py on_boot.sh; do
         fetch "$f" "$_stage/$f" 0755 || { echo "fetch failed: $f" >&2; return 1; }
         [ -s "$_stage/$f" ] || { echo "empty file fetched: $f" >&2; return 1; }
