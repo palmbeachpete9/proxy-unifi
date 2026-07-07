@@ -108,6 +108,27 @@ SH
     else bad "CLI WireGuard endpoint formats IPv6"; fi
     rm -rf "$_ed"
 
+    _dd="$(mktemp -d)"
+    {
+        cat <<'SH'
+download_to() {
+    case "$1" in
+        *good*) printf ok > "$2"; return 0 ;;
+        *) return 1 ;;
+    esac
+}
+SH
+        sed -n '/^DOWNLOAD_URL_USED=/,/^}/p' "$SRC/proxy-unifi"
+        cat <<'SH'
+download_any_to "$1/out" 10 https://bad.example/file https://good.example/file || exit 1
+[ "$DOWNLOAD_URL_USED" = "https://good.example/file" ] || exit 1
+[ "$(cat "$1/out")" = ok ]
+SH
+    } > "$_dd/download-any.sh"
+    if sh "$_dd/download-any.sh" "$_dd"; then ok "core downloader tries fallback URL"
+    else bad "core downloader tries fallback URL"; fi
+    rm -rf "$_dd"
+
     # The installer-wide rollback must restore scripts, both cores, and geo
     # assets from one retained promotion backup.
     _id="$(mktemp -d)"
