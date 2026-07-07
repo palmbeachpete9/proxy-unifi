@@ -672,12 +672,12 @@ download_to() {
     _d_url="$1"; _d_dst="$2"; _d_max="${3:-419430400}"
     if have curl; then
         ( ulimit -f $(((_d_max + 511) / 512)) 2>/dev/null || exit 1
-          curl -fsSL --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 2 \
+          curl -fsSL --connect-timeout 30 --max-time 600 --retry 6 --retry-delay 3 \
               --max-filesize "$_d_max" "$_d_url" -o "$_d_dst" ) \
             || { rm -f "$_d_dst"; return 1; }
     elif have wget; then
         ( ulimit -f $(((_d_max + 511) / 512)) 2>/dev/null || exit 1
-          wget -q --timeout=30 --tries=3 -O "$_d_dst" "$_d_url" ) \
+          wget -q --timeout=45 --tries=6 -O "$_d_dst" "$_d_url" ) \
             || { rm -f "$_d_dst"; return 1; }
     else
         return 1
@@ -687,12 +687,26 @@ download_to() {
     [ "$_d_size" -le "$_d_max" ] || { rm -f "$_d_dst"; return 1; }
 }
 
+DOWNLOAD_URL_USED=""
+download_any_to() {
+    _da_dst="$1"; _da_max="$2"; shift 2
+    DOWNLOAD_URL_USED=""
+    for _da_url in "$@"; do
+        [ -n "$_da_url" ] || continue
+        if download_to "$_da_url" "$_da_dst" "$_da_max"; then
+            DOWNLOAD_URL_USED="$_da_url"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Resolve the latest tag from a .../releases/latest redirect with the available tool.
 resolve_latest_tag() {
     if have curl; then
-        curl -fsSLI --connect-timeout 15 --max-time 60 --retry 3 "$1/latest" 2>/dev/null
+        curl -fsSLI --connect-timeout 30 --max-time 120 --retry 5 --retry-delay 3 "$1/latest" 2>/dev/null
     elif have wget; then
-        wget -qS --timeout=30 --tries=3 --max-redirect=0 "$1/latest" -O /dev/null 2>&1
+        wget -qS --timeout=45 --tries=5 --max-redirect=0 "$1/latest" -O /dev/null 2>&1
     fi | awk -F'/tag/' '
         tolower($0) ~ /location:/ {
             value=$2; sub(/[[:space:]\r].*$/, "", value); tag=value
@@ -814,14 +828,20 @@ ensure_singbox() {
 cmd_install_binary() {
     mkdir -p "$BIN_DIR"
     slug="$(arch_slug)"
-    url="${XRAY_RELEASE_BASE}/Xray-linux-${slug}.zip"
+    _tag="$(resolve_latest_tag "https://github.com/XTLS/Xray-core/releases" 2>/dev/null || true)"
+    _asset="Xray-linux-${slug}.zip"
+    _latest="${XRAY_RELEASE_BASE}/${_asset}"
+    _pinned=""
+    [ -n "$_tag" ] && _pinned="https://github.com/XTLS/Xray-core/releases/download/${_tag}/${_asset}"
     ensure_run_dir
     tmp="$RUN_DIR/xray"; mkdir -p "$tmp"
-    info "downloading xray-core ($slug) ..."
-    download_to "$url" "$tmp/xray.zip" 367001600 || fatal "download failed: $url"
+    info "downloading xray-core${_tag:+ $_tag} ($slug) ..."
+    download_any_to "$tmp/xray.zip" 367001600 "$_pinned" "$_latest" \
+        || fatal "download failed: ${_pinned:-$_latest}"
+    _xray_url="$DOWNLOAD_URL_USED"
     # D21: verify the archive against the release's published SHA-256 (.dgst). This
     # is integrity (catches corruption/truncation/MITM-without-cert), not signing.
-    download_to "$url.dgst" "$tmp/xray.dgst" 1048576 2>/dev/null \
+    download_any_to "$tmp/xray.dgst" 1048576 "${_xray_url}.dgst" "${_pinned:+$_pinned.dgst}" "$_latest.dgst" 2>/dev/null \
         || fatal "xray-core checksum file is unavailable; refusing unverified update"
     _want="$(awk -F'= ' '
         tolower($1) ~ /sha2-256/ {
