@@ -2174,7 +2174,7 @@ sub_add() {
 sub_list() {
     [ -f "$SUB_CATALOG" ] || fatal "no subscription catalog yet (menu -> Manage a multi-server subscription -> Refresh)"
     _sel="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
-    py "$MKSUB" render --file "$SUB_CATALOG" --selected "$_sel"
+    PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKSUB" render --file "$SUB_CATALOG" --selected "$_sel"
 }
 
 sub_select() {

@@ -157,11 +157,45 @@ def _display_width(ch):
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
+def _terminal_emoji_fallback(value):
+    """Avoid mojibake in terminals that cannot render 4-byte UTF-8 emoji.
+
+    UniFi/web SSH terminals commonly render BMP Unicode correctly (Cyrillic,
+    arrows, hourglass, star) but corrupt supplementary-plane symbols such as
+    regional-indicator flags and newer Wi-Fi emoji. Keep stored labels intact;
+    this is display-only and opt-in via PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1.
+    """
+    out = []
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        code = ord(ch)
+        if 0x1F1E6 <= code <= 0x1F1FF and i + 1 < len(value):
+            nxt = value[i + 1]
+            ncode = ord(nxt)
+            if 0x1F1E6 <= ncode <= 0x1F1FF:
+                country = chr(ord("A") + code - 0x1F1E6) \
+                    + chr(ord("A") + ncode - 0x1F1E6)
+                out.append("[%s] " % country)
+                i += 2
+                continue
+        if ch in ("\U0001f6dc", "\U0001f4f6"):
+            out.append("Wi-Fi ")
+        elif code > 0xFFFF:
+            out.append("")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def clean(s, maxlen=FIELD_MAX):
     """Return terminal-safe Unicode while preserving letters and emoji."""
     if not s:
         return ""
     value = unicodedata.normalize("NFC", _repair_mojibake(str(s)))
+    if os.environ.get("PROXY_UNIFI_TERMINAL_SAFE_EMOJI") == "1":
+        value = _terminal_emoji_fallback(value)
     value = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", value)
     value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
     out = []
@@ -319,7 +353,6 @@ def _profile_catalog_node(prof, label_hint="", identity_salt="",
     if len(raw_json) > MAX_PROFILE:
         return None
     identity = dict(prof)
-    identity.pop("remarks", None)
     canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True,
                            separators=(",", ":"))
     if identity_salt:
@@ -512,7 +545,6 @@ def _process_json(text, headers):
         if len(raw_json) > MAX_PROFILE:
             continue
         identity = dict(prof)
-        identity.pop("remarks", None)
         canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True,
                                separators=(",", ":"))
         nid = hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()
