@@ -116,7 +116,7 @@ formats are not currently parsed.
 
 Each installation creates a random persistent device UUID and sends it as
 `x-hwid` to the subscription origin. The header is not forwarded across a
-cross-origin redirect. The default User-Agent is `proxy-unifi/1.1` and can be
+cross-origin redirect. The default User-Agent is `Happ/2.0` and can be
 changed from the subscription menu for provider compatibility. A persistent
 systemd timer refreshes the catalog at the configured interval; if a selected
 node disappears or matches ambiguously, the active tunnel is kept unchanged.

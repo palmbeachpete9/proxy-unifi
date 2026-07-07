@@ -1194,9 +1194,9 @@ def main():
     f.add_argument("--url-file", default="")
     f.add_argument("--hwid", default="")
     f.add_argument("--hwid-file", default="")
-    # Provider-specific compatibility UAs can be supplied explicitly by the
-    # caller; do not impersonate a third-party client by default.
-    f.add_argument("--ua", default="proxy-unifi/1.1")
+    # Happ/Remnawave-style providers return JSON catalogs only to compatible
+    # app User-Agents; callers may still override this for other providers.
+    f.add_argument("--ua", default="Happ/2.0")
     f.add_argument("--body-file", default="")
     f.set_defaults(fn=cmd_fetch)
 
