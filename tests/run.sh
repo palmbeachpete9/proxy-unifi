@@ -372,13 +372,24 @@ assert all(len(n["id"]) == 64 for n in cat["nodes"])
 # uppercase scheme normalized
 n = mksub.node_from_link("VLESS://u@h:443#x"); assert n["link"].startswith("vless://"), n
 # URI-form VMess labels and legacy VMess identity are parsed without duplicate
-# base64/JSON work; display-only ps/key ordering must not change identity.
+# base64/JSON work; provider labels are part of subscription row identity.
 n = mksub.node_from_link("vmess://u@h:443#Москва🎯"); assert n["label"] == "Москва🎯", n
 vm1 = {"v":"2","ps":"old","add":"public.example","port":443,"id":"u"}
 vm2 = {"id":"u","port":443,"add":"public.example","ps":"new","v":"2"}
 vl1 = "vmess://" + base64.b64encode(json.dumps(vm1).encode()).decode()
 vl2 = "vmess://" + base64.b64encode(json.dumps(vm2).encode()).decode()
-assert mksub.node_from_link(vl1)["id"] == mksub.node_from_link(vl2)["id"]
+assert mksub.node_from_link(vl1)["id"] != mksub.node_from_link(vl2)["id"]
+same_server = [
+  "ss://%s@max.ru:1234#%s" % (
+      base64.b64encode(b"aes-256-gcm:pw").decode(),
+      label)
+  for label in ("DE", "NL", "US", "FR", "PL", "TR", "JP", "GB")
+]
+cat_same = mksub.process_body(body(same_server))
+assert cat_same["meta"]["count"] == 8, cat_same
+assert len({n["id"] for n in cat_same["nodes"]}) == 8
+mojibake_de = bytes.fromhex("f09f87a9f09f87aa").decode("latin-1") + "⭐ VPN | Германия ♾️"
+assert mksub.clean(mojibake_de, 80).startswith("🇩🇪⭐"), mksub.clean(mojibake_de, 80)
 # control bytes / oversize / dup dropped
 assert mksub.node_from_link("vless://u@h:443\x00evil") is None
 assert mksub.node_from_link("vless://u@h:443?x=" + "a"*9000) is None

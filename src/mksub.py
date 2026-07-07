@@ -220,29 +220,35 @@ def _link_details(parsed, scheme, legacy_vmess):
 
 
 def _canonical_link(link, parsed, legacy_vmess):
-    """Canonical identity form, excluding display-only fragment."""
+    """Canonical subscription row identity.
+
+    The URI fragment / VMess ``ps`` name is intentionally included. Providers
+    sometimes publish several selectable rows with the same dial target but
+    different labels; clients show those as separate nodes, so proxy-unifi must
+    not collapse them as duplicates.
+    """
     try:
         is_legacy, value = legacy_vmess
         if is_legacy:
             if isinstance(value, dict):
                 value = dict(value)
-                value.pop("ps", None)
                 return "vmess://" + json.dumps(
                     value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            return link.split("#", 1)[0]
+            return link
         if parsed is None:
-            return link.split("#", 1)[0]
+            return link
         u = parsed
         pairs = parse_qsl(u.query, keep_blank_values=True)
         # Duplicate parameters are ambiguous and the generator rejects them.
         keys = [k for k, _ in pairs]
         if len(keys) != len(set(keys)):
-            return link.split("#", 1)[0]
+            return link
         query = urlencode(sorted(pairs), doseq=True)
+        fragment = unquote(u.fragment) if u.fragment else ""
         # A legacy SS authority is case-sensitive base64, not a hostname.
         if u.scheme.lower() == "ss" and u.username is None:
             netloc = u.netloc
-            return urlunsplit((u.scheme.lower(), netloc, u.path, query, ""))
+            return urlunsplit((u.scheme.lower(), netloc, u.path, query, fragment))
         host = (u.hostname or "").lower()
         if ":" in host and not host.startswith("["):
             host = "[" + host + "]"
@@ -255,9 +261,9 @@ def _canonical_link(link, parsed, legacy_vmess):
         netloc = userinfo + host
         if u.port is not None:
             netloc += ":%d" % u.port
-        return urlunsplit((u.scheme.lower(), netloc, u.path, query, ""))
+        return urlunsplit((u.scheme.lower(), netloc, u.path, query, fragment))
     except (TypeError, ValueError):
-        return link.split("#", 1)[0]
+        return link
 
 
 def _ss_engine(parsed):
