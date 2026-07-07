@@ -139,6 +139,41 @@ SH
         || bad "installer rollback restores scripts, cores, and assets"
     rm -rf "$_id"
 
+    _bd="$(mktemp -d)"
+    mkdir -p "$_bd/archive-root/src" "$_bd/work"
+    for _f in proxy-unifi mkxray.py mksingbox.py mksub.py mkjson.py proxylib.py safeexec.py on_boot.sh; do
+        printf 'bundle:%s\n' "$_f" > "$_bd/archive-root/src/$_f"
+    done
+    python3 - "$_bd/source.tgz" "$_bd/archive-root" <<'PY'
+import sys
+import tarfile
+with tarfile.open(sys.argv[1], "w:gz") as archive:
+    archive.add(sys.argv[2], arcname="proxy-unifi-test")
+PY
+    cat > "$_bd/bundle.sh" <<SH
+WORKDIR='$_bd/work'
+PYTHON=python3
+PROJECT_REPO='ignored'
+PROXY_UNIFI_RAW=''
+bounded_curl() { cp '$_bd/source.tgz' "\$2"; }
+SCRIPT_DIR=''
+REPO_RAW='https://invalid'
+CACHEBUST=1
+SH
+    {
+        sed -n '/^prepare_source_bundle() {/,/^}/p' "$ROOT/install.sh"
+        sed -n '/^fetch() {/,/^}/p' "$ROOT/install.sh"
+        cat <<'SH'
+printf '%040d\n' 1 > "$WORKDIR/repo-sha"
+prepare_source_bundle || exit 1
+fetch mksingbox.py "$WORKDIR/out" 0644 || exit 1
+grep -q '^bundle:mksingbox.py$' "$WORKDIR/out"
+SH
+    } >> "$_bd/bundle.sh"
+    if sh "$_bd/bundle.sh"; then ok "installer source archive fallback"
+    else bad "installer source archive fallback"; fi
+    rm -rf "$_bd"
+
     _ld="$(mktemp -d)"
     cat > "$_ld/listeners.sh" <<'SH'
 have() { return 0; }
