@@ -149,7 +149,7 @@ def _repair_mojibake(value):
 
 
 def _display_width(ch):
-    if unicodedata.combining(ch):
+    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
         return 0
     o = ord(ch)
     if 0x1F000 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF:
@@ -210,6 +210,9 @@ def clean(s, maxlen=FIELD_MAX):
     for ch in r:
         w = _display_width(ch)
         if width + w > maxlen:
+            while rendered and width + 1 > maxlen:
+                removed = rendered.pop()
+                width -= _display_width(removed)
             return "".join(rendered).rstrip() + "…"
         rendered.append(ch)
         width += w

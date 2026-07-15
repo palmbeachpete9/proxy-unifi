@@ -20,11 +20,12 @@ ETC_DIR="$ROOT/etc"
 WG_DIR="$ETC_DIR/wg"
 XRAY="$BIN_DIR/xray"
 SBIN="$BIN_DIR/sing-box"
+ABIN="$BIN_DIR/amnezia-box"
 CONFIG="$ETC_DIR/config.json"
 OUTBOUND_LINK="$ETC_DIR/link.txt"
 POOL_DIR="$ETC_DIR/pool"                    # xray -confdir dir for a JSON balancer profile
 POOL_SRC="$ETC_DIR/pool.json"               # the imported provider profile (verbatim source)
-ENGINE_FILE="$ETC_DIR/engine"               # active engine: "xray" / "singbox" / "xraypool"
+ENGINE_FILE="$ETC_DIR/engine"               # active engine: xray / singbox / xraypool / awg
 SERVER_CACHE="$ETC_DIR/.server"             # cached "Server:" display string (menu speed)
 MKJSON="$BIN_DIR/mkjson.py"
 AUTOSTART_FILE="$ETC_DIR/autostart"         # "enabled" / "disabled" (persisted across boots)
@@ -32,6 +33,7 @@ SETTINGS="$ETC_DIR/settings.env"
 MKXRAY="$BIN_DIR/mkxray.py"
 MKSB="$BIN_DIR/mksingbox.py"
 MKSUB="$BIN_DIR/mksub.py"
+MKAWG="$BIN_DIR/mkawg.py"
 SAFEEXEC="$BIN_DIR/safeexec.py"
 SUB_DIR="$ETC_DIR/subscription"
 SUB_URL_FILE="$SUB_DIR/url.txt"             # subscription URL (mode 600)
@@ -39,6 +41,10 @@ SUB_CATALOG="$SUB_DIR/catalog.json"         # cached parsed nodes
 SUB_HWID_FILE="$SUB_DIR/hwid"               # stable per-install device id
 SUB_SELECTED="$SUB_DIR/selected"            # id of the node currently activated
 SUB_SELECTED_META="$SUB_DIR/selected.json"  # stable selection metadata for refresh matching
+AWG_DIR="$ETC_DIR/awg"
+AWG_PROFILES_DIR="$AWG_DIR/profiles"
+AWG_SELECTED="$AWG_DIR/selected"            # UUID of the active AWG profile
+AWG_DRAFT_DIR="$ROOT/.awg-drafts"            # root-only editor scratch space
 SERVICE_NAME="proxy-unifi"
 SERVICE_USER="proxy-unifi"
 SERVICE_GROUP="proxy-unifi"
@@ -58,6 +64,9 @@ PLUGIN_SERVICE_FILE="/etc/systemd/system/${PLUGIN_SERVICE_NAME}.service"
 
 XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/latest/download"
 SINGBOX_RELEASES="https://github.com/SagerNet/sing-box/releases"
+AWG_CORE_RELEASES="https://github.com/palmbeachpete9/proxy-unifi/releases"
+AWG_CORE_VERSION="0.1.0"
+AWG_CORE_TAG="awg-core-v${AWG_CORE_VERSION}"
 
 # defaults (overridable via settings.env)
 WG_LISTEN="127.0.0.1"
@@ -209,6 +218,13 @@ wg_endpoint() {
     esac
 }
 
+format_endpoint() {
+    case "$1" in
+        *:*) printf '[%s]:%s' "$1" "$2" ;;
+        *)   printf '%s:%s' "$1" "$2" ;;
+    esac
+}
+
 # D20: only create/remove /usr/bin/proxy if it is absent or already OUR symlink,
 # never clobbering an unrelated file someone else owns.
 PROXY_LINK="/usr/bin/proxy"
@@ -257,6 +273,7 @@ LOCK_HELD=0
 LOCK_OWNER=""
 TXN_DIR=""
 BG_PID=""
+EDIT_DRAFT=""
 UPDATE_BACKUP=""
 UPDATE_WAS_ACTIVE=0
 GEO_BACKUP=""
@@ -479,6 +496,7 @@ on_exit() {
     _rc="$1"
     trap - EXIT INT TERM HUP
     [ -z "$BG_PID" ] || { kill "$BG_PID" 2>/dev/null || true; wait "$BG_PID" 2>/dev/null || true; }
+    [ -z "$EDIT_DRAFT" ] || rm -f "$EDIT_DRAFT" 2>/dev/null || true
     if [ -n "$UPDATE_BACKUP" ]; then
         _restore_update_backup "$UPDATE_BACKUP" || err "core update rollback was incomplete"
         ( write_service ) 2>/dev/null || true
@@ -616,7 +634,7 @@ arch_slug() {
 }
 
 # --------------------------------------------------------------------------
-# Engine selection (xray vs sing-box)
+# Share-link engine selection (xray vs sing-box; AWG uses saved profiles)
 # --------------------------------------------------------------------------
 # Which engine handles a link file: "xray", "singbox", or "" (unsupported).
 engine_for_link_file() {
@@ -644,8 +662,9 @@ current_engine() {
     # wrong core, e.g. running a hysteria2 link under xray).
     _ce="$(cat "$ENGINE_FILE" 2>/dev/null || true)"
     case "$_ce" in
-        xray|singbox|xraypool) echo "$_ce"; return ;;
+        xray|singbox|xraypool|awg) echo "$_ce"; return ;;
     esac
+    if [ -s "$AWG_SELECTED" ] && awg_selected_profile >/dev/null 2>&1; then echo awg; return; fi
     # a pool dir present means we're in pool mode
     if [ -f "$POOL_DIR/99-overlay.json" ]; then echo xraypool; return; fi
     if [ -f "$OUTBOUND_LINK" ]; then
@@ -830,6 +849,69 @@ ensure_singbox() {
     [ -x "$SBIN" ] || fatal "sing-box is required for this link but could not be installed"
 }
 
+cmd_install_awg() {
+    mkdir -p "$BIN_DIR"
+    { have curl || have wget; } || { err "need curl or wget to download the AmneziaWG core"; return 1; }
+    _aa="$(sb_arch)"
+    _asset="proxy-unifi-amnezia-box-${AWG_CORE_VERSION}-linux-${_aa}.tar.gz"
+    _url="$AWG_CORE_RELEASES/download/${AWG_CORE_TAG}/${_asset}"
+    ensure_run_dir
+    _tmp="$RUN_DIR/amnezia-box"; mkdir -p "$_tmp"
+    info "downloading AmneziaWG core ${AWG_CORE_VERSION} (${_aa}) ..."
+    download_to "$_url" "$_tmp/core.tgz" 262144000 \
+        || { rm -rf "$_tmp"; err "AmneziaWG core download failed"; return 1; }
+    _want="$(github_asset_digest palmbeachpete9/proxy-unifi "$AWG_CORE_TAG" "$_asset" 2>/dev/null)" \
+        || { rm -rf "$_tmp"; err "could not obtain the AmneziaWG core asset digest"; return 1; }
+    verify_sha256 "$_tmp/core.tgz" "$_want" \
+        || { rm -rf "$_tmp"; err "AmneziaWG core checksum verification failed"; return 1; }
+    py - "$_tmp/core.tgz" "$_tmp" <<'PYEOF' \
+        || { rm -rf "$_tmp"; err "could not safely extract the AmneziaWG core"; return 1; }
+import os,sys,tarfile
+src,dest=sys.argv[1],os.path.realpath(sys.argv[2]); total=0; limit=250*1024*1024
+with tarfile.open(src,"r:gz") as archive:
+    members=archive.getmembers()
+    for member in members:
+        target=os.path.realpath(os.path.join(dest,member.name))
+        if target!=dest and not target.startswith(dest+os.sep): raise SystemExit("unsafe archive path")
+        if member.issym() or member.islnk() or member.isdev() or member.isfifo(): raise SystemExit("unsafe archive member")
+        total += max(0,member.size)
+        if total>limit: raise SystemExit("archive is too large")
+    archive.extractall(dest,members=members)
+PYEOF
+    _b="$(find "$_tmp" -name amnezia-box -type f -print -quit)"
+    [ -n "$_b" ] || { rm -rf "$_tmp"; err "AmneziaWG core binary not found in archive"; return 1; }
+    chmod 0755 "$_b"
+    "$_b" version 2>/dev/null | grep -q "version proxy-unifi-awg-${AWG_CORE_VERSION}" \
+        || { rm -rf "$_tmp"; err "downloaded AmneziaWG core has an unexpected version"; return 1; }
+    if [ -x "$ABIN" ] && [ "$(current_engine)" = "awg" ] && [ -f "$CONFIG" ]; then
+        prepare_service_permissions
+        chown root:"$SERVICE_GROUP" "$RUN_DIR" "$_tmp" 2>/dev/null || true
+        chmod 750 "$RUN_DIR" "$_tmp" 2>/dev/null || true
+        validate_as_service "$_b" check -c "$CONFIG" >/dev/null 2>&1 \
+            || { rm -rf "$_tmp"; err "the new AmneziaWG core rejects the active profile; keeping the old version"; return 1; }
+    fi
+    if [ -x "$ABIN" ]; then
+        cp -p "$ABIN" "$ABIN.bak.new" || { rm -rf "$_tmp"; err "could not back up the AmneziaWG core"; return 1; }
+        mv -f "$ABIN.bak.new" "$ABIN.bak"
+    fi
+    install -m 0755 "$_b" "$ABIN.new" \
+        || { rm -rf "$_tmp"; rm -f "$ABIN.new"; err "could not stage the AmneziaWG core"; return 1; }
+    mv -f "$ABIN.new" "$ABIN" \
+        || { rm -rf "$_tmp"; err "could not activate the AmneziaWG core"; return 1; }
+    if ! "$ABIN" version >/dev/null 2>&1; then
+        if [ -f "$ABIN.bak" ]; then mv -f "$ABIN.bak" "$ABIN"; else rm -f "$ABIN"; fi
+        rm -rf "$_tmp"; err "new AmneziaWG core failed to run; rolled back"; return 1
+    fi
+    rm -f "$ABIN.bak"
+    rm -rf "$_tmp"
+    c_grn "AmneziaWG core installed: $(core_version "$ABIN")"
+}
+
+ensure_awg() {
+    [ -x "$ABIN" ] || cmd_install_awg || true
+    [ -x "$ABIN" ] || fatal "the AmneziaWG core is required but could not be installed"
+}
+
 # --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
@@ -894,7 +976,7 @@ PYEOF
         if [ -f "$POOL_DIR/99-overlay.json" ]; then
             validate_as_service "$tmp/xray" run -test -confdir "$POOL_DIR" >/dev/null 2>&1 \
                 || fatal "the new xray-core rejects your current profile; keeping the old version"
-        elif [ -f "$CONFIG" ] && [ "$(current_engine)" != "singbox" ]; then
+        elif [ -f "$CONFIG" ] && [ "$(current_engine)" = "xray" ]; then
             validate_as_service "$tmp/xray" run -test -config "$CONFIG" -format json >/dev/null 2>&1 \
                 || fatal "the new xray-core rejects your current config; keeping the old version"
         fi
@@ -937,18 +1019,29 @@ PYEOF
     else
         info "sing-box not installed (fetched automatically on the first hysteria2/tuic/ss+obfs link)."
     fi
+    # The AmneziaWG-enabled core is likewise on-demand. It is a separately
+    # pinned build because upstream does not publish Linux binaries for its AWG
+    # endpoint branch.
+    if [ -x "$ABIN" ]; then
+        if ! cmd_install_awg; then
+            [ "${_STRICT_UPDATE:-0}" = 1 ] && fatal "AmneziaWG core update failed; update transaction aborted"
+            c_ylw "AmneziaWG core update failed (continuing); the existing version is kept"
+        fi
+    else
+        info "AmneziaWG core not installed (fetched automatically on first profile activation)."
+    fi
 }
 
 # --------------------------------------------------------------------------
-# External-exposure guard for the sing-box engine
+# External-exposure guard for sing-box-based engines
 # --------------------------------------------------------------------------
 # xray binds the WireGuard inbound to 127.0.0.1 (loopback-only), so nothing it
-# runs is reachable from the LAN/WAN. sing-box has no bind-address option for its
-# WG inbound and binds 0.0.0.0 (all interfaces). The local UniFi WG client only
-# ever dials 127.0.0.1, so we drop every NON-loopback packet to that UDP port,
-# closing the external surface while leaving the loopback path working. The rule
+# runs is reachable from the LAN/WAN. sing-box and amnezia-box have no
+# bind-address option for their WG inbound and bind all interfaces. The local
+# UniFi WG client only ever dials loopback, so we drop every NON-loopback packet
+# to that UDP port, closing the external surface while leaving loopback working.
 # The dedicated chain is project-owned, so cleanup never removes an
-# administrator's matching rule. Protection is fail-closed before sing-box binds.
+# administrator's matching rule. Protection is fail-closed before either core binds.
 FW_CHAIN="PROXY_UNIFI_WG"
 
 _ipv6_enabled() { [ -s /proc/net/if_inet6 ]; }
@@ -1057,9 +1150,14 @@ write_service() {
     # ExecStart depends on the active engine. Prefer the recorded engine; if the
     # engine file was lost (e.g. after a partial restore) fall back to inferring it.
     # _fwpre/_fwpost wire the external-exposure guard to the service lifecycle:
-    # for sing-box, block the port BEFORE the binary binds (ExecStartPre) and
+    # for sing-box/amnezia-box, block the port BEFORE the binary binds
+    # (ExecStartPre) and
     # clean up on stop; for xray (loopback-only) just clear any stale rule.
     case "$(current_engine)" in
+        awg)
+            _exec="$ABIN run -c $CONFIG"; _cond="$CONFIG"
+            _fwpre="ExecStartPre=+$BIN_DIR/proxy-unifi _fw-lock"
+            _fwpost="ExecStopPost=-+$BIN_DIR/proxy-unifi _fw-unlock" ;;
         singbox)
             _exec="$SBIN run -c $CONFIG"; _cond="$CONFIG"
             _fwpre="ExecStartPre=+$BIN_DIR/proxy-unifi _fw-lock"
@@ -1073,7 +1171,7 @@ write_service() {
     esac
     atomic_write "$SERVICE_FILE" 644 <<EOF || return 1
 [Unit]
-Description=proxy-unifi (WireGuard->proxy bridge)
+Description=proxy-unifi (WireGuard to proxy/VPN bridge)
 After=network-online.target nss-lookup.target
 Wants=network-online.target
 # Don't crash-loop before a link/profile has been imported.
@@ -1255,8 +1353,54 @@ _build_config_file() {
     fi
 }
 
+awg_selected_profile() {
+    _asp_id="$(cat "$AWG_SELECTED" 2>/dev/null || true)"
+    case "$_asp_id" in
+        ????????-????-????-????-????????????) : ;;
+        *) return 1 ;;
+    esac
+    case "$_asp_id" in *[!0-9a-f-]*) return 1 ;; esac
+    _asp_path="$AWG_PROFILES_DIR/${_asp_id}.conf"
+    [ -f "$_asp_path" ] && [ ! -L "$_asp_path" ] || return 1
+    printf '%s\n' "$_asp_path"
+}
+
+_build_awg_profile() {
+    _ap="$1"
+    [ -s "$_ap" ] || fatal "AmneziaWG profile is empty or missing"
+    [ "$WG_LISTEN" = "127.0.0.1" ] \
+        || fatal "the AmneziaWG core cannot bind its inner WireGuard endpoint to WG_LISTEN=$WG_LISTEN; use 127.0.0.1"
+    [ -f "$MKAWG" ] || fatal "AmneziaWG profile helper is missing"
+    ensure_awg
+    ensure_keys
+    mkdir -p "$ETC_DIR" || fatal "could not create $ETC_DIR"
+    prepare_service_permissions
+    _tmpcfg="$(mktemp "$ETC_DIR/.awgcfg.XXXXXX")" || fatal "could not create temporary config"
+    py "$MKAWG" build --file "$_ap" \
+        --secret-key-file "$WG_DIR/wg_private.key" \
+        --peer-pubkey-file "$WG_DIR/unifi_public.key" \
+        --port "$WG_PORT" --address "$XRAY_ADDR" --mtu "$WG_MTU" \
+        --loglevel "$(sb_loglevel)" > "$_tmpcfg" \
+        || fatal "AmneziaWG config generation failed"
+    [ -s "$_tmpcfg" ] || fatal "generated AmneziaWG config is empty"
+    chown root:"$SERVICE_GROUP" "$_tmpcfg"; chmod 640 "$_tmpcfg"
+    validate_as_service "$ABIN" check -c "$_tmpcfg" >/dev/null 2>&1 \
+        || fatal "the AmneziaWG core rejected this profile"
+    mv -f "$_tmpcfg" "$CONFIG" || fatal "could not install AmneziaWG config"
+    chown root:"$SERVICE_GROUP" "$CONFIG"; chmod 640 "$CONFIG"
+    printf 'awg' | atomic_write "$ENGINE_FILE" 600 || fatal "could not write engine marker"
+    rm -f "$SERVER_CACHE" 2>/dev/null || true
+    if [ -f "$SERVICE_FILE" ]; then
+        write_service || fatal "could not update the systemd service"
+    fi
+}
+
 regen_config() {
-    if [ -f "$POOL_SRC" ] && [ "$(current_engine)" = "xraypool" ]; then
+    if [ "$(current_engine)" = "awg" ]; then
+        _active_awg="$(awg_selected_profile)" \
+            || fatal "the selected AmneziaWG profile is missing or invalid"
+        _build_awg_profile "$_active_awg"
+    elif [ -f "$POOL_SRC" ] && [ "$(current_engine)" = "xraypool" ]; then
         _build_pool "$POOL_SRC"
     else
         [ -f "$OUTBOUND_LINK" ] || fatal "no proxy link imported yet. Run 'proxy' and choose option 1."
@@ -1315,6 +1459,7 @@ cmd_import_json() {
     atomic_write "$POOL_SRC" 600 < "$_src" || fatal "could not store profile"
     # a pool import supersedes any single link + subscription selection
     rm -f "$OUTBOUND_LINK" 2>/dev/null || true
+    rm -f "$AWG_SELECTED" 2>/dev/null || true
     [ "${_FROM_SUB:-0}" = "1" ] || rm -f "$SUB_SELECTED" "$SUB_SELECTED_META" 2>/dev/null || true
     save_settings
     restart_service || fatal "profile was valid, but the service failed its startup health check"
@@ -1348,6 +1493,7 @@ cmd_import() {
     atomic_write "$OUTBOUND_LINK" 600 < "$_candidate_link" || fatal "could not store proxy link"
     # a single-link import supersedes any active pool profile
     rm -rf "$POOL_DIR" "$POOL_SRC" 2>/dev/null || true
+    rm -f "$AWG_SELECTED" 2>/dev/null || true
     save_settings
     # A manual import detaches any subscription selection (so a later 'sub refresh'
     # won't think this hand-picked link came from the subscription). sub_select sets
@@ -1365,7 +1511,7 @@ cmd_import() {
 }
 
 cmd_wg_config() {
-    [ -f "$WG_DIR/unifi_private.key" ] || fatal "no keys yet. Run 'proxy' and choose option 1 to import a link first."
+    [ -f "$WG_DIR/unifi_private.key" ] || fatal "no keys yet. Import a proxy or activate an AmneziaWG profile first."
     load_settings
     upriv="$(cat "$WG_DIR/unifi_private.key")"
     xpub="$(cat "$WG_DIR/wg_public.key")"
@@ -1413,16 +1559,17 @@ cmd_status() {
     echo "service:   ${act:-unknown} / ${ena:-disabled}"
     _eng="$(current_engine)"
     echo "engine:    $_eng"
-    if [ "$_eng" = "singbox" ]; then
+    if [ "$_eng" = "awg" ]; then
+        if [ -x "$ABIN" ]; then echo "core:      $(core_version "$ABIN")"; else echo "core:      AmneziaWG core not installed"; fi
+    elif [ "$_eng" = "singbox" ]; then
         if [ -x "$SBIN" ]; then echo "core:      $(core_version "$SBIN")"; else echo "core:      sing-box not installed"; fi
     else
         if [ -x "$XRAY" ]; then echo "core:      $(core_version "$XRAY")"; else echo "core:      xray not installed"; fi
     fi
     echo "server:    $(current_server)"
-    # sing-box has no listen-address option, so it binds the WG port on all
-    # interfaces; a firewall rule blocks non-loopback access. Report what is
-    # actually in effect rather than guessing.
-    if [ "$_eng" = "singbox" ]; then
+    # The sing-box-based cores bind the WG port on all interfaces; a firewall
+    # rule blocks non-loopback access. Report the protection actually in effect.
+    if [ "$_eng" = "singbox" ] || [ "$_eng" = "awg" ]; then
         if fw_is_locked "$WG_PORT"; then
             echo "wg listen: 0.0.0.0:${WG_PORT} (loopback only; LAN/WAN blocked by firewall)  mtu=${WG_MTU}"
         else
@@ -1511,6 +1658,10 @@ cmd_config()  {
         done
         return
     fi
+    if [ "$(current_engine)" = "awg" ]; then
+        awg_details
+        return
+    fi
     [ -f "$CONFIG" ] || fatal "no config generated yet"; cat "$CONFIG"
 }
 
@@ -1561,7 +1712,7 @@ PYEOF
         *) fatal "unknown setting '$key' (port|mtu|dns|keepalive|loglevel|ping)" ;;
     esac
     save_settings
-    if [ -f "$OUTBOUND_LINK" ] || [ -f "$POOL_SRC" ]; then
+    if [ -f "$OUTBOUND_LINK" ] || [ -f "$POOL_SRC" ] || [ -s "$AWG_SELECTED" ]; then
         regen_config
         restart_if_previously_active || fatal "updated config failed its startup health check; previous settings restored"
         [ "$_cmd_owned" = 1 ] && txn_commit
@@ -1579,7 +1730,7 @@ cmd_regen_keys() {
     txn_begin
     rm -f "$WG_DIR"/*.key
     ensure_keys
-    if [ -f "$OUTBOUND_LINK" ] || [ -f "$POOL_SRC" ]; then
+    if [ -f "$OUTBOUND_LINK" ] || [ -f "$POOL_SRC" ] || [ -s "$AWG_SELECTED" ]; then
         regen_config
         restart_if_previously_active || fatal "new-key config failed its startup health check; previous keys restored"
     fi
@@ -1595,7 +1746,7 @@ cmd_update() {
     systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && _update_was_active=1
     UPDATE_WAS_ACTIVE="$_update_was_active"
     _backup="$RUN_DIR/update-backup"; mkdir -p "$_backup"
-    for _name in xray sing-box geoip.dat geosite.dat; do
+    for _name in xray sing-box amnezia-box geoip.dat geosite.dat; do
         if [ -e "$BIN_DIR/$_name" ]; then cp -p "$BIN_DIR/$_name" "$_backup/$_name" || fatal "could not back up $_name"
         else : > "$_backup/$_name.absent"; fi
     done
@@ -1629,7 +1780,7 @@ cmd_update() {
 _restore_update_backup() {
     _backup="$1"
     _restore_rc=0
-    for _name in xray sing-box geoip.dat geosite.dat; do
+    for _name in xray sing-box amnezia-box geoip.dat geosite.dat; do
         if [ -f "$_backup/$_name.absent" ]; then rm -f "$BIN_DIR/$_name" || _restore_rc=1
         elif [ -f "$_backup/$_name" ]; then
             install -m "$( [ -x "$_backup/$_name" ] && echo 0755 || echo 0644 )" \
@@ -1688,6 +1839,11 @@ _restore_geo_backup() {
 
 # Print 'host<TAB>port' for the current link using the engine-appropriate generator.
 _server_hp() {
+    if [ "$(current_engine)" = "awg" ]; then
+        _awg_profile="$(awg_selected_profile)" || return 1
+        py "$MKAWG" server --file "$_awg_profile" 2>/dev/null
+        return
+    fi
     [ -f "$OUTBOUND_LINK" ] || return 1
     if [ "$(current_engine)" = "singbox" ]; then _gen="$MKSB"; else _gen="$MKXRAY"; fi
     py "$_gen" --link-file "$OUTBOUND_LINK" --print-server 2>/dev/null
@@ -1716,12 +1872,20 @@ _compute_server() {
         printf 'balancer pool (%s nodes, %s)' "${_m:-?}" "${_s:--}"
         return
     fi
+    if [ "$(current_engine)" = "awg" ]; then
+        _awg_path="$(awg_selected_profile)" || { printf 'AmneziaWG (selected profile missing)'; return; }
+        hp="$(py "$MKAWG" server --file "$_awg_path" 2>/dev/null)" \
+            || { printf 'AmneziaWG (invalid selected profile)'; return; }
+        _host="${hp%%"$TAB"*}"; _port="${hp#*"$TAB"}"
+        printf 'AWG %s' "$(format_endpoint "$_host" "$_port")"
+        return
+    fi
     [ -f "$OUTBOUND_LINK" ] || { printf '(none imported)'; return; }
     hp="$(_server_hp)" || { printf '?'; return; }
     [ -n "$hp" ] || { printf '?'; return; }
     _host="${hp%%"$TAB"*}"
     _port="${hp#*"$TAB"}"
-    printf '%s:%s' "$_host" "$_port"
+    format_endpoint "$_host" "$_port"
 }
 
 # --------------------------------------------------------------------------
@@ -1757,6 +1921,14 @@ ping_proxy() {   # $1 = get|head
         py "$MKJSON" socksconfig --profile "$POOL_SRC" --socks-port "$_port" > "$_cfg" 2>/dev/null \
             || { err "could not build test config"; _ping_cleanup; return 1; }
         set -- "$XRAY" run -config "$_cfg" -format json
+    elif [ "$_e" = "awg" ]; then
+        [ -x "$ABIN" ] || { err "AmneziaWG core not installed"; _ping_cleanup; return 1; }
+        _awg_profile="$(awg_selected_profile)" \
+            || { err "selected AmneziaWG profile is missing"; _ping_cleanup; return 1; }
+        py "$MKAWG" build --file "$_awg_profile" --socks-port "$_port" \
+            --loglevel "$(sb_loglevel)" > "$_cfg" 2>/dev/null \
+            || { err "could not build AmneziaWG test config"; _ping_cleanup; return 1; }
+        set -- "$ABIN" run -c "$_cfg"
     elif [ "$_e" = "singbox" ]; then
         [ -x "$SBIN" ] || { err "sing-box not installed"; _ping_cleanup; return 1; }
         py "$MKSB" --link-file "$OUTBOUND_LINK" --socks-port "$_port" > "$_cfg" 2>/dev/null \
@@ -1846,8 +2018,9 @@ cmd_ping() {
     load_settings
     # pool mode keeps its config in $POOL_DIR (no single link file); a plain
     # link keeps $OUTBOUND_LINK. Either is pingable.
-    if [ ! -f "$OUTBOUND_LINK" ] && [ "$(current_engine)" != "xraypool" ]; then
-        c_ylw "No proxy imported yet. Import a link, subscription, or JSON profile first (menu option 1-3)."
+    if [ ! -f "$OUTBOUND_LINK" ] && [ "$(current_engine)" != "xraypool" ] \
+        && [ "$(current_engine)" != "awg" ]; then
+        c_ylw "No proxy/VPN imported yet. Add a link, subscription, JSON profile, or AmneziaWG profile first."
         return 1
     fi
     _mode="${1:-$PING_MODE}"
@@ -1889,29 +2062,32 @@ print_menu() {
     printf '├%s┤\n' "$HR"
     ml "  1. Manage a single-server proxy link"
     ml "  2. Manage a multi-server subscription"
-    ml "  3. Import an Xray JSON profile (from a file)"
-    ml "  4. Show current server & config"
     printf '├%s┤\n' "$HR"
-    ml "  5. Show UniFi WireGuard VPN Client config"
-    ml "  6. Regenerate WireGuard keys"
-    ml "  7. Change WireGuard settings"
+    ml "  3. Manage AmneziaWG profiles"
     printf '├%s┤\n' "$HR"
-    ml "  8. Ping test"
-    ml "  9. Change test algorithm"
+    ml "  4. Import an Xray JSON profile (from a file)"
+    ml "  5. Show current server & config"
     printf '├%s┤\n' "$HR"
-    ml " 10. Start"
-    ml " 11. Stop"
-    ml " 12. Restart"
-    ml " 13. Check status"
-    ml " 14. View logs"
+    ml "  6. Show UniFi WireGuard VPN Client config"
+    ml "  7. Regenerate WireGuard keys"
+    ml "  8. Change WireGuard settings"
     printf '├%s┤\n' "$HR"
-    ml " 15. Enable autostart"
-    ml " 16. Disable autostart"
+    ml "  9. Ping test"
+    ml " 10. Change test algorithm"
     printf '├%s┤\n' "$HR"
-    ml " 17. Update xray-core"
-    ml " 18. Update geo files"
-    ml " 19. Version info"
-    ml " 20. Uninstall"
+    ml " 11. Start"
+    ml " 12. Stop"
+    ml " 13. Restart"
+    ml " 14. Check status"
+    ml " 15. View logs"
+    printf '├%s┤\n' "$HR"
+    ml " 16. Enable autostart"
+    ml " 17. Disable autostart"
+    printf '├%s┤\n' "$HR"
+    ml " 18. Update proxy cores"
+    ml " 19. Update geo files"
+    ml " 20. Version info"
+    ml " 21. Uninstall"
     printf '└%s┘\n' "$HR"
     printf '\n'
     printf 'Service:    %s\n' "$svc_d"
@@ -1985,7 +2161,7 @@ cmd_menu() {
     while true; do
         clear 2>/dev/null || true
         print_menu
-        printf '\nPlease enter your selection [0-20]: '
+        printf '\nPlease enter your selection [0-21]: '
         read -r sel || exit 0
         echo
         case "$sel" in
@@ -1993,30 +2169,32 @@ cmd_menu() {
             1)  ( printf 'Paste proxy link (vless/vmess/trojan/ss/hysteria2/tuic): '; read -r _l || true
                   if [ -n "${_l:-}" ]; then locked_call cmd_import "$_l"; else c_ylw "No link entered."; fi ) ;;
             2)  ( menu_sub ) ;;
-            3)  ( menu_import_json ) ;;
-            4)  ( cmd_config ) ;;
-            5)  ( cmd_wg_config ) ;;
-            6)  ( printf 'Regenerate keys? This breaks the current UniFi VPN Client until you re-paste the new config. [y/N]: '
+            3)  ( menu_awg ) ;;
+            4)  ( menu_import_json ) ;;
+            5)  ( cmd_config ) ;;
+            6)  ( cmd_wg_config ) ;;
+            7)  ( printf 'Regenerate keys? This breaks the current UniFi VPN Client until you re-paste the new config. [y/N]: '
                   read -r _c || true
                   if [ "${_c:-}" = "y" ]; then locked_call cmd_regen_keys; else c_ylw "Cancelled."; fi ) ;;
-            7)  ( menu_wg_settings ) ;;
-            8)  ( cmd_ping ) ;;
-            9)  ( menu_set_ping ) ;;
-            10) ( locked_call menu_start ) ;;
-            11) ( locked_call menu_stop ) ;;
-            12) ( locked_call menu_restart ) ;;
-            13) ( cmd_status ) ;;
-            14) ( printf 'Lines to show [100]: '; read -r _n || true
+            8)  ( menu_wg_settings ) ;;
+            9)  ( cmd_ping ) ;;
+            10) ( menu_set_ping ) ;;
+            11) ( locked_call menu_start ) ;;
+            12) ( locked_call menu_stop ) ;;
+            13) ( locked_call menu_restart ) ;;
+            14) ( cmd_status ) ;;
+            15) ( printf 'Lines to show [100]: '; read -r _n || true
                   case "${_n:-}" in ""|*[!0-9]*) _n=100 ;; esac
                   cmd_logs logs -n "$_n" --no-pager ) ;;
-            15) ( locked_call menu_enable ) ;;
-            16) ( locked_call menu_disable ) ;;
-            17) ( locked_call cmd_update ) ;;
-            18) ( locked_call cmd_geo_update ) ;;
-            19) ( if [ -x "$XRAY" ]; then core_version "$XRAY"; else c_ylw "xray-core: not installed"; fi
+            16) ( locked_call menu_enable ) ;;
+            17) ( locked_call menu_disable ) ;;
+            18) ( locked_call cmd_update ) ;;
+            19) ( locked_call cmd_geo_update ) ;;
+            20) ( if [ -x "$XRAY" ]; then core_version "$XRAY"; else c_ylw "xray-core: not installed"; fi
                   if [ -x "$SBIN" ]; then core_version "$SBIN"; else c_ylw "sing-box: not installed"; fi
+                  if [ -x "$ABIN" ]; then core_version "$ABIN"; else c_ylw "AmneziaWG core: not installed"; fi
                   echo "proxy-unifi CLI 1.0.0" ) ;;
-            20) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
+            21) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
                 if [ "${_c:-}" = "y" ]; then ( locked_call cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
             *)  c_red "Invalid selection." ;;
         esac
@@ -2066,6 +2244,267 @@ menu_import_json() {
     done
     if [ -s "$_tmp" ]; then locked_call cmd_import_json "$_tmp"; else c_ylw "Nothing pasted."; fi
     rm -f "$_tmp"
+}
+
+awg_secure_dirs() {
+    mkdir -p "$AWG_PROFILES_DIR" "$AWG_DRAFT_DIR" \
+        || fatal "could not create AmneziaWG profile directories"
+    chmod 700 "$AWG_DIR" "$AWG_PROFILES_DIR" "$AWG_DRAFT_DIR" \
+        || fatal "could not secure AmneziaWG profile directories"
+}
+
+awg_resolve() {
+    _awg_resolve_id="$1"
+    case "$_awg_resolve_id" in ????????-????-????-????-????????????) : ;; *) fatal "invalid profile id" ;; esac
+    case "$_awg_resolve_id" in *[!0-9a-f-]*) fatal "invalid profile id" ;; esac
+    if [ "${2:-}" = allow ]; then _awg_allow="--allow-invalid"; else _awg_allow=""; fi
+    # shellcheck disable=SC2086 # optional fixed flag, never user-controlled.
+    _awg_pick_row="$(PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKAWG" pick \
+        --dir "$AWG_PROFILES_DIR" --id "$_awg_resolve_id" $_awg_allow)" \
+        || fatal "AmneziaWG profile no longer exists or is invalid"
+    AWG_PICK_ID="${_awg_pick_row%%"$TAB"*}"
+    _awg_pick_rest="${_awg_pick_row#*"$TAB"}"
+    AWG_PICK_PATH="${_awg_pick_rest%%"$TAB"*}"
+    AWG_PICK_NAME="${_awg_pick_rest#*"$TAB"}"
+}
+
+awg_list() {
+    _awg_sel=""
+    if [ "$(current_engine)" = awg ]; then
+        _awg_sel="$(cat "$AWG_SELECTED" 2>/dev/null || true)"
+    fi
+    if [ -n "${1:-}" ]; then
+        PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKAWG" render \
+            --dir "$AWG_PROFILES_DIR" --selected "$_awg_sel" --map-file "$1"
+    else
+        PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKAWG" render \
+            --dir "$AWG_PROFILES_DIR" --selected "$_awg_sel"
+    fi
+}
+
+awg_choose() {
+    _awg_choose_prompt="$1"; _awg_choose_mode="${2:-valid}"
+    ensure_run_dir
+    _awg_choose_map="$RUN_DIR/awg-choice.map"
+    rm -f "$_awg_choose_map"
+    awg_list "$_awg_choose_map" || return 1
+    [ -s "$_awg_choose_map" ] || return 1
+    echo
+    printf '%s' "$_awg_choose_prompt"; read -r _awg_index || true
+    case "${_awg_index:-}" in ""|*[!0-9]*) c_ylw "Cancelled."; return 1 ;; esac
+    AWG_CHOICE_ID="$(awk -v n="$_awg_index" 'NR == n { print; exit }' "$_awg_choose_map")"
+    [ -n "$AWG_CHOICE_ID" ] || { c_red "No profile #$_awg_index."; return 1; }
+    if [ "$_awg_choose_mode" = allow ]; then awg_resolve "$AWG_CHOICE_ID" allow
+    else awg_resolve "$AWG_CHOICE_ID"; fi
+}
+
+awg_commit_new() {
+    _awg_name="$1"; _awg_draft="$2"
+    _awg_name="$(py "$MKAWG" name --value "$_awg_name")" \
+        || fatal "invalid display name"
+    py "$MKAWG" validate --file "$_awg_draft" >/dev/null \
+        || fatal "AmneziaWG profile validation failed"
+    awg_secure_dirs
+    _awg_id="$(py -c 'import uuid; print(uuid.uuid4())')"
+    [ -n "$_awg_id" ] || fatal "could not generate profile id"
+    _awg_conf="$AWG_PROFILES_DIR/${_awg_id}.conf"
+    _awg_name_file="$AWG_PROFILES_DIR/${_awg_id}.name"
+    txn_begin
+    atomic_write "$_awg_conf" 600 < "$_awg_draft" || fatal "could not store AmneziaWG profile"
+    printf '%s' "$_awg_name" | atomic_write "$_awg_name_file" 600 \
+        || fatal "could not store AmneziaWG display name"
+    txn_commit
+    awg_resolve "$_awg_id" allow
+    c_grn "Saved AmneziaWG profile: $AWG_PICK_NAME"
+}
+
+awg_select() {
+    awg_resolve "$1"
+    load_settings
+    txn_begin
+    _build_awg_profile "$AWG_PICK_PATH"
+    printf '%s' "$AWG_PICK_ID" | atomic_write "$AWG_SELECTED" 600 \
+        || fatal "could not record selected AmneziaWG profile"
+    # AWG activation supersedes every other active source, but retains saved
+    # subscriptions and AWG profiles so the user can switch back later.
+    rm -f "$OUTBOUND_LINK" "$SUB_SELECTED" "$SUB_SELECTED_META" 2>/dev/null || true
+    rm -rf "$POOL_DIR" "$POOL_SRC" 2>/dev/null || true
+    save_settings
+    restart_service || fatal "profile was valid, but the service failed its startup health check"
+    txn_commit
+    c_grn "Selected and activated AmneziaWG profile: $AWG_PICK_NAME"
+}
+
+awg_commit_edit() {
+    _awg_id="$1"; _awg_draft="$2"; _awg_original_hash="$3"
+    case "$_awg_id" in ????????-????-????-????-????????????) : ;; *) fatal "invalid profile id" ;; esac
+    case "$_awg_id" in *[!0-9a-f-]*) fatal "invalid profile id" ;; esac
+    _awg_conf="$AWG_PROFILES_DIR/${_awg_id}.conf"
+    [ -f "$_awg_conf" ] && [ ! -L "$_awg_conf" ] || fatal "profile no longer exists"
+    [ "$(sha256_of "$_awg_conf")" = "$_awg_original_hash" ] \
+        || fatal "profile changed while the editor was open; refusing to overwrite it"
+    py "$MKAWG" validate --file "$_awg_draft" >/dev/null \
+        || fatal "AmneziaWG profile validation failed"
+    txn_begin
+    _awg_is_selected=0
+    [ "$(cat "$AWG_SELECTED" 2>/dev/null || true)" = "$_awg_id" ] \
+        && _awg_is_selected=1
+    if [ "$_awg_is_selected" = 1 ] && [ "$(current_engine)" = awg ]; then
+        load_settings
+        _build_awg_profile "$_awg_draft"
+        atomic_write "$_awg_conf" 600 < "$_awg_draft" || fatal "could not store edited profile"
+        restart_if_previously_active \
+            || fatal "edited profile failed its startup health check; previous profile restored"
+    else
+        atomic_write "$_awg_conf" 600 < "$_awg_draft" || fatal "could not store edited profile"
+        if [ "$_awg_is_selected" = 1 ]; then
+            rm -f "$AWG_SELECTED" "$SERVER_CACHE" \
+                || fatal "could not clear a stale AmneziaWG selection"
+        fi
+    fi
+    txn_commit
+    c_grn "AmneziaWG profile updated."
+}
+
+awg_rename() {
+    awg_resolve "$1" allow
+    _awg_name="$(py "$MKAWG" name --value "$2")" || fatal "invalid display name"
+    txn_begin
+    printf '%s' "$_awg_name" | atomic_write "$AWG_PROFILES_DIR/${AWG_PICK_ID}.name" 600 \
+        || fatal "could not update display name"
+    rm -f "$SERVER_CACHE" 2>/dev/null || true
+    txn_commit
+    awg_resolve "$AWG_PICK_ID" allow
+    c_grn "Profile renamed to: $AWG_PICK_NAME"
+}
+
+awg_delete() {
+    awg_resolve "$1" allow
+    txn_begin
+    _awg_is_selected=0
+    [ "$(cat "$AWG_SELECTED" 2>/dev/null || true)" = "$AWG_PICK_ID" ] \
+        && _awg_is_selected=1
+    if [ "$_awg_is_selected" = 1 ] && [ "$(current_engine)" = awg ]; then
+        systemctl stop "$SERVICE_NAME" 2>/dev/null || fatal "could not stop the active tunnel"
+        rm -f "$AWG_SELECTED" "$CONFIG" "$ENGINE_FILE" "$SERVER_CACHE" \
+            || fatal "could not remove the active profile state"
+        rm -f "$AWG_PICK_PATH" "$AWG_PROFILES_DIR/${AWG_PICK_ID}.name" \
+            || fatal "could not remove the active profile files"
+        write_service || fatal "could not update the service after deleting the active profile"
+        txn_commit
+        c_ylw "Deleted active profile '$AWG_PICK_NAME'; the tunnel is now stopped."
+    else
+        rm -f "$AWG_PICK_PATH" "$AWG_PROFILES_DIR/${AWG_PICK_ID}.name" \
+            || fatal "could not remove the profile files"
+        if [ "$_awg_is_selected" = 1 ]; then
+            rm -f "$AWG_SELECTED" "$SERVER_CACHE" \
+                || fatal "could not clear a stale AmneziaWG selection"
+        fi
+        txn_commit
+        c_ylw "Deleted AmneziaWG profile: $AWG_PICK_NAME"
+    fi
+}
+
+awg_details() {
+    [ "$(current_engine)" = awg ] \
+        || { c_ylw "No AmneziaWG profile is active."; return 1; }
+    _awg_path="$(awg_selected_profile)" \
+        || { c_ylw "No AmneziaWG profile is active."; return 1; }
+    _awg_id="$(cat "$AWG_SELECTED")"
+    awg_resolve "$_awg_id" allow
+    _awg_name="$AWG_PICK_NAME"
+    load_settings
+    _awg_info="$(py "$MKAWG" info --file "$_awg_path")" || return 1
+    _awg_version="${_awg_info%%"$TAB"*}"; _awg_info="${_awg_info#*"$TAB"}"
+    _awg_host="${_awg_info%%"$TAB"*}"; _awg_info="${_awg_info#*"$TAB"}"
+    _awg_port="${_awg_info%%"$TAB"*}"; _awg_info="${_awg_info#*"$TAB"}"
+    _awg_peers="${_awg_info%%"$TAB"*}"; _awg_info="${_awg_info#*"$TAB"}"
+    _awg_dns="${_awg_info%%"$TAB"*}"; _awg_mtu="${_awg_info#*"$TAB"}"
+    printf 'Name:           %s\n' "$_awg_name"
+    printf 'Protocol:       AmneziaWG %s\n' "$_awg_version"
+    printf 'Endpoint:       %s\n' "$(format_endpoint "$_awg_host" "$_awg_port")"
+    printf 'Peers:          %s\n' "$_awg_peers"
+    printf 'Profile MTU:    %s\n' "$_awg_mtu"
+    printf 'Profile DNS:    %s (informational)\n' "$_awg_dns"
+    printf 'UniFi DNS:      %s (managed in WireGuard settings)\n' "$INNER_DNS"
+    echo "Private and preshared keys are intentionally hidden."
+}
+
+awg_edit_until_valid() {
+    _awg_draft="$1"
+    while true; do
+        nano "$_awg_draft" || return 1
+        [ -s "$_awg_draft" ] || { c_ylw "The profile is empty."; return 1; }
+        if py "$MKAWG" validate --file "$_awg_draft" >/dev/null; then return 0; fi
+        printf 'Reopen nano and correct the profile? [Y/n]: '
+        read -r _awg_retry || true
+        case "${_awg_retry:-y}" in y|Y|yes|YES) : ;; *) return 1 ;; esac
+    done
+}
+
+menu_awg_create() {
+    have nano || fatal "nano is required to create AmneziaWG profiles"
+    printf 'Display name: '; read -r _awg_name || true
+    [ -n "${_awg_name:-}" ] || { c_ylw "Cancelled."; return; }
+    _awg_name="$(py "$MKAWG" name --value "$_awg_name")" || fatal "invalid display name"
+    awg_secure_dirs
+    EDIT_DRAFT="$(mktemp "$AWG_DRAFT_DIR/new.XXXXXX.conf")" || fatal "could not create editor draft"
+    chmod 600 "$EDIT_DRAFT"
+    echo "Paste the AmneziaWG config into nano, then press Ctrl+X, Y, Enter."
+    if awg_edit_until_valid "$EDIT_DRAFT"; then
+        locked_call awg_commit_new "$_awg_name" "$EDIT_DRAFT"
+    else
+        c_ylw "Profile was not saved."
+    fi
+    rm -f "$EDIT_DRAFT"; EDIT_DRAFT=""
+}
+
+menu_awg_edit() {
+    have nano || fatal "nano is required to edit AmneziaWG profiles"
+    awg_choose 'Profile number to edit: ' allow || return
+    _awg_id="$AWG_PICK_ID"; _awg_path="$AWG_PICK_PATH"
+    _awg_hash="$(sha256_of "$_awg_path")"; [ -n "$_awg_hash" ] || fatal "could not fingerprint profile"
+    awg_secure_dirs
+    EDIT_DRAFT="$(mktemp "$AWG_DRAFT_DIR/edit.XXXXXX.conf")" || fatal "could not create editor draft"
+    cp -p "$_awg_path" "$EDIT_DRAFT" || fatal "could not prepare profile editor"
+    chmod 600 "$EDIT_DRAFT"
+    if awg_edit_until_valid "$EDIT_DRAFT"; then
+        locked_call awg_commit_edit "$_awg_id" "$EDIT_DRAFT" "$_awg_hash"
+    else
+        c_ylw "Changes were not saved."
+    fi
+    rm -f "$EDIT_DRAFT"; EDIT_DRAFT=""
+}
+
+menu_awg() {
+    echo "AmneziaWG profiles:"
+    echo "  1. Create a new profile"
+    echo "  2. List profiles"
+    echo "  3. Select and activate a profile"
+    echo "  4. Edit a profile"
+    echo "  5. Rename a profile"
+    echo "  6. Delete a profile"
+    echo "  7. Show active profile details"
+    echo "  0. Back"
+    printf 'Choice: '; read -r _awg_choice || true
+    echo
+    case "${_awg_choice:-0}" in
+        1) menu_awg_create ;;
+        2) awg_list ;;
+        3) if awg_choose 'Profile number to select: '; then locked_call awg_select "$AWG_CHOICE_ID"; fi ;;
+        4) menu_awg_edit ;;
+        5) if awg_choose 'Profile number to rename: ' allow; then
+               printf 'New display name: '; read -r _awg_name || true
+               if [ -n "${_awg_name:-}" ]; then locked_call awg_rename "$AWG_CHOICE_ID" "$_awg_name"; else c_ylw "Cancelled."; fi
+           fi ;;
+        6) if awg_choose 'Profile number to delete: ' allow; then
+               printf "Delete '%s'? [y/N]: " "$AWG_PICK_NAME"; read -r _awg_confirm || true
+               if [ "${_awg_confirm:-}" = "y" ]; then locked_call awg_delete "$AWG_CHOICE_ID"; else c_ylw "Cancelled."; fi
+           fi ;;
+        7) awg_details ;;
+        0|"") : ;;
+        *) c_red "invalid choice" ;;
+    esac
 }
 
 # Interactive subscription submenu (wraps the cmd_sub actions).
@@ -2322,7 +2761,7 @@ cmd_uninstall() {
     systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null \
         && fatal "service is still running; refusing to remove its unit"
     systemctl disable --now "$PLUGIN_SERVICE_NAME" 2>/dev/null || true
-    fw_unlock                       # drop the sing-box external-exposure rule, if any
+    fw_unlock                       # drop the userspace-core firewall guard, if any
     rm -f "$SERVICE_FILE" "$PLUGIN_SERVICE_FILE" "$REFRESH_SERVICE_FILE" "$REFRESH_TIMER_FILE" "$ONBOOT_DST"
     remove_proxy_link
     systemctl daemon-reload 2>/dev/null || true
@@ -2332,11 +2771,11 @@ cmd_uninstall() {
 
 usage() {
     cat <<EOF
-proxy - multi-core proxy client (xray-core + sing-box) for UniFi gateways
+proxy - multi-core proxy/VPN client (xray-core + sing-box + AmneziaWG) for UniFi gateways
 
 Run 'proxy' with no arguments for the interactive management menu — it is the
-full interface: import links, subscriptions, WireGuard config, keys, port/MTU/DNS,
-ping test, autostart, updates, and uninstall.
+full interface: links, subscriptions, AmneziaWG profiles, WireGuard config, keys,
+port/MTU/DNS, ping tests, autostart, updates, and uninstall.
 
 Direct commands (quick ops / scripting):
   proxy start        Start the service
@@ -2380,7 +2819,7 @@ case "$cmd" in
     -h|--help|help) usage ;;
     # internal hooks (used only by install.sh, the boot hook, and the systemd
     # unit's ExecStartPre/ExecStopPost; not user-facing). _fw-lock is deliberately
-    # fail-closed for sing-box, while _fw-unlock is cleanup-only.
+    # fail-closed for sing-box/amnezia-box, while _fw-unlock is cleanup-only.
     install-binary)  cmd_install_binary ;;
     install-service) install_service ;;
     boot-recover)    boot_recover ;;

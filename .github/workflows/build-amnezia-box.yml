@@ -1,0 +1,140 @@
+name: Build AmneziaWG core
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-amnezia-box-release
+  cancel-in-progress: false
+
+env:
+  CORE_VERSION: 0.1.0
+  AMNEZIA_BOX_COMMIT: dbfa7d83c105d16a6b38846268a36532df04ff91
+  AMNEZIAWG_GO_VERSION: v0.2.19
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} core
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            goarch: amd64
+            goarm: ""
+          - arch: arm64
+            goarch: arm64
+            goarm: ""
+          - arch: armv7
+            goarch: arm
+            goarm: "7"
+    steps:
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: 1.24.4
+          cache: false
+      - name: Check out pinned Amnezia source
+        run: |
+          set -eu
+          git clone --filter=blob:none https://github.com/amnezia-vpn/amnezia-box.git source
+          git -C source checkout --detach "$AMNEZIA_BOX_COMMIT"
+          test "$(git -C source rev-parse HEAD)" = "$AMNEZIA_BOX_COMMIT"
+      - name: Pin current AmneziaWG userspace library
+        working-directory: source
+        run: |
+          set -eu
+          go get "github.com/amnezia-vpn/amneziawg-go@${AMNEZIAWG_GO_VERSION}"
+          test "$(go list -m -f '{{.Version}}' github.com/amnezia-vpn/amneziawg-go)" = "$AMNEZIAWG_GO_VERSION"
+          go mod vendor
+      - name: Build static core
+        working-directory: source
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GOTOOLCHAIN: local
+        run: |
+          set -eu
+          go build -mod=vendor -trimpath -tags 'with_gvisor,with_wireguard,with_awg' \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=proxy-unifi-awg-${CORE_VERSION}' -s -w -buildid=" \
+            -o amnezia-box ./cmd/sing-box
+          go version -m amnezia-box | grep -q 'CGO_ENABLED=0'
+          file amnezia-box | grep -q 'statically linked'
+          if [ "$GOARCH" = amd64 ]; then
+            ./amnezia-box version | grep -q "version proxy-unifi-awg-${CORE_VERSION}"
+          fi
+      - name: Package core and corresponding source
+        env:
+          PACKAGE_ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          package="proxy-unifi-amnezia-box-${CORE_VERSION}-linux-${PACKAGE_ARCH}"
+          mkdir -p "$package"
+          install -m 0755 source/amnezia-box "$package/amnezia-box"
+          install -m 0644 source/LICENSE "$package/LICENSE"
+          {
+            echo "amnezia-box commit: $AMNEZIA_BOX_COMMIT"
+            echo "amneziawg-go version: $AMNEZIAWG_GO_VERSION"
+            echo "build tags: with_gvisor,with_wireguard,with_awg"
+            echo "source: https://github.com/amnezia-vpn/amnezia-box"
+          } > "$package/SOURCE.txt"
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='UTC 2020-01-01' \
+            -czf "$package.tar.gz" "$package"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: core-${{ matrix.arch }}
+          path: proxy-unifi-amnezia-box-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish pinned core release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # Create or replace assets on the pinned project release.
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: 1.24.4
+          cache: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: core-*
+          merge-multiple: true
+          path: dist
+      - name: Prepare corresponding source archive
+        run: |
+          set -eu
+          git clone --filter=blob:none https://github.com/amnezia-vpn/amnezia-box.git source
+          git -C source checkout --detach "$AMNEZIA_BOX_COMMIT"
+          cd source
+          go get "github.com/amnezia-vpn/amneziawg-go@${AMNEZIAWG_GO_VERSION}"
+          test "$(go list -m -f '{{.Version}}' github.com/amnezia-vpn/amneziawg-go)" = "$AMNEZIAWG_GO_VERSION"
+          go mod vendor
+          rm -rf .git amnezia-box
+          cd ..
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='UTC 2020-01-01' \
+            -czf "dist/proxy-unifi-amnezia-box-${CORE_VERSION}-source.tar.gz" source
+          cd dist
+          sha256sum ./* > SHA256SUMS
+      - name: Publish pinned core release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="awg-core-v${CORE_VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --target "$GITHUB_SHA" \
+              --title "proxy-unifi AmneziaWG core ${CORE_VERSION}" \
+              --notes "Pinned userspace AWG 1.5/2.0 core for proxy-unifi. Corresponding source and checksums are attached."
+          fi
