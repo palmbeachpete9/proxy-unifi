@@ -5,7 +5,7 @@
 # Runs three tiers:
 #   1. static  - shellcheck + dash -n + python compile on all sources (always).
 #   2. parsers - generator/sub/json parsing + fuzz (always; pure Python, no network).
-#   3. engine  - real xray-core / sing-box validation of generated configs, and a
+#   3. engine  - real xray-core / sing-box / optional AWG-core validation, and a
 #                sandboxed CLI lifecycle (only if the binaries are available; the
 #                harness downloads them to a cache the first time when --download).
 #
@@ -46,7 +46,7 @@ static_tests() {
         done
         if [ "$_d" = 0 ]; then ok "dash -n"; else bad "dash -n"; fi
     else printf '  skip dash -n (not installed)\n'; fi
-    if python3 -m py_compile "$SRC"/mkxray.py "$SRC"/mksingbox.py "$SRC"/mksub.py "$SRC"/mkjson.py "$SRC"/proxylib.py "$SRC"/safeexec.py 2>/dev/null
+    if python3 -m py_compile "$SRC"/mkxray.py "$SRC"/mksingbox.py "$SRC"/mksub.py "$SRC"/mkawg.py "$SRC"/mkjson.py "$SRC"/proxylib.py "$SRC"/safeexec.py 2>/dev/null
     then ok "python compile"; else bad "python compile"; fi
     rm -rf "$SRC/__pycache__"
 
@@ -106,11 +106,14 @@ PY
     _ed="$(mktemp -d)"
     {
         sed -n '/^wg_endpoint() {/,/^}/p' "$SRC/proxy-unifi"
+        sed -n '/^format_endpoint() {/,/^}/p' "$SRC/proxy-unifi"
         cat <<'SH'
 WG_LISTEN="127.0.0.1"; WG_PORT="51821"
 [ "$(wg_endpoint)" = "127.0.0.1:51821" ] || exit 1
 WG_LISTEN="2001:db8::1"; WG_PORT="51821"
 [ "$(wg_endpoint)" = "[2001:db8::1]:51821" ] || exit 1
+[ "$(format_endpoint "2001:db8::2" 443)" = "[2001:db8::2]:443" ] || exit 1
+[ "$(format_endpoint "vpn.example" 443)" = "vpn.example:443" ] || exit 1
 SH
     } > "$_ed/endpoint.sh"
     if sh "$_ed/endpoint.sh"; then ok "CLI WireGuard endpoint formats IPv6"
@@ -138,12 +141,76 @@ SH
     else bad "core downloader tries fallback URL"; fi
     rm -rf "$_dd"
 
-    # The installer-wide rollback must restore scripts, both cores, and geo
+    _ad="$(mktemp -d)"
+    mkdir -p "$_ad/package"
+    cat > "$_ad/package/amnezia-box" <<'SH'
+#!/bin/sh
+[ "${1:-}" = version ] || exit 2
+echo 'sing-box version proxy-unifi-awg-0.1.0'
+SH
+    chmod 0755 "$_ad/package/amnezia-box"
+    python3 - "$_ad/good.tgz" "$_ad/package" "$_ad/bad.tgz" <<'PY'
+import io,sys,tarfile
+with tarfile.open(sys.argv[1], "w:gz") as archive:
+    archive.add(sys.argv[2], arcname="proxy-unifi-amnezia-box")
+with tarfile.open(sys.argv[3], "w:gz") as archive:
+    member=tarfile.TarInfo("../escape")
+    member.size=1
+    archive.addfile(member,io.BytesIO(b"x"))
+PY
+    cat > "$_ad/install-awg.sh" <<'SH'
+set -eu
+BIN_DIR="$WORK/bin"; ABIN="$BIN_DIR/amnezia-box"; RUN_DIR=""
+AWG_CORE_VERSION=0.1.0; AWG_CORE_TAG=awg-core-v0.1.0
+AWG_CORE_RELEASES=https://invalid.example
+have() { command -v "$1" >/dev/null 2>&1; }
+sb_arch() { echo arm64; }
+ensure_run_dir() { RUN_DIR="$WORK/run"; mkdir -p "$RUN_DIR"; }
+download_to() { cp "$ARCHIVE" "$2"; }
+github_asset_digest() { printf '%s\n' "$EXPECTED"; }
+verify_sha256() {
+    _got="$(python3 - "$1" <<'PY'
+import hashlib,sys
+print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())
+PY
+)"
+    [ "$_got" = "$2" ]
+}
+py() { python3 "$@"; }
+current_engine() { echo xray; }
+info() { :; }; err() { :; }; c_grn() { :; }
+core_version() { "$1" version | head -1; }
+SH
+    sed -n '/^cmd_install_awg() {/,/^}/p' "$SRC/proxy-unifi" >> "$_ad/install-awg.sh"
+    cat >> "$_ad/install-awg.sh" <<'SH'
+cmd_install_awg
+[ -x "$ABIN" ]
+"$ABIN" version | grep -q 'proxy-unifi-awg-0.1.0'
+[ ! -e "$ABIN.new" ] && [ ! -e "$ABIN.bak" ] && [ ! -e "$ABIN.bak.new" ]
+SH
+    _good_digest="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$_ad/good.tgz")"
+    _bad_digest="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$_ad/bad.tgz")"
+    _awg_install_ok=1
+    WORK="$_ad/work" ARCHIVE="$_ad/good.tgz" EXPECTED="$_good_digest" \
+        sh "$_ad/install-awg.sh" || _awg_install_ok=0
+    _old_core="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$_ad/work/bin/amnezia-box")"
+    if WORK="$_ad/work" ARCHIVE="$_ad/bad.tgz" EXPECTED="$_bad_digest" \
+        sh "$_ad/install-awg.sh" >/dev/null 2>&1; then
+        _awg_install_ok=0
+    fi
+    [ ! -e "$_ad/work/escape" ] || _awg_install_ok=0
+    [ "$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$_ad/work/bin/amnezia-box")" = "$_old_core" ] \
+        || _awg_install_ok=0
+    [ "$_awg_install_ok" = 1 ] && ok "AWG core installer validates and safely promotes archive" \
+        || bad "AWG core installer validates and safely promotes archive"
+    rm -rf "$_ad"
+
+    # The installer-wide rollback must restore scripts, all cores, and geo
     # assets from one retained promotion backup.
     _id="$(mktemp -d)"
     mkdir -p "$_id/live" "$_id/backup"
-    for _f in proxy-unifi mkxray.py mksingbox.py mksub.py mkjson.py proxylib.py safeexec.py \
-              xray sing-box geoip.dat geosite.dat; do
+    for _f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py \
+              xray sing-box amnezia-box geoip.dat geosite.dat; do
         printf old > "$_id/backup/$_f"; printf new > "$_id/live/$_f"
     done
     printf old > "$_id/backup/on_boot.sh"; printf new > "$_id/on_boot.sh"; : > "$_id/marker"
@@ -157,7 +224,7 @@ SH
     echo 'restore_promotion' >> "$_id/restore.sh"
     _install_restore=1
     if sh "$_id/restore.sh"; then
-        for _f in proxy-unifi xray sing-box geoip.dat geosite.dat; do
+        for _f in proxy-unifi mkawg.py xray sing-box amnezia-box geoip.dat geosite.dat; do
             [ "$(cat "$_id/live/$_f")" = old ] || _install_restore=0
         done
         [ "$(cat "$_id/on_boot.sh")" = old ] || _install_restore=0
@@ -171,7 +238,7 @@ SH
 
     _bd="$(mktemp -d)"
     mkdir -p "$_bd/archive-root/src" "$_bd/work"
-    for _f in proxy-unifi mkxray.py mksingbox.py mksub.py mkjson.py proxylib.py safeexec.py on_boot.sh; do
+    for _f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py on_boot.sh; do
         printf 'bundle:%s\n' "$_f" > "$_bd/archive-root/src/$_f"
     done
     python3 - "$_bd/source.tgz" "$_bd/archive-root" <<'PY'
@@ -196,8 +263,8 @@ SH
         cat <<'SH'
 printf '%040d\n' 1 > "$WORKDIR/repo-sha"
 prepare_source_bundle || exit 1
-fetch mksingbox.py "$WORKDIR/out" 0644 || exit 1
-grep -q '^bundle:mksingbox.py$' "$WORKDIR/out"
+fetch mkawg.py "$WORKDIR/out" 0644 || exit 1
+grep -q '^bundle:mkawg.py$' "$WORKDIR/out"
 SH
     } >> "$_bd/bundle.sh"
     if sh "$_bd/bundle.sh"; then ok "installer source archive fallback"
@@ -229,7 +296,7 @@ SH
     # (loopback-only) -- clearing any stale rule instead.
     _ud="$(mktemp -d)"
     cat > "$_ud/h.sh" <<'SH'
-SBIN=/b/sing-box; XRAY=/b/xray; CONFIG=/c/config.json; POOL_DIR=/c/pool
+    SBIN=/b/sing-box; ABIN=/b/amnezia-box; XRAY=/b/xray; CONFIG=/c/config.json; POOL_DIR=/c/pool
 BIN_DIR=/b; ROOT=/r; SERVICE_FILE="$WORK/unit"
 current_engine() { echo "$ENG"; }
 prepare_service_permissions() { :; }
@@ -242,10 +309,14 @@ SH
     ENG=singbox  WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
     grep -q '^ExecStartPre=+/b/proxy-unifi _fw-lock$'  "$_ud/unit" || _fw_ok=0
     grep -q '^ExecStopPost=-+/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
+    ENG=awg      WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
+    grep -q '^ExecStart=/b/amnezia-box run -c /c/config.json$' "$_ud/unit" || _fw_ok=0
+    grep -q '^ExecStartPre=+/b/proxy-unifi _fw-lock$' "$_ud/unit" || _fw_ok=0
+    grep -q '^ExecStopPost=-+/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
     ENG=xray     WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
     grep -q '^ExecStartPre=-+/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
     grep -q '_fw-lock' "$_ud/unit" && _fw_ok=0          # xray must NOT lock a port
-    [ "$_fw_ok" = 1 ] && ok "singbox WG port firewalled (unit)" || bad "singbox WG port firewalled (unit)"
+    [ "$_fw_ok" = 1 ] && ok "singbox/AWG WG port firewalled (unit)" || bad "singbox/AWG WG port firewalled (unit)"
     rm -rf "$_ud"
 
     # Exercise firewall ownership and IPv6 fail-closed behavior against a stateful
@@ -566,6 +637,256 @@ for bad_header in ("bad\r\nX: y", "emoji-\U0001f600", "\u043a\u0438\u0440\u0438\
 print("mksub-ok")
 PY
 
+    # mkawg: AWG 1.5/2.0 parser, bridge generator, profile catalog, and UI safety.
+    python3 - "$SRC" <<'PY' && ok "mkawg parser and UI corpus" || bad "mkawg parser and UI corpus"
+import base64
+import contextlib
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import types
+
+sys.path.insert(0, sys.argv[1])
+import mkawg
+import mksub
+
+PRIVATE = base64.b64encode(bytes(range(32))).decode()
+PUBLIC = base64.b64encode(bytes(reversed(range(32)))).decode()
+PUBLIC2 = base64.b64encode(bytes(range(96, 128))).decode()
+INNER = base64.b64encode(bytes(range(32, 64))).decode()
+INNER_PEER = base64.b64encode(bytes(range(64, 96))).decode()
+
+def text(extra="", endpoint="vpn.example:443", second_peer=False):
+    peers = """[Peer]
+PublicKey = %s
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = %s
+PersistentKeepalive = 25
+""" % (PUBLIC, endpoint)
+    if second_peer:
+        peers += """\n[Peer]
+PublicKey = %s
+AllowedIPs = 10.0.0.0/8
+Endpoint = backup.example:8443
+""" % PUBLIC2
+    return """[Interface]
+PrivateKey = %s
+Address = 172.16.0.2/32
+DNS = 8.8.8.8, 2001:4860:4860::8888
+MTU = 1280
+%s
+%s""" % (PRIVATE, extra, peers)
+
+def write(directory, value, name="profile.conf"):
+    path = os.path.join(directory, name)
+    with open(path, "w", encoding="utf-8") as output:
+        output.write(value)
+    return path
+
+def rejected(value):
+    with tempfile.TemporaryDirectory() as directory:
+        path = write(directory, value)
+        try:
+            mkawg.load_profile(path)
+            raise AssertionError("accepted malformed profile")
+        except mkawg.ProfileError:
+            pass
+
+awg15 = """Jc = 4
+Jmin = 40
+Jmax = 70
+S1 = 0
+S2 = 0
+H1 = 1
+H2 = 2
+H3 = 3
+H4 = 4
+I1 = <b 0x01020304><r 16><t><d><ds><dz 2>"""
+awg20 = """ListenPort = 51820
+Jc = 5
+Jmin = 32
+Jmax = 96
+S1 = 12
+S2 = 24
+S3 = 8
+S4 = 16
+H1 = 100-199
+H2 = 200-299
+H3 = 300-399
+H4 = 400-499
+I1 = <b 0x16030100><r 8>
+I2 = <rc 8><rd 8>
+I3 = <t><dz 2>
+I4 = <b abcd>
+I5 = <r 1>"""
+
+with tempfile.TemporaryDirectory() as directory:
+    p15 = write(directory, text(awg15))
+    profile15 = mkawg.load_profile(p15)
+    assert profile15["version"] == "1.5"
+    assert profile15["interface"]["i1"].startswith("<b 0x01020304>")
+    p20 = write(directory, text(awg20, "[2001:db8::10]:51820", True), "v2.conf")
+    profile20 = mkawg.load_profile(p20)
+    assert profile20["version"] == "2.0" and len(profile20["peers"]) == 2
+    assert profile20["peers"][0]["core_host"] == "[2001:db8::10]"
+    p10 = write(directory, text(""), "v1.conf")
+    assert mkawg.load_profile(p10)["version"] == "1.0"
+
+    secret = write(directory, INNER, "inner.key")
+    peer = write(directory, INNER_PEER, "peer.key")
+    args = types.SimpleNamespace(socks_port=0, secret_key_file=secret,
+                                 peer_pubkey_file=peer, port=51821,
+                                 address="10.7.0.1/32, fd00::1/128", mtu=1340,
+                                 loglevel="warn")
+    config = mkawg.build_config(profile20, args)
+    assert [item["tag"] for item in config["endpoints"]] == ["wg-in", "awg-out"]
+    assert config["route"]["final"] == "awg-out"
+    assert config["route"]["rules"] == [{"inbound": ["wg-in"], "outbound": "awg-out"}]
+    assert config["endpoints"][0]["private_key"] == INNER
+    assert config["endpoints"][1]["private_key"] == PRIVATE
+    assert config["endpoints"][1]["h1"] == "100-199"
+    assert config["endpoints"][1]["i5"] == "<r 1>"
+    assert "listen_port" not in config["endpoints"][1]
+    assert "outbounds" not in config and "direct" not in json.dumps(config)
+    args.socks_port = 10808
+    ping = mkawg.build_config(profile15, args)
+    assert ping["inbounds"][0]["listen"] == "127.0.0.1"
+    assert ping["route"]["final"] == "awg-out" and len(ping["endpoints"]) == 1
+
+    with contextlib.redirect_stdout(io.StringIO()) as output:
+        mkawg.print_info(profile15)
+    assert PRIVATE not in output.getvalue() and PUBLIC not in output.getvalue()
+
+    # Catalog rows preserve identity independently from the sorted display index.
+    profiles = os.path.join(directory, "profiles")
+    os.mkdir(profiles)
+    good_id = "11111111-1111-4111-8111-111111111111"
+    bad_id = "22222222-2222-4222-8222-222222222222"
+    write(profiles, text(awg15), good_id + ".conf")
+    write(profiles, "[Interface]\nPrivateKey = bad\n", bad_id + ".conf")
+    write(profiles, "🇩🇪 Москва 🛜", good_id + ".name")
+    write(profiles, "Broken", bad_id + ".name")
+    map_file = os.path.join(directory, "map")
+    old = os.environ.get("PROXY_UNIFI_TERMINAL_SAFE_EMOJI")
+    os.environ["PROXY_UNIFI_TERMINAL_SAFE_EMOJI"] = "1"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            mkawg.render_profiles(profiles, good_id, map_file)
+        rendered = output.getvalue()
+        assert "[*] AWG 1.5" in rendered and "[DE] Москва Wi-Fi" in rendered
+        assert "invalid" in rendered and "\x1b" not in rendered
+    finally:
+        if old is None:
+            os.environ.pop("PROXY_UNIFI_TERMINAL_SAFE_EMOJI", None)
+        else:
+            os.environ["PROXY_UNIFI_TERMINAL_SAFE_EMOJI"] = old
+    old_columns = os.environ.get("COLUMNS")
+    os.environ["COLUMNS"] = "60"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            mkawg.render_profiles(profiles, good_id)
+        narrow = output.getvalue()
+        assert "endpoint:" in narrow
+        for line in narrow.splitlines():
+            assert sum(mkawg._display_width(ch) for ch in line) <= 60, line
+    finally:
+        if old_columns is None:
+            os.environ.pop("COLUMNS", None)
+        else:
+            os.environ["COLUMNS"] = old_columns
+    mapping = open(map_file, encoding="ascii").read().splitlines()
+    assert set(mapping) == {good_id, bad_id}
+    assert (os.stat(map_file).st_mode & 0o777) == 0o600
+    with contextlib.redirect_stdout(io.StringIO()) as output:
+        mkawg.pick_profile(profiles, profile_id=bad_id, allow_invalid=True)
+    assert output.getvalue().startswith(bad_id + "\t")
+    try:
+        mkawg.pick_profile(profiles, profile_id=bad_id)
+        raise AssertionError("selected an invalid profile")
+    except mkawg.ProfileError:
+        pass
+    os.unlink(os.path.join(profiles, good_id + ".name"))
+    with contextlib.redirect_stdout(io.StringIO()) as output:
+        mkawg.pick_profile(profiles, profile_id=good_id)
+    assert output.getvalue().rstrip().endswith(good_id)
+
+    symlink = os.path.join(directory, "profile-link")
+    os.symlink(p15, symlink)
+    try:
+        mkawg.load_profile(symlink)
+        raise AssertionError("accepted profile symlink")
+    except mkawg.ProfileError:
+        pass
+
+# Malformed or dangerous semantics fail before core startup.
+rejected(text(awg15).replace("PrivateKey = " + PRIVATE, "PrivateKey = invalid"))
+rejected(text(awg15).replace("PrivateKey = " + PRIVATE,
+                             "PrivateKey = " + base64.b64encode(bytes(32)).decode()))
+rejected(text(awg15).replace("PublicKey = " + PUBLIC, "PublicKey = invalid"))
+rejected(text(awg15).replace("PublicKey = " + PUBLIC,
+                             "PublicKey = " + base64.b64encode(bytes(32)).decode()))
+rejected(text(awg15).replace("PublicKey = " + PUBLIC,
+                             "PublicKey = " + PUBLIC[:-2] + "B="))
+rejected(text(awg15).replace("MTU = 1280", "MTU = 1280\nMTU = 1400"))
+rejected(text(awg15).replace("MTU = 1280", "MTU = 1280\nPostUp = touch /tmp/pwn"))
+rejected(text(awg15).replace("MTU = 1280", "MTU = 1280\nUnknown = value"))
+rejected(text(awg15).replace("H1 = 1", "H1 = 0-4294967295"))
+rejected(text(awg20).replace("H2 = 200-299", "H2 = 150-299"))
+rejected(text(awg15).replace("I1 = <b 0x01020304><r 16><t><d><ds><dz 2>", "I1 = junk<b 00>"))
+rejected(text(awg15).replace("I1 = <b 0x01020304><r 16><t><d><ds><dz 2>", "I1 = <r 65508>"))
+rejected(text(awg15).replace("S1 = 0", "S1 = 65507"))
+rejected(text(awg15).replace("Jc = 4", "Jc = " + "9" * 10000))
+rejected(text(awg15).replace("H1 = 1", "H1 = " + "9" * 10000))
+rejected(text(awg15).replace("<r 16>", "<r " + "9" * 10000 + ">"))
+rejected(text(awg15).replace("vpn.example:443", "[2001:db8::1:443"))
+rejected(text(awg15).replace("[Peer]", "[Unknown]", 1))
+rejected(text(awg15).split("[Peer]", 1)[0])
+rejected(text(awg15) + "\n[Peer]\nPublicKey = " + PUBLIC +
+         "\nAllowedIPs = 10.0.0.0/8\nEndpoint = duplicate.example:443\n")
+rejected(text(awg15).replace("Address = 172.16.0.2/32",
+                             "Address = " + ",".join("10.0.0.%d/32" % n
+                                                       for n in range(1, 18))))
+rejected(text(awg15).replace("DNS = 8.8.8.8, 2001:4860:4860::8888",
+                             "DNS = " + ",".join("dns%d.example" % n
+                                                   for n in range(17))))
+rejected(text(awg15).replace("AllowedIPs = 0.0.0.0/0, ::/0",
+                             "AllowedIPs = " + ",".join("10.%d.0.0/16" % n
+                                                          for n in range(129))))
+
+try:
+    mkawg.validate_name("safe\u202eevil")
+    raise AssertionError("accepted bidirectional override in name")
+except mkawg.ProfileError:
+    pass
+assert mkawg.validate_name("Семья 👨‍👩‍👧‍👦") == "Семья 👨‍👩‍👧‍👦"
+safe = mkawg._display("日本日本日本日本", 7)
+assert safe.endswith("...") and sum(mkawg._display_width(ch) for ch in safe) <= 7
+assert mkawg._display_width("\ufe0f") == 0 and mkawg._display_width("\u200d") == 0
+subsafe = mksub.clean("日本日本日本日本", 7)
+assert subsafe.endswith("…") and sum(mksub._display_width(ch) for ch in subsafe) <= 7
+assert mksub._display_width("\ufe0f") == 0 and mksub._display_width("\u200d") == 0
+
+# CLI errors are concise and never duplicate proxylib's message or leak traceback.
+with tempfile.TemporaryDirectory() as directory:
+    bad = write(directory, text(awg15, "bad host:443"))
+    proc = subprocess.run([sys.executable, os.path.join(sys.argv[1], "mkawg.py"),
+                           "validate", "--file", bad], text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.returncode != 0 and proc.stderr.count("mkawg: error:") == 1
+    assert "Traceback" not in proc.stderr
+    hostile = write(directory, text(awg15).replace(
+        "Address = 172.16.0.2/32", "Address = bad\x1b[2Jhost"), "hostile.conf")
+    proc = subprocess.run([sys.executable, os.path.join(sys.argv[1], "mkawg.py"),
+                           "validate", "--file", hostile], text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.returncode != 0 and "\x1b" not in proc.stderr
+    assert not any(ord(ch) < 32 and ch not in "\r\n\t" for ch in proc.stderr)
+print("mkawg-ok")
+PY
+
     # mkjson: balancer profile validation + overlay tag matching (pure python)
     python3 - "$SRC" <<'PY' && ok "mkjson profile validation" || bad "mkjson profile validation"
 import sys, json
@@ -686,6 +1007,13 @@ PY
 # -------------------------------------------------------------------------
 find_xray()   { [ -x "$CACHE/xray" ] && echo "$CACHE/xray"; }
 find_singbox(){ [ -x "$CACHE/sing-box" ] && echo "$CACHE/sing-box"; }
+find_awg() {
+    if [ -n "${PROXY_UNIFI_AWG_CORE:-}" ] && [ -x "$PROXY_UNIFI_AWG_CORE" ]; then
+        echo "$PROXY_UNIFI_AWG_CORE"
+    elif [ -x "$CACHE/amnezia-box" ]; then
+        echo "$CACHE/amnezia-box"
+    fi
+}
 
 download_engines() {
     mkdir -p "$CACHE"
@@ -729,7 +1057,7 @@ PY
 }
 
 engine_tests() {
-    XR="$(find_xray || true)"; SG="$(find_singbox || true)"
+    XR="$(find_xray || true)"; SG="$(find_singbox || true)"; AB="$(find_awg || true)"
     if [ -z "$XR" ] || [ -z "$SG" ]; then
         printf '== engine == (skipped: run with --download to fetch xray/sing-box)\n'
         return
@@ -755,6 +1083,74 @@ engine_tests() {
         && ok "xray current XHTTP/FinalMask share fields" || bad "xray current XHTTP/FinalMask share fields"
     gs "hysteria2://pw@h:443?sni=h" && ok "singbox hysteria2" || bad "singbox hysteria2"
     gs "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?sni=h" && ok "singbox tuic" || bad "singbox tuic"
+    if [ -n "$AB" ]; then
+        cat > "$_d/awg.conf" <<EOF
+[Interface]
+PrivateKey = $XP
+Address = 172.16.0.2/32
+MTU = 1280
+Jc = 4
+Jmin = 40
+Jmax = 70
+S1 = 8
+S2 = 16
+S3 = 4
+S4 = 12
+H1 = 100-199
+H2 = 200-299
+H3 = 300-399
+H4 = 400-499
+I1 = <b 0x01020304><r 8>
+I2 = <rc 4><rd 4>
+
+[Peer]
+PublicKey = $UP
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = 127.0.0.1:9
+PersistentKeepalive = 25
+EOF
+        printf '%s' "$XP" > "$_d/inner.key"
+        printf '%s' "$UP" > "$_d/peer.key"
+        if python3 "$SRC/mkawg.py" build --file "$_d/awg.conf" \
+             --secret-key-file "$_d/inner.key" --peer-pubkey-file "$_d/peer.key" \
+             --port 51831 --address 10.7.0.1/32 --mtu 1340 > "$_d/awg-active.json" \
+           && "$AB" check -c "$_d/awg-active.json" >/dev/null 2>&1
+        then ok "amnezia-box AWG 2.0 bridge config"; else bad "amnezia-box AWG 2.0 bridge config"; fi
+
+        _aport="$(python3 - <<'PY'
+import socket
+s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()
+PY
+)"
+        if python3 "$SRC/mkawg.py" build --file "$_d/awg.conf" \
+             --socks-port "$_aport" > "$_d/awg-ping.json" \
+           && "$AB" check -c "$_d/awg-ping.json" >/dev/null 2>&1 \
+           && python3 - "$AB" "$_d/awg-ping.json" "$_aport" <<'PY'
+import socket,subprocess,sys,time
+proc=subprocess.Popen([sys.argv[1],"run","-c",sys.argv[2]],
+                      stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+try:
+    deadline=time.time()+8
+    while time.time()<deadline:
+        if proc.poll() is not None:
+            raise SystemExit(1)
+        try:
+            with socket.create_connection(("127.0.0.1",int(sys.argv[3])),0.2):
+                raise SystemExit(0)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit(1)
+finally:
+    if proc.poll() is None:
+        proc.terminate()
+        try: proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill(); proc.wait()
+PY
+        then ok "amnezia-box AWG endpoint runtime"; else bad "amnezia-box AWG endpoint runtime"; fi
+    else
+        printf '  skip amnezia-box validation (set PROXY_UNIFI_AWG_CORE or cache tests/.cache/amnezia-box)\n'
+    fi
     # balancer pool: build overlay + validate merged confdir
     printf '%s' "$XP" > "$_d/sk"; printf '%s' "$UP" > "$_d/pk"
     # profile carries a hostile extra inbound on 0.0.0.0; sanitizer must drop it.

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-proxylib.py - shared share-link parsing utilities for proxy-unifi's two config
-generators, mkxray.py (Xray) and mksingbox.py (sing-box).
+proxylib.py - shared parsing utilities for proxy-unifi's config generators.
 
-Both generators parse the same family of proxy URIs into an engine-specific
+The two share-link generators parse the same family of proxy URIs into an engine-specific
 outbound; only the generic plumbing (URL splitting, host/port validation,
 base64, query helpers, secret-file loading, Shadowsocks credentials, and error
 handling) is shared here instead of being copy-pasted into each.
+mkawg.py also reuses the strict host validator for AmneziaWG peer endpoints.
 
-It is imported, never run directly: each generator is invoked as
-`python3 .../mkxray.py`, and Python puts that script's directory on sys.path[0],
-so a sibling proxylib.py in the same bin dir is importable with no packaging.
+It is imported, never run directly. Each helper runs from the installed `bin/`
+directory, which Python places on sys.path[0], so the sibling proxylib.py is
+importable with no packaging.
 
 Stdlib only (Python 3.7+).
 """

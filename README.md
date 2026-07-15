@@ -9,10 +9,11 @@
 Run a headless proxy client on your UniFi Cloud Gateway and steer traffic into it
 from the native UniFi UI (**Policy Engine → Policy Table**).
 
-proxy-unifi ships **two cores** — [xray-core](https://github.com/XTLS/Xray-core) and
-[sing-box](https://github.com/SagerNet/sing-box) — and automatically picks the right
-one for each link you import. Both terminate the **same** WireGuard tunnel, so the
-UniFi UI only ever needs **one** VPN Client entry.
+proxy-unifi ships **three cores** — [xray-core](https://github.com/XTLS/Xray-core),
+[sing-box](https://github.com/SagerNet/sing-box), and a pinned userspace
+[AmneziaWG-enabled core](https://github.com/amnezia-vpn/amnezia-box). It selects the
+right core for imported links and saved AWG profiles. All three terminate the
+**same** WireGuard tunnel, so the UniFi UI only ever needs **one** VPN Client entry.
 
 UniFi gateways have no built-in outbound proxy support and can't dial any proxy protocol server's links (`vless://`, `hysteria2://`, ...).
 proxy-unifi bridges that gap **without** altering UniFi OS packages: it presents the proxy to
@@ -32,7 +33,8 @@ After the script finishes the installation, run `proxy` for the management menu:
 
 1. **Import a connection** — choose a single-server share link (`vless://`,
    `vmess://`, `trojan://`, `ss://`, `hysteria2://`, or `tuic://`), an HTTPS
-   subscription, or an Xray JSON profile from the corresponding menu action.
+   subscription, an Xray JSON profile, or an AmneziaWG profile from the
+   corresponding menu action.
 
 2. **Copy the shown WireGuard VPN Client config** — create a `.conf` file locally on your computer and upload it at:
 
@@ -49,17 +51,19 @@ The created `.conf` file & Ubiquiti WireGuard config is persistent for the entir
   │  VLAN client ─▶ Policy Table route ─▶ WireGuard VPN Client (native UniFi)  │
   │                              │ encrypted WireGuard over loopback           │
   │                              ▼  udp 127.0.0.1:51821                        │
-  │                  xray-core  OR  sing-box  (WireGuard inbound)              │
+  │        xray-core  OR  sing-box  OR  AmneziaWG core (WireGuard inbound)     │
   │                              │  terminates the tunnel, then routes         │
-  │                              ▼  proxy outbound (your imported link)        │
+  │                              ▼  selected proxy / AWG outbound              │
   └──────────────────────────────┼─────────────────────────────────────────────┘
                                  ▼  out via WAN
                             your proxy server ──▶ Internet
 ```
 
 The gateway's own WireGuard VPN Client does a real WireGuard handshake with the
-active core over loopback. The core terminates the tunnel and forwards everything
-out through the proxy server from your link. No remote WireGuard server is required.
+active core over loopback. The core terminates that inner tunnel and forwards
+everything through the selected proxy or AWG outbound. Proxy-link modes need no
+remote WireGuard server; AWG mode connects to the remote AmneziaWG peer in the
+selected profile.
 
 ## Compatibility
 
@@ -94,12 +98,14 @@ The proxy engine is chosen automatically based on the imported link:
 | Shadowsocks + v2ray-plugin | sing-box |
 | Hysteria2 | sing-box |
 | TUIC | sing-box |
+| AmneziaWG 1.5 / 2.0 configuration | AmneziaWG core |
 
-Only one core runs at a time. Both use the **same** WireGuard keys/port, so the
+Only one core runs at a time. All three use the **same** WireGuard keys/port, so the
 single UniFi VPN Client entry works no matter which core is active.
 
 > **Note:** xray binds the WireGuard port on loopback (`127.0.0.1:51821`).
-> sing-box has no listen-address option, so it binds all interfaces — but
+> sing-box and the AmneziaWG core have no listen-address option for their inner
+> WireGuard endpoint, so they bind all interfaces — but
 > proxy-unifi adds an `iptables`/`ip6tables` rule that drops every non-loopback
 > packet to that port, making it unreachable from the LAN/WAN. Defence in depth:
 > the port is firewalled to loopback **and** WireGuard only ever answers the one
@@ -128,6 +134,30 @@ WireGuard inbound. Provider outbounds, routing rules, balancer strategies,
 health probes, and failover tags otherwise remain intact. Profiles that cannot
 be projected safely are rejected before xray-core is started.
 
+## AmneziaWG profiles
+
+The second menu block manages standalone AmneziaWG 1.5 and 2.0 client
+configurations. Choose **Create a new profile**, enter a display name, paste the
+configuration into `nano`, and save with `Ctrl+X`, `Y`, `Enter`. Saved profiles
+can be listed, selected and activated, edited, renamed, or deleted; `*` marks the
+active profile. Cyrillic, CJK text, and emoji are preserved, with a display-only
+fallback for limited UniFi SSH terminals. `nano` is required only for the create
+and edit actions; all other proxy-unifi features remain available without it.
+
+AWG runs entirely in userspace. It does not create a kernel interface, change
+gateway policy routes, require `/dev/net/tun`, or replace the persistent UniFi
+WireGuard client. Selecting an AWG profile therefore needs no change in the UniFi
+UI. The AWG core is downloaded on first activation and is pinned to the project
+release and its GitHub SHA-256 asset digest.
+
+The importer accepts AWG obfuscation fields `Jc`, `Jmin`, `Jmax`, `S1-S4`,
+`H1-H4`, and `I1-I5`, including AWG 2.0 header ranges and CPS packet templates.
+Multiple peers, IPv4/IPv6 addresses, preshared keys, and keepalives are supported.
+Unsafe `wg-quick` hooks and routing commands are rejected. A profile's client-side
+`ListenPort` is retained in its saved source but omitted from the outbound runtime
+to avoid opening an unnecessary UDP listener. Profile DNS is shown for reference;
+the DNS advertised to UniFi remains the global value under **WireGuard settings**.
+
 ## Usage
 
 Run `proxy` for the interactive menu, or use the direct commands:
@@ -140,10 +170,10 @@ Run `proxy` for the interactive menu, or use the direct commands:
 | `proxy start` · `stop` · `restart` | Service controls |
 | `proxy logs [args]` | Service logs (passed to `journalctl`) |
 | `proxy help` | Show help |
-| `proxy update` | Updates xray, installed sing-box, and bundled geo files |
+| `proxy update` | Updates xray, installed sing-box/AWG cores, and bundled geo files |
 | `proxy geo-update` | Updates the independent routing geo database |
 
-The menu covers: single links, subscriptions, Xray JSON profiles, UniFi WireGuard config,
+The menu covers: single links, subscriptions, AmneziaWG profiles, Xray JSON profiles, UniFi WireGuard config,
 regenerate keys, change port/MTU/DNS, ping test + protocol, enable/disable
 autostart, update cores, update geo files, and uninstall.
 
@@ -153,8 +183,8 @@ autostart, update cores, update geo files, and uninstall.
   manage it over SSH with `proxy`.
 - **Loopback endpoint:** the UniFi WireGuard VPN Client points at `127.0.0.1:51821`.
   A custom `WG_LISTEN` address is supported for xray-core links and JSON pools.
-  sing-box cannot bind this inbound to a chosen address, so proxy-unifi requires
-  loopback configuration for sing-box and fails closed if its firewall guard
+  sing-box and the AmneziaWG core cannot bind this inbound to a chosen address,
+  so proxy-unifi requires loopback configuration for those cores and fails closed if its firewall guard
   cannot be installed.
 - **MTU** defaults to `1340` (Change via main menu if large transfers stall);
   **DNS** defaults to `8.8.8.8`.
@@ -181,7 +211,7 @@ Remote installer files are pinned to one immutable GitHub commit for each run.
 Core archives and geo assets must pass their published SHA-256 checks before
 activation, and failed core/service updates restore the previous files.
 
-Re-running the installer only overwrites `bin/` (script + binaries) and the `systemd` unit. Your WireGuard keys, added proxy link, subscription catalog, and client settings (DNS, MTU) persist — the UniFi WireGuard client keeps working without any changes required.
+Re-running the installer only overwrites `bin/` (script + binaries) and the `systemd` unit. Your WireGuard keys, added proxy link, subscription catalog, AmneziaWG profiles, and client settings (DNS, MTU) persist — the UniFi WireGuard client keeps working without any changes required.
 
 ## Uninstall
 
@@ -195,8 +225,10 @@ Then delete the WireGuard VPN Client in the UniFi UI.
 ## Credits
 
 Persistence model built on [unifi-utilities/unifi-common](https://github.com/unifi-utilities/unifi-common).
-Powered by [XTLS/Xray-core](https://github.com/XTLS/Xray-core) and
-[SagerNet/sing-box](https://github.com/SagerNet/sing-box).
+Powered by [XTLS/Xray-core](https://github.com/XTLS/Xray-core),
+[SagerNet/sing-box](https://github.com/SagerNet/sing-box),
+[AmneziaVPN/amnezia-box](https://github.com/amnezia-vpn/amnezia-box), and
+[AmneziaVPN/amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go).
 
 ## License
 
