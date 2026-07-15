@@ -2340,7 +2340,9 @@ awg_commit_edit() {
     case "$_awg_id" in ????????-????-????-????-????????????) : ;; *) fatal "invalid profile id" ;; esac
     case "$_awg_id" in *[!0-9a-f-]*) fatal "invalid profile id" ;; esac
     _awg_conf="$AWG_PROFILES_DIR/${_awg_id}.conf"
-    [ -f "$_awg_conf" ] && [ ! -L "$_awg_conf" ] || fatal "profile no longer exists"
+    if [ ! -f "$_awg_conf" ] || [ -L "$_awg_conf" ]; then
+        fatal "profile no longer exists"
+    fi
     [ "$(sha256_of "$_awg_conf")" = "$_awg_original_hash" ] \
         || fatal "profile changed while the editor was open; refusing to overwrite it"
     py "$MKAWG" validate --file "$_awg_draft" >/dev/null \

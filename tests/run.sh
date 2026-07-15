@@ -36,7 +36,7 @@ static_tests() {
     echo "== static =="
     if have shellcheck; then
         if shellcheck -s sh "$SRC/proxy-unifi" "$SRC/on_boot.sh" "$ROOT/install.sh" \
-            "$ROOT/tests/run.sh" "$ROOT/tests/lifecycle.sh" >/dev/null 2>&1
+            "$ROOT/tests/run.sh" "$ROOT/tests/lifecycle.sh"
         then ok "shellcheck"; else bad "shellcheck"; fi
     else printf '  skip shellcheck (not installed)\n'; fi
     if have dash; then
