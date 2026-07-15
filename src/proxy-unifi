@@ -65,7 +65,7 @@ PLUGIN_SERVICE_FILE="/etc/systemd/system/${PLUGIN_SERVICE_NAME}.service"
 XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/latest/download"
 SINGBOX_RELEASES="https://github.com/SagerNet/sing-box/releases"
 AWG_CORE_RELEASES="https://github.com/palmbeachpete9/proxy-unifi/releases"
-AWG_CORE_VERSION="0.1.0"
+AWG_CORE_VERSION="1.0.0"
 AWG_CORE_TAG="awg-core-v${AWG_CORE_VERSION}"
 
 # defaults (overridable via settings.env)

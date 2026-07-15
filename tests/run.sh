@@ -146,7 +146,7 @@ SH
     cat > "$_ad/package/amnezia-box" <<'SH'
 #!/bin/sh
 [ "${1:-}" = version ] || exit 2
-echo 'sing-box version proxy-unifi-awg-0.1.0'
+echo 'sing-box version proxy-unifi-awg-1.0.0'
 SH
     chmod 0755 "$_ad/package/amnezia-box"
     python3 - "$_ad/good.tgz" "$_ad/package" "$_ad/bad.tgz" <<'PY'
@@ -161,7 +161,7 @@ PY
     cat > "$_ad/install-awg.sh" <<'SH'
 set -eu
 BIN_DIR="$WORK/bin"; ABIN="$BIN_DIR/amnezia-box"; RUN_DIR=""
-AWG_CORE_VERSION=0.1.0; AWG_CORE_TAG=awg-core-v0.1.0
+AWG_CORE_VERSION=1.0.0; AWG_CORE_TAG=awg-core-v1.0.0
 AWG_CORE_RELEASES=https://invalid.example
 have() { command -v "$1" >/dev/null 2>&1; }
 sb_arch() { echo arm64; }
@@ -185,7 +185,7 @@ SH
     cat >> "$_ad/install-awg.sh" <<'SH'
 cmd_install_awg
 [ -x "$ABIN" ]
-"$ABIN" version | grep -q 'proxy-unifi-awg-0.1.0'
+"$ABIN" version | grep -q 'proxy-unifi-awg-1.0.0'
 [ ! -e "$ABIN.new" ] && [ ! -e "$ABIN.bak" ] && [ ! -e "$ABIN.bak.new" ]
 SH
     _good_digest="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$_ad/good.tgz")"

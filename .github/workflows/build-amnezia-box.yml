@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CORE_VERSION: 0.1.0
+  CORE_VERSION: 1.0.0
   AMNEZIA_BOX_COMMIT: dbfa7d83c105d16a6b38846268a36532df04ff91
   AMNEZIAWG_GO_VERSION: v0.2.19
 
@@ -135,6 +135,6 @@ jobs:
             gh release upload "$tag" dist/* --clobber
           else
             gh release create "$tag" dist/* --target "$GITHUB_SHA" \
-              --title "proxy-unifi AmneziaWG core ${CORE_VERSION}" \
+              --title "AmneziaWG Core ${CORE_VERSION}" \
               --notes "Pinned userspace AWG 1.5/2.0 core for proxy-unifi. Corresponding source and checksums are attached."
           fi
