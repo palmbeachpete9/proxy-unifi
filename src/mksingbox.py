@@ -2,8 +2,8 @@
 """
 mksingbox.py - Build a sing-box config for the UniFi WireGuard bridge.
 
-Used for the protocols xray-core can't do natively: Shadowsocks with a SIP003
-plugin handled in-process (obfs-local / v2ray-plugin), Hysteria2 and TUIC.
+Used for SS2022, Shadowsocks with a supported SIP003 plugin handled in-process
+(obfs-local / v2ray-plugin), Hysteria2 and TUIC.
 
 Topology mirrors the xray path: a WireGuard *server* endpoint terminates the
 UniFi gateway's WireGuard VPN Client (same keys/port), and everything it
@@ -20,7 +20,7 @@ from urllib.parse import unquote
 from proxylib import (die, flat_query, qg, safe_urlsplit, host_port, safe_port,
                       valid_host, reject_unknown_query, shadowsocks_credentials,
                       add_secret_file_arguments, load_generator_inputs,
-                      handle_common_generator_modes)
+                      handle_common_generator_modes, shadowsocks_engine)
 
 
 _TLS_QUERY = {"sni", "peer", "alpn", "insecure", "allowInsecure",
@@ -65,16 +65,23 @@ def plugin_alias(name):
 # --------------------------------------------------------------------------
 def parse_ss(link):
     u, method, password, host, port = shadowsocks_credentials(link)
-
-    out = {"type": "shadowsocks", "tag": "proxy", "server": host,
-           "server_port": port, "method": method, "password": password}
-
     query = flat_query(u)
     reject_unknown_query(query, {"plugin"})
     raw = qg(query, "plugin")
+    name = ""
+    opts = ""
     if raw:
         raw = unquote(raw)
         name, opts = (raw.split(";", 1) + [""])[:2]
+    engine, reason, _variant = shadowsocks_engine(method, password, name)
+    if engine != "singbox":
+        if reason:
+            die(reason)
+        die("plain legacy Shadowsocks links are handled by xray-core")
+
+    out = {"type": "shadowsocks", "tag": "proxy", "server": host,
+           "server_port": port, "method": method, "password": password}
+    if name:
         out["plugin"] = plugin_alias(name)
         out["plugin_opts"] = opts
     return out, host, port
@@ -171,7 +178,7 @@ def parse_link(link):
         return parse_tuic(link)
     if low.startswith("ss://"):
         return parse_ss(link)
-    die("unsupported link for sing-box (expected ss:// with plugin, hysteria2://, or tuic://)")
+    die("unsupported link for sing-box (expected SS2022/SS plugin, hysteria2, or tuic)")
 
 
 def build_test_config(args):
@@ -221,7 +228,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="Build sing-box config for the UniFi WireGuard bridge")
     ap.add_argument("--link", default="",
-                    help="proxy share link (ss:// w/ plugin, hysteria2://, tuic://)")
+                    help="proxy share link (SS2022/SS plugin, hysteria2://, tuic://)")
     ap.add_argument("--port", type=int, default=0, help="UDP port for the WireGuard endpoint")
     ap.add_argument("--secret-key", default="", help="local WireGuard private key, base64")
     ap.add_argument("--peer-pubkey", default="", help="UniFi WireGuard public key, base64")

@@ -24,6 +24,14 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 
 _B64_ALPHABET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_=")
 
+SS2022_KEY_BYTES = {
+    "2022-blake3-aes-128-gcm": 16,
+    "2022-blake3-aes-256-gcm": 32,
+    "2022-blake3-chacha20-poly1305": 32,
+}
+SS2022_MAX_KEYS = 16
+SINGBOX_SS_PLUGINS = ("obfs-local", "simple-obfs", "v2ray-plugin")
+
 
 def die(msg):
     """Print 'PROG: error: MSG' to stderr and exit 2. PROG is derived from the
@@ -263,12 +271,15 @@ def xray_outbound_servers(ob):
     return result
 
 
-def shadowsocks_credentials(link):
-    """Return (split URL, method, password, host, port) for SIP002 or legacy SS."""
-    parsed = safe_urlsplit(link)
-    host, port = host_port(parsed)
+def shadowsocks_method_password(parsed):
+    """Extract SS method/password without validating the destination.
+
+    This non-exiting form is shared with subscription classification, where one
+    malformed provider row must be marked unsupported instead of terminating
+    the entire catalog parse.
+    """
     method = password = None
-    if parsed.username is not None and host and port:
+    if parsed.username is not None:
         if parsed.password is not None:
             method, password = unquote(parsed.username), unquote(parsed.password)
         else:
@@ -278,8 +289,86 @@ def shadowsocks_credentials(link):
     if method is None:
         decoded = b64decode_any(parsed.netloc)
         if decoded and "@" in decoded and ":" in decoded:
-            credentials, hostport = decoded.rsplit("@", 1)
+            credentials = decoded.rsplit("@", 1)[0]
             method, password = credentials.split(":", 1)
+    return method, password
+
+
+def shadowsocks_2022_key_info(method, password, allow_xray_compat=True):
+    """Return (is_ss2022, error, needs_xray_compat) without exposing keys.
+
+    SS2022 uses one fixed-length base64 PSK, or a colon-separated identity chain
+    for an AES single-port multi-user server and optional relays. Xray historically
+    also accepts 32-byte keys with the AES-128 method; preserve that existing
+    behavior only when the caller explicitly allows the compatibility path.
+    """
+    lowered = method.lower() if isinstance(method, str) else ""
+    if lowered not in SS2022_KEY_BYTES:
+        if lowered.startswith("2022-"):
+            return True, "unsupported SS2022 method", False
+        return False, "", False
+    if method != lowered:
+        return True, "SS2022 method must use its exact lowercase name", False
+    if not isinstance(password, str) or not password or len(password) > 1024:
+        return True, "SS2022 key is empty or too long", False
+    parts = password.split(":")
+    if len(parts) > SS2022_MAX_KEYS or any(not part for part in parts):
+        return True, "SS2022 key must contain 1-%d colon-delimited PSKs" \
+            % SS2022_MAX_KEYS, False
+    if len(parts) > 1 and method == "2022-blake3-chacha20-poly1305":
+        return True, "SS2022 multi-user keys require an AES-GCM method", False
+    expected = SS2022_KEY_BYTES[method]
+    compatibility = False
+    for number, encoded in enumerate(parts, 1):
+        try:
+            # SS2022 PSKs use standard base64. Accept omitted trailing padding,
+            # but not whitespace or the URL-safe alphabet inside the decoded
+            # SIP002 credential.
+            if any(ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+                   for ch in encoded):
+                raise ValueError()
+            raw = base64.b64decode(b64_pad(encoded), validate=True)
+        except Exception:
+            return True, "SS2022 key #%d is not valid base64" % number, False
+        if len(raw) == expected:
+            continue
+        if method == "2022-blake3-aes-128-gcm" and len(raw) == 32 \
+                and allow_xray_compat:
+            compatibility = True
+            continue
+        return True, "SS2022 key #%d must decode to %d bytes" % (number, expected), False
+    return True, "", compatibility
+
+
+def shadowsocks_engine(method, password, plugin=""):
+    """Return (engine, reason, variant) for one parsed Shadowsocks link."""
+    is_2022, error, compatibility = shadowsocks_2022_key_info(
+        method, password, allow_xray_compat=True)
+    variant = "2022" if is_2022 else ""
+    if error:
+        return "", error, variant
+    if plugin and plugin not in SINGBOX_SS_PLUGINS:
+        return "", "unsupported SIP003 plugin", variant
+    if is_2022:
+        if compatibility:
+            if plugin:
+                return "", "32-byte AES-128 compatibility keys cannot use a SIP003 plugin", variant
+            return "xray", "Xray 32-byte AES-128 compatibility key", variant
+        return "singbox", "", variant
+    return ("singbox", "", variant) if plugin else ("xray", "", variant)
+
+
+def shadowsocks_credentials(link):
+    """Return (split URL, method, password, host, port) for SIP002 or legacy SS."""
+    parsed = safe_urlsplit(link)
+    host, port = host_port(parsed)
+    method, password = shadowsocks_method_password(parsed)
+    if parsed.username is None and (not host or not port):
+        decoded = b64decode_any(parsed.netloc)
+        if decoded and "@" in decoded and ":" in decoded:
+            credentials, hostport = decoded.rsplit("@", 1)
+            if method is None:
+                method, password = credentials.split(":", 1)
             try:
                 if hostport.startswith("[") and "]:" in hostport:
                     host, port = hostport[1:].rsplit("]:", 1)
@@ -289,6 +378,17 @@ def shadowsocks_credentials(link):
                 die("could not parse shadowsocks server host/port")
     if not method or not password or not host or not port:
         die("could not parse shadowsocks link")
+    is_2022, error, _compatibility = shadowsocks_2022_key_info(
+        method, password, allow_xray_compat=True)
+    if is_2022 and error:
+        die(error)
+    if is_2022:
+        # Providers occasionally omit trailing key padding inside the SIP002
+        # credential. The bytes are unambiguous, but current cores expect the
+        # canonical padded spelling in their JSON configuration.
+        password = ":".join(
+            base64.b64encode(base64.b64decode(b64_pad(part), validate=True)).decode("ascii")
+            for part in password.split(":"))
     return parsed, method, password, valid_host(host), safe_port(port)
 
 

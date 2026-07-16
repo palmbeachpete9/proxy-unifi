@@ -27,7 +27,7 @@ from proxylib import (die, b64decode_any, flat_query, qg, safe_urlsplit,
                       host_port, safe_port, valid_host, reject_unknown_query,
                       shadowsocks_credentials, add_secret_file_arguments,
                       load_generator_inputs, handle_common_generator_modes,
-                      validate_xhttp_download_settings)
+                      validate_xhttp_download_settings, shadowsocks_engine)
 
 
 _COMMON_QUERY = {
@@ -384,9 +384,18 @@ def _ss_plugin_name(parsed):
     return raw.split(";", 1)[0] if ";" in raw else raw
 
 
-def ss_plugin_name(link):
-    """Return the SIP003 plugin name for an ss:// link, or None if it has no plugin."""
-    return _ss_plugin_name(safe_urlsplit(link))
+def ss_info(link):
+    """Return (engine, variant) for an SS link without exposing credentials."""
+    parsed, method, password, _host, _port = shadowsocks_credentials(link)
+    plugin = _ss_plugin_name(parsed) or ""
+    engine, reason, variant = shadowsocks_engine(method, password, plugin)
+    if not engine:
+        die(reason or "unsupported Shadowsocks link")
+    return engine, variant
+
+
+def ss_engine(link):
+    return ss_info(link)[0]
 
 
 def parse_ss(link):
@@ -590,8 +599,10 @@ def main():
                     help="emit a SOCKS test config on this port instead")
     ap.add_argument("--print-server", action="store_true",
                     help="print 'host<TAB>port' of the server and exit")
-    ap.add_argument("--print-plugin", action="store_true",
-                    help="print the SIP003 plugin name for an ss:// link, else nothing")
+    ap.add_argument("--print-ss-engine", action="store_true",
+                    help="print xray/singbox for an ss:// link, validating SS2022 keys")
+    ap.add_argument("--print-ss-variant", action="store_true",
+                    help="print 2022 for an SS2022 link, else nothing")
     add_secret_file_arguments(ap)
     args = ap.parse_args()
 
@@ -600,11 +611,13 @@ def main():
     # ARG_MAX limit on very long links.
     load_generator_inputs(args)
 
-    if args.print_plugin:
-        if args.link.strip().lower().startswith("ss://"):
-            name = ss_plugin_name(args.link)
-            if name:
-                sys.stdout.write("%s\n" % name)
+    if args.print_ss_engine or args.print_ss_variant:
+        if not args.link.strip().lower().startswith("ss://"):
+            die("SS inspection mode requires an ss:// link")
+        engine, variant = ss_info(args.link)
+        value = engine if args.print_ss_engine else variant
+        if value:
+            sys.stdout.write("%s\n" % value)
         return
 
     if handle_common_generator_modes(args, parse_link, build_test_config):

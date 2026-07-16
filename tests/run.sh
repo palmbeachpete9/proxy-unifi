@@ -371,10 +371,35 @@ expect() {  # <gen> <link> <accept|reject> <name>
     else bad "$4 (rc=$rc want $3)"; fi
 }
 
+ss_test_key() {  # byte length -> deterministic standard-base64 PSK
+    python3 - "$1" <<'PY'
+import base64,sys
+size=int(sys.argv[1])
+print(base64.b64encode(bytes((n % 251) + 1 for n in range(size))).decode())
+PY
+}
+
+ss_test_link() {  # method password [query] -> SIP002 link
+    python3 - "$1" "$2" "${3:-}" <<'PY'
+import base64,sys
+credentials=base64.urlsafe_b64encode((sys.argv[1]+":"+sys.argv[2]).encode()).decode().rstrip("=")
+print("ss://%s@h:8388%s#SS2022" % (credentials,sys.argv[3]))
+PY
+}
+
 parser_tests() {
     echo "== parsers =="
     KEY=cvttX9u3nd7XD16gF4LJ09KjFZ0ZN4x9nk2TQePX5jk
     VM="vmess://$(printf '{"add":"h","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","net":"ws","tls":"tls","host":"h","path":"/w"}' | base64 | tr -d '\n')"
+    SS16="$(ss_test_key 16)"; SS32="$(ss_test_key 32)"; SS15="$(ss_test_key 15)"
+    SS22A128="$(ss_test_link 2022-blake3-aes-128-gcm "$SS16")"
+    SS22A128_UNPADDED="$(ss_test_link 2022-blake3-aes-128-gcm "$(printf '%s' "$SS16" | tr -d '=')")"
+    SS22A256="$(ss_test_link 2022-blake3-aes-256-gcm "$SS32")"
+    SS22CHACHA="$(ss_test_link 2022-blake3-chacha20-poly1305 "$SS32")"
+    SS22CHACHA_MULTI="$(ss_test_link 2022-blake3-chacha20-poly1305 "$SS32:$SS32")"
+    SS22MULTI="$(ss_test_link 2022-blake3-aes-128-gcm "$SS16:$SS16")"
+    SS22CHAIN="$(ss_test_link 2022-blake3-aes-256-gcm "$SS32:$SS32:$SS32")"
+    SS22COMPAT="$(ss_test_link 2022-blake3-aes-128-gcm "$SS32")"
     # accepted forms
     expect mkxray.py "vless://u@h:443?security=reality&type=tcp&flow=xtls-rprx-vision&pbk=$KEY&sid=ab&sni=a&fp=chrome" accept "vless reality"
     expect mkxray.py "$VM" accept "vmess base64-json"
@@ -387,6 +412,13 @@ parser_tests() {
     expect mksingbox.py "hysteria2://pw@h:443?mport=4000-5000" reject "hysteria2 port hopping"
     expect mksingbox.py "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?sni=h" accept "tuic"
     expect mksingbox.py "ss://$(printf 'aes-256-gcm:pw' | base64 | tr -d '\n')@h:8388?plugin=obfs-local%3Bobfs%3Dhttp" accept "ss+obfs"
+    expect mksingbox.py "$SS22A128" accept "SS2022 AES-128"
+    expect mksingbox.py "$SS22A128_UNPADDED" accept "SS2022 unpadded key normalization"
+    expect mksingbox.py "$SS22A256" accept "SS2022 AES-256"
+    expect mksingbox.py "$SS22CHACHA" accept "SS2022 ChaCha20"
+    expect mksingbox.py "$SS22MULTI" accept "SS2022 multi-user key"
+    expect mksingbox.py "$SS22CHAIN" accept "SS2022 relay identity chain"
+    expect mkxray.py "$SS22COMPAT" accept "SS2022 Xray 32-byte AES-128 compatibility"
     # rejected forms (security / removed transports / bad input)
     expect mkxray.py "vless://u@h:443?security=tls&allowInsecure=1&sni=a" reject "allowInsecure rejected"
     expect mkxray.py "vless://u@h:443?security=tls&type=quic&sni=a" reject "quic rejected"
@@ -410,6 +442,15 @@ parser_tests() {
     expect mkxray.py "vmess://$_bad_vmess" reject "invalid base64 characters rejected"
     expect mksingbox.py "hysteria2://pw@h:443?sni=h&obfs=salamander" reject "incomplete hysteria2 obfs rejected"
     expect mksingbox.py "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?sni=h&udp_over_stream=maybe" reject "invalid TUIC boolean rejected"
+    expect mksingbox.py "$(ss_test_link 2022-blake3-aes-128-gcm "$SS15")" reject "SS2022 short key rejected"
+    expect mkxray.py "$(ss_test_link 2022-blake3-aes-256-gcm "$SS16")" reject "SS2022 wrong AES-256 key rejected"
+    expect mksingbox.py "$(ss_test_link 2022-blake3-chacha20-poly1305 'not_base64!')" reject "SS2022 invalid base64 rejected"
+    expect mksingbox.py "$(ss_test_link 2022-blake3-aes-128-gcm "$SS16::$SS16")" reject "SS2022 empty identity key rejected"
+    expect mksingbox.py "$SS22CHACHA_MULTI" reject "SS2022 ChaCha20 multi-user rejected"
+    expect mksingbox.py "$(ss_test_link 2022-BLAKE3-AES-128-GCM "$SS16")" reject "SS2022 method case rejected"
+    expect mkxray.py "$(ss_test_link 2022-blake3-aes-192-gcm "$SS16")" reject "unknown SS2022 method rejected"
+    expect mksingbox.py "$SS22COMPAT" reject "SS2022 nonstandard key kept off sing-box"
+    expect mksingbox.py "$(ss_test_link 2022-blake3-aes-128-gcm "$SS16" '?plugin=kcptun')" reject "SS2022 unsupported plugin rejected"
 
     # host injection: ESC byte must be rejected (no traceback)
     out="$(python3 "$SRC/mkxray.py" --link "$(printf 'vless://u@h\033[2Jx:443?security=tls&sni=a')" --port 51821 --secret-key AAAA --peer-pubkey BBBB 2>&1)" || true
@@ -433,6 +474,54 @@ out,_,_=mksingbox.parse_tuic("tuic://u:p@h:443?sni=h&network=tcp")
 assert out["network"]=="tcp"
 PY
 
+    python3 - "$SRC" <<'PY' && ok "SS2022 strict classifier and key fuzz" || bad "SS2022 strict classifier and key fuzz"
+import base64,contextlib,io,random,string,sys
+sys.path.insert(0,sys.argv[1])
+import mkxray,mksingbox,proxylib
+def key(size): return base64.b64encode(bytes((n % 251)+1 for n in range(size))).decode()
+def link(method,password,query=""):
+    credentials=base64.urlsafe_b64encode((method+":"+password).encode()).decode().rstrip("=")
+    return "ss://%s@h:8388%s" % (credentials,query)
+k16,k32=key(16),key(32)
+standard=link("2022-blake3-aes-128-gcm",k16)
+compat=link("2022-blake3-aes-128-gcm",k32)
+assert mkxray.ss_engine(standard)=="singbox"
+assert mkxray.ss_engine(compat)=="xray"
+assert mkxray.ss_engine(link("aes-256-gcm","password"))=="xray"
+assert mkxray.ss_engine(link("aes-256-gcm","password","?plugin=obfs-local"))=="singbox"
+out,_,_=mksingbox.parse_ss(standard)
+assert out["method"]=="2022-blake3-aes-128-gcm" and "multiplex" not in out
+assert out["password"]==k16
+with contextlib.redirect_stderr(io.StringIO()):
+    try: mksingbox.parse_ss(compat); raise AssertionError("compat key reached sing-box")
+    except SystemExit: pass
+for method,size in proxylib.SS2022_KEY_BYTES.items():
+    valid=key(size)
+    assert proxylib.shadowsocks_2022_key_info(method,valid)==(True,"",False)
+    multi=proxylib.shadowsocks_2022_key_info(method,valid+":"+valid)
+    if method=="2022-blake3-chacha20-poly1305":
+        assert multi[0] is True and "AES-GCM" in multi[1]
+    else:
+        assert multi==(True,"",False)
+        assert proxylib.shadowsocks_2022_key_info(
+            method,":".join([valid]*3))==(True,"",False)
+        assert proxylib.shadowsocks_2022_key_info(
+            method,":".join([valid]*proxylib.SS2022_MAX_KEYS))==(True,"",False)
+        assert "1-%d" % proxylib.SS2022_MAX_KEYS in proxylib.shadowsocks_2022_key_info(
+            method,":".join([valid]*(proxylib.SS2022_MAX_KEYS+1)))[1]
+rng=random.Random(2022)
+alphabet=string.ascii_letters+string.digits+"+/=_:-! \t"
+for _ in range(20000):
+    candidate="".join(rng.choice(alphabet) for _ in range(rng.randrange(0,100)))
+    result=proxylib.shadowsocks_2022_key_info(
+        "2022-blake3-aes-256-gcm",candidate,allow_xray_compat=False)
+    assert len(result)==3 and result[0] is True and isinstance(result[1],str)
+    if not result[1]:
+        parts=candidate.split(":")
+        assert 1<=len(parts)<=proxylib.SS2022_MAX_KEYS
+        assert all(len(base64.b64decode(p+"="*(-len(p)%4),validate=True))==32 for p in parts)
+PY
+
     # mksub: classification + safety (pure python)
     python3 - "$SRC" <<'PY' && ok "mksub parser corpus" || bad "mksub parser corpus"
 import sys, base64, json, gzip, contextlib, io, os, tempfile, types
@@ -450,6 +539,58 @@ assert cat["meta"]["count"] == 3, cat
 assert cat["meta"]["supported"] == 2, cat
 assert cat["nodes"][2]["reason"] == "unsupported SIP003 plugin", cat
 assert all(len(n["id"]) == 64 for n in cat["nodes"])
+# SS2022 is identified separately, routed through sing-box, and kept distinct
+# from legacy Shadowsocks during refresh matching.
+k16 = base64.b64encode(bytes(range(16))).decode()
+k32 = base64.b64encode(bytes(range(32))).decode()
+def sslink(method,password,suffix=""):
+    cred=base64.urlsafe_b64encode((method+":"+password).encode()).decode().rstrip("=")
+    return "ss://%s@h:8388%s#Москва🎯" % (cred,suffix)
+ss2022=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",k16))
+assert ss2022["recognized"] and ss2022["engine"]=="singbox" and ss2022["variant"]=="2022", ss2022
+assert mksub._selection_meta(ss2022)["scheme"]=="ss2022"
+chain=mksub.node_from_link(sslink("2022-blake3-aes-256-gcm",":".join([k32]*3)))
+assert chain["recognized"] and chain["engine"]=="singbox" and chain["variant"]=="2022", chain
+chacha_multi=mksub.node_from_link(
+    sslink("2022-blake3-chacha20-poly1305",k32+":"+k32))
+assert not chacha_multi["recognized"] and "AES-GCM" in chacha_multi["reason"], chacha_multi
+legacy=mksub.node_from_link(sslink("aes-256-gcm","password"))
+assert legacy["engine"]=="xray" and mksub._selection_meta(legacy)["scheme"]=="ss"
+compat=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",k32))
+assert compat["recognized"] and compat["engine"]=="xray" and "compatibility" in compat["reason"], compat
+bad=mksub.node_from_link(sslink("2022-blake3-aes-256-gcm",k16))
+assert not bad["recognized"] and "32 bytes" in bad["reason"], bad
+unknown=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",k16,"?uot=1"))
+assert not unknown["recognized"] and "query parameter" in unknown["reason"], unknown
+with tempfile.TemporaryDirectory() as directory:
+    path=os.path.join(directory,"catalog.json")
+    ss2022["n"]=1
+    json.dump({"schema":mksub.SCHEMA_VERSION,"meta":{},"nodes":[ss2022]},open(path,"w"))
+    output=io.StringIO()
+    with contextlib.redirect_stdout(output):
+        mksub.cmd_render(types.SimpleNamespace(file=path,selected=""))
+    assert "ss2022" in output.getvalue() and "Москва🎯" in output.getvalue(), output.getvalue()
+    active_path=os.path.join(directory,"active-link")
+    open(active_path,"w").write(ss2022["link"])
+    old_meta=mksub._selection_meta(ss2022); old_meta["scheme"]="ss"
+    migrated=mksub._migrate_selection_scheme(old_meta,active_path)
+    assert migrated["scheme"]=="ss2022"
+    old_meta_path=os.path.join(directory,"old-selection.json")
+    json.dump(old_meta,open(old_meta_path,"w"))
+    rotated_key=base64.b64encode(bytes(range(1,17))).decode()
+    rotated=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",rotated_key))
+    rotated["n"]=1
+    json.dump({"schema":mksub.SCHEMA_VERSION,"meta":{},"nodes":[rotated]},open(path,"w"))
+    refreshed_meta=os.path.join(directory,"refreshed-selection.json")
+    output=io.StringIO()
+    with contextlib.redirect_stdout(output):
+        mksub.cmd_match(types.SimpleNamespace(
+            file=path,selection_file=old_meta_path,meta_file=refreshed_meta,
+            active_link_file=active_path))
+    assert output.getvalue().startswith("1\t%s\t" % rotated["id"]), output.getvalue()
+    assert json.load(open(refreshed_meta))["scheme"]=="ss2022"
+    open(active_path,"w").write(legacy["link"])
+    assert mksub._migrate_selection_scheme(old_meta,active_path)["scheme"]=="ss"
 # uppercase scheme normalized
 n = mksub.node_from_link("VLESS://u@h:443#x"); assert n["link"].startswith("vless://"), n
 # URI-form VMess labels and legacy VMess identity are parsed without duplicate
@@ -1083,6 +1224,32 @@ engine_tests() {
         && ok "xray current XHTTP/FinalMask share fields" || bad "xray current XHTTP/FinalMask share fields"
     gs "hysteria2://pw@h:443?sni=h" && ok "singbox hysteria2" || bad "singbox hysteria2"
     gs "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?sni=h" && ok "singbox tuic" || bad "singbox tuic"
+    _ss16="$(ss_test_key 16)"; _ss32="$(ss_test_key 32)"
+    _ssa128="$(ss_test_link 2022-blake3-aes-128-gcm "$_ss16")"
+    _ssa128_unpadded="$(ss_test_link 2022-blake3-aes-128-gcm "$(printf '%s' "$_ss16" | tr -d '=')")"
+    _ssa256="$(ss_test_link 2022-blake3-aes-256-gcm "$_ss32")"
+    _sschacha="$(ss_test_link 2022-blake3-chacha20-poly1305 "$_ss32")"
+    _ssmulti="$(ss_test_link 2022-blake3-aes-128-gcm "$_ss16:$_ss16")"
+    _sschain="$(ss_test_link 2022-blake3-aes-256-gcm "$_ss32:$_ss32:$_ss32")"
+    gs "$_ssa128" && ok "singbox SS2022 AES-128" || bad "singbox SS2022 AES-128"
+    gs "$_ssa128_unpadded" \
+        && ok "singbox SS2022 unpadded key normalization" \
+        || bad "singbox SS2022 unpadded key normalization"
+    gs "$_ssa256" && ok "singbox SS2022 AES-256" || bad "singbox SS2022 AES-256"
+    gs "$_sschacha" && ok "singbox SS2022 ChaCha20" || bad "singbox SS2022 ChaCha20"
+    gs "$_ssmulti" && ok "singbox SS2022 multi-user" || bad "singbox SS2022 multi-user"
+    gs "$_sschain" && ok "singbox SS2022 relay identity chain" \
+        || bad "singbox SS2022 relay identity chain"
+    gx "$(ss_test_link 2022-blake3-aes-128-gcm "$_ss32")" \
+        && ok "xray SS2022 AES-128 compatibility" || bad "xray SS2022 AES-128 compatibility"
+    if python3 - "$_d/s.json" <<'PY'
+import json,sys
+out=json.load(open(sys.argv[1]))["outbounds"][0]
+assert out["type"]=="shadowsocks" and out["method"].startswith("2022-blake3-")
+assert "multiplex" not in out and "udp_over_tcp" not in out
+PY
+    then ok "SS2022 does not force server-dependent extensions"
+    else bad "SS2022 does not force server-dependent extensions"; fi
     if [ -n "$AB" ]; then
         cat > "$_d/awg.conf" <<EOF
 [Interface]
