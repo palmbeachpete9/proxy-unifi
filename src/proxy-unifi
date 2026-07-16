@@ -645,12 +645,9 @@ engine_for_link_file() {
         vless://*|vmess://*|trojan://*) echo xray; return ;;
         hysteria2://*|hy2://*|tuic://*) echo singbox; return ;;
         ss://*)
-            _pn="$(py "$MKXRAY" --link-file "$_ef_file" --print-plugin 2>/dev/null)"
-            if [ -z "$_pn" ]; then echo xray; return; fi   # plain SS -> xray
-            case "$_pn" in
-                obfs-local|simple-obfs|v2ray-plugin) echo singbox ;;  # sing-box runs these in-process
-                *) echo "" ;;                                        # other SIP003 plugins: unsupported
-            esac
+            _ss_engine="$(py "$MKXRAY" --link-file "$_ef_file" \
+                --print-ss-engine 2>/dev/null)" || { echo ""; return; }
+            case "$_ss_engine" in xray|singbox) echo "$_ss_engine" ;; *) echo "" ;; esac
             return ;;
     esac
     echo ""
@@ -1007,17 +1004,17 @@ PYEOF
     fi
     rm -rf "$tmp"
     c_grn "xray-core installed: $(core_version "$XRAY")"
-    # sing-box (~48 MB) is only needed for ss+obfs/v2ray-plugin, hysteria2 and
-    # tuic links. Don't download it eagerly: it is installed on demand the first
-    # time such a link is imported (ensure_singbox). On an update, refresh it only
-    # if it is already present, so xray-only installs stay lean.
+    # sing-box (~48 MB) is only needed for SS2022, ss+obfs/v2ray-plugin,
+    # Hysteria2 and TUIC links. Don't download it eagerly: it is installed on
+    # demand the first time such a link is imported (ensure_singbox). On an
+    # update, refresh it only if already present, so xray-only installs stay lean.
     if [ -x "$SBIN" ]; then
         if ! cmd_install_singbox; then
             [ "${_STRICT_UPDATE:-0}" = 1 ] && fatal "sing-box update failed; update transaction aborted"
             c_ylw "sing-box update failed (continuing); the existing version is kept"
         fi
     else
-        info "sing-box not installed (fetched automatically on the first hysteria2/tuic/ss+obfs link)."
+        info "sing-box not installed (fetched automatically on the first SS2022/hysteria2/tuic/ss+obfs link)."
     fi
     # The AmneziaWG-enabled core is likewise on-demand. It is a separately
     # pinned build because upstream does not publish Linux binaries for its AWG
@@ -1559,6 +1556,7 @@ cmd_status() {
     echo "service:   ${act:-unknown} / ${ena:-disabled}"
     _eng="$(current_engine)"
     echo "engine:    $_eng"
+    echo "protocol:  $(current_protocol)"
     if [ "$_eng" = "awg" ]; then
         if [ -x "$ABIN" ]; then echo "core:      $(core_version "$ABIN")"; else echo "core:      AmneziaWG core not installed"; fi
     elif [ "$_eng" = "singbox" ]; then
@@ -1581,6 +1579,31 @@ cmd_status() {
     if have ss; then
         if socket_listening "$WG_PORT"; then c_grn "udp/${WG_PORT}: listening"; else c_ylw "udp/${WG_PORT}: not listening"; fi
     fi
+}
+
+current_protocol() {
+    _cp_engine="$(current_engine)"
+    case "$_cp_engine" in
+        awg) printf '%s\n' 'AmneziaWG'; return ;;
+        xraypool) printf '%s\n' 'Xray JSON profile'; return ;;
+    esac
+    [ -s "$OUTBOUND_LINK" ] || { printf '%s\n' '(none)'; return; }
+    _cp_link="$(cat "$OUTBOUND_LINK")"
+    case "$_cp_link" in
+        vless://*) printf '%s\n' 'VLESS' ;;
+        vmess://*) printf '%s\n' 'VMess' ;;
+        trojan://*) printf '%s\n' 'Trojan' ;;
+        hysteria2://*|hy2://*) printf '%s\n' 'Hysteria2' ;;
+        tuic://*) printf '%s\n' 'TUIC' ;;
+        ss://*)
+            if py "$MKXRAY" --link-file "$OUTBOUND_LINK" \
+                    --print-ss-variant 2>/dev/null | grep -qx 2022; then
+                printf '%s\n' 'Shadowsocks 2022'
+            else
+                printf '%s\n' 'Shadowsocks'
+            fi ;;
+        *) printf '%s\n' '(unknown)' ;;
+    esac
 }
 
 cmd_logs()    { shift || true; journalctl -u "$SERVICE_NAME" "$@"; }
@@ -2670,7 +2693,7 @@ sub_refresh() {
     _new_meta="$RUN_DIR/refreshed-selection.json"
     _match_err="$RUN_DIR/refreshed-selection.err"
     if _match="$(py "$MKSUB" match --file "$SUB_CATALOG" --selection-file "$SUB_SELECTED_META" \
-        --meta-file "$_new_meta" 2>"$_match_err")"; then
+        --active-link-file "$OUTBOUND_LINK" --meta-file "$_new_meta" 2>"$_match_err")"; then
         _new_index="${_match%%"$TAB"*}"; _match_rest="${_match#*"$TAB"}"
         _new_id="${_match_rest%%"$TAB"*}"
         if [ "$_new_id" = "$_sel" ]; then

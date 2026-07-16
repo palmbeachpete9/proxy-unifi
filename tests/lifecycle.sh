@@ -107,6 +107,19 @@ case "${1:-}" in
 esac
 SH
 
+cat > "$T/root/bin/sing-box" <<'SH'
+#!/bin/sh
+case "${1:-}" in
+    version) echo 'sing-box version 1.13.14' ;;
+    check)
+        shift
+        [ "${1:-}" = -c ] || exit 2
+        python3 -m json.tool "$2" >/dev/null ;;
+    run) sleep 300 ;;
+    *) exit 2 ;;
+esac
+SH
+
 cat > "$T/mock-bin/nano" <<'SH'
 #!/bin/sh
 target=""
@@ -115,7 +128,7 @@ for target do :; done
 cp "$MOCK_NANO_SOURCE" "$target"
 SH
 chmod 0755 "$T/mock-bin"/*
-chmod 0755 "$T/root/bin/amnezia-box"
+chmod 0755 "$T/root/bin/amnezia-box" "$T/root/bin/sing-box"
 
 PRIVATE='AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8='
 PUBLIC='Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA='
@@ -204,6 +217,50 @@ run_cli stop >/dev/null
 printf '8\n1\n51822\n\n0\n' | menu_input >/dev/null
 if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
 grep -q '"port": 51822' "$T/root/etc/config.json"
+
+# Standards-compliant SS2022 switches to the existing sing-box core, preserves
+# the UniFi-facing WG identity, and rolls back atomically on an invalid key.
+SS_WG_PRIVATE_HASH="$(hash_file "$T/root/etc/wg/wg_private.key")"
+SS_UNIFI_PUBLIC_HASH="$(hash_file "$T/root/etc/wg/unifi_public.key")"
+SS2022_LINK="$(python3 - <<'PY'
+import base64
+key=base64.b64encode(bytes(range(16))).decode()
+cred=base64.urlsafe_b64encode(("2022-blake3-aes-128-gcm:"+key).encode()).decode().rstrip("=")
+print("ss://%s@1.1.1.1:8388#SS2022" % cred)
+PY
+)"
+printf '1\n%s\n\n0\n' "$SS2022_LINK" | menu_input >/dev/null
+[ "$(cat "$T/root/etc/engine")" = singbox ]
+grep -q '^ExecStart=.*/sing-box run -c .*/config.json$' "$T/proxy-unifi.service"
+python3 - "$T/root/etc/config.json" <<'PY'
+import json,sys
+cfg=json.load(open(sys.argv[1],encoding="utf-8"))
+assert cfg["endpoints"][0]["type"]=="wireguard"
+out=cfg["outbounds"][0]
+assert out["type"]=="shadowsocks" and out["method"]=="2022-blake3-aes-128-gcm"
+assert "multiplex" not in out and "udp_over_tcp" not in out
+assert cfg["route"]["final"]=="proxy"
+PY
+[ "$(hash_file "$T/root/etc/wg/wg_private.key")" = "$SS_WG_PRIVATE_HASH" ]
+[ "$(hash_file "$T/root/etc/wg/unifi_public.key")" = "$SS_UNIFI_PUBLIC_HASH" ]
+run_cli status > "$T/ss2022-status.out"
+grep -q '^engine:    singbox$' "$T/ss2022-status.out"
+grep -q '^protocol:  Shadowsocks 2022$' "$T/ss2022-status.out"
+SS_CONFIG_HASH="$(hash_file "$T/root/etc/config.json")"
+SS_LINK_HASH="$(hash_file "$T/root/etc/link.txt")"
+BAD_SS2022_LINK="$(python3 - <<'PY'
+import base64
+key=base64.b64encode(bytes(range(15))).decode()
+cred=base64.urlsafe_b64encode(("2022-blake3-aes-128-gcm:"+key).encode()).decode().rstrip("=")
+print("ss://%s@1.1.1.1:8388#bad" % cred)
+PY
+)"
+printf '1\n%s\n\n0\n' "$BAD_SS2022_LINK" | menu_input >/dev/null 2>&1
+[ "$(cat "$T/root/etc/engine")" = singbox ]
+[ "$(hash_file "$T/root/etc/config.json")" = "$SS_CONFIG_HASH" ]
+[ "$(hash_file "$T/root/etc/link.txt")" = "$SS_LINK_HASH" ]
+[ ! -e "$T/root/.transactions/active" ] || exit 1
+[ ! -e "$T/root/.lock" ] || exit 1
 
 # Pool mode must survive key regeneration and rebuild its WireGuard overlay.
 cat > "$T/profile.json" <<'EOF'

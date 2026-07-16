@@ -35,7 +35,8 @@ import tempfile
 import unicodedata
 from urllib.parse import urlsplit, unquote, parse_qsl, urlencode, urlunsplit
 from proxylib import (dispatch_subcommand, is_non_public_host,
-                      nested_too_deep, xray_outbound_servers)
+                      nested_too_deep, xray_outbound_servers,
+                      shadowsocks_method_password, shadowsocks_engine)
 # Network-only modules (ssl, http.client, socket, time, urljoin) are
 # imported lazily inside fetch_url()/_https_get()/_public_ips(); the hot local
 # subcommands (render/extract/match) never touch the
@@ -57,7 +58,6 @@ MAX_JSON_DEPTH = 64
 MAX_EXPANSION_RATIO = 500
 
 SUPPORTED = ("vless", "vmess", "trojan", "ss", "hysteria2", "hy2", "tuic")
-SINGBOX_PLUGINS = ("obfs-local", "simple-obfs", "v2ray-plugin")
 
 # Characters stripped from any provider-controlled text shown in the terminal:
 # C0/DEL/C1 controls, zero-width, bidi embeddings/overrides/isolates, BOM.
@@ -329,20 +329,26 @@ def _canonical_link(link, parsed, legacy_vmess):
 
 
 def _ss_engine(parsed):
-    """(engine, reason) for an ss:// link mirroring the shell's engine routing."""
+    """(engine, reason, variant) mirroring direct-import engine routing."""
     if parsed is None:
-        return "", "unparseable link"
-    q = parsed.query
+        return "", "unparseable link", ""
+    try:
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return "", "malformed query string", ""
+    keys = [key for key, _value in pairs]
+    if len(keys) != len(set(keys)):
+        return "", "duplicate query parameter", ""
+    if any(key != "plugin" for key in keys):
+        return "", "unsupported Shadowsocks query parameter", ""
     plugin = ""
-    for kv in q.split("&"):
-        if kv.startswith("plugin="):
-            plugin = unquote(kv[len("plugin="):]).split(";", 1)[0]
-            break
-    if not plugin:
-        return "xray", ""
-    if plugin in SINGBOX_PLUGINS:
-        return "singbox", ""
-    return "", "unsupported SIP003 plugin"
+    for key, value in pairs:
+        if key == "plugin" and value:
+            plugin = unquote(value).split(";", 1)[0]
+    method, password = shadowsocks_method_password(parsed)
+    if not method or not password:
+        return "", "unparseable Shadowsocks credentials", ""
+    return shadowsocks_engine(method, password, plugin)
 
 
 def _profile_catalog_node(prof, label_hint="", identity_salt="",
@@ -478,18 +484,21 @@ def node_from_link(link):
         profile_node = _json_profile_from_ss_wrapper(link, parsed, label)
         if profile_node is not None:
             return profile_node
-    node = {"scheme": scheme, "link": link, "label": "", "server": "",
-            "recognized": True, "engine": "", "reason": ""}
+    node = {"scheme": scheme, "variant": "", "link": link, "label": "",
+            "server": "", "recognized": True, "engine": "", "reason": ""}
     try:
         node["label"], destination, node["server"] = _link_details(
             parsed, scheme, legacy_vmess)
         if scheme in ("hysteria2", "hy2", "tuic"):
             node["engine"] = "singbox"
         elif scheme == "ss":
-            eng, reason = _ss_engine(parsed)
+            eng, reason, variant = _ss_engine(parsed)
             node["engine"] = eng
+            node["variant"] = variant
             if not eng:
                 node["recognized"] = False
+                node["reason"] = reason
+            elif reason:
                 node["reason"] = reason
         else:  # vless / vmess / trojan
             node["engine"] = "xray"
@@ -1033,7 +1042,7 @@ def _validate_node(nd):
             die("catalog node has an invalid link")
         if _CONTROL_RE.search(link):
             die("catalog node link contains control characters")
-    for f in ("label", "server", "reason", "engine"):
+    for f in ("label", "server", "reason", "engine", "variant"):
         if not isinstance(nd.get(f, ""), str):
             die("catalog node field '%s' is not a string" % f)
     return nd
@@ -1095,7 +1104,8 @@ def cmd_render(args):
             mark = " "
         label = clean(nd.get("label", ""), LABEL_MAX) or "(no label)"
         server = clean(nd.get("server", "?"), 40)
-        scheme = clean(nd.get("scheme", "?"), 12)
+        scheme = "ss2022" if nd.get("scheme") == "ss" \
+            and nd.get("variant") == "2022" else clean(nd.get("scheme", "?"), 12)
         line = "%3d. [%s] %-9s %-24s %s" % (
             nd.get("n", 0), mark, scheme, server, label)
         if nd.get("reason"):
@@ -1105,12 +1115,15 @@ def cmd_render(args):
 
 
 def _selection_meta(nd):
+    scheme = nd.get("scheme", "")
+    if scheme == "ss" and nd.get("variant") == "2022":
+        scheme = "ss2022"
     return {
         "schema": 1,
         "id": nd.get("id", ""),
         "n": nd.get("n", 0),
         "kind": "pool" if (nd.get("kind") == "pool" or nd.get("scheme") == "json") else "link",
-        "scheme": nd.get("scheme", ""),
+        "scheme": scheme,
         "label": nd.get("label", ""),
         "server": nd.get("server", ""),
     }
@@ -1152,6 +1165,32 @@ def _write_selection_meta(nd, path):
     _atomic_write_text(path, payload)
 
 
+def _migrate_selection_scheme(old, active_link_file):
+    """Identify pre-SS2022 metadata without weakening refresh matching.
+
+    Older releases recorded every Shadowsocks selection as ``ss``. Only migrate
+    that marker when the active link is itself a recognized SS2022 node and its
+    full identity matches the stored selection. A legacy SS link can therefore
+    never become an SS2022 match merely because labels coincide.
+    """
+    if old.get("scheme") != "ss" or not active_link_file:
+        return old
+    try:
+        with open(active_link_file, "r", encoding="utf-8") as fh:
+            active_link = fh.read(MAX_LINK + 1).strip()
+        if not active_link or len(active_link.encode("utf-8", "replace")) > MAX_LINK:
+            return old
+        active = node_from_link(active_link)
+    except (OSError, UnicodeError):
+        return old
+    if not active or not active.get("recognized") or active.get("variant") != "2022" \
+            or active.get("id") != old.get("id"):
+        return old
+    migrated = dict(old)
+    migrated["scheme"] = "ss2022"
+    return migrated
+
+
 def cmd_extract(args):
     cat = _load(args.file)
     nd = next((node for node in cat.get("nodes", []) if node.get("n") == args.index), None)
@@ -1186,6 +1225,7 @@ def cmd_match(args):
         die("could not read selection metadata: %s" % e)
     if not isinstance(old, dict):
         die("selection metadata is malformed")
+    old = _migrate_selection_scheme(old, getattr(args, "active_link_file", ""))
     best_score = -1
     best_node = None
     best_count = 0
@@ -1251,6 +1291,7 @@ def main():
     mt.add_argument("--file", required=True)
     mt.add_argument("--selection-file", required=True)
     mt.add_argument("--meta-file", default="")
+    mt.add_argument("--active-link-file", default="")
     mt.set_defaults(fn=cmd_match)
 
     dispatch_subcommand(ap)

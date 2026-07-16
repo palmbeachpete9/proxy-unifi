@@ -93,7 +93,9 @@ The proxy engine is chosen automatically based on the imported link:
 | VLESS | xray-core |
 | VMess | xray-core |
 | Trojan | xray-core |
-| Shadowsocks — plain, AEAD + 2022 ciphers | xray-core |
+| Shadowsocks — plain / classic AEAD | xray-core |
+| Shadowsocks 2022 — standards-compliant fixed keys | sing-box |
+| Shadowsocks 2022 AES-128 — Xray-compatible 32-byte key | xray-core |
 | Shadowsocks + obfs-local / simple-obfs | sing-box |
 | Shadowsocks + v2ray-plugin | sing-box |
 | Hysteria2 | sing-box |
@@ -110,6 +112,33 @@ single UniFi VPN Client entry works no matter which core is active.
 > packet to that port, making it unreachable from the LAN/WAN. Defence in depth:
 > the port is firewalled to loopback **and** WireGuard only ever answers the one
 > configured peer key.
+
+## Shadowsocks 2022
+
+SS2022 is imported through the existing single-link and subscription workflows;
+there is no separate profile menu or second UniFi VPN Client entry. The catalog
+labels these rows as `ss2022`, and **Status** reports `Shadowsocks 2022` when one
+is active.
+
+Supported standardized methods:
+
+- `2022-blake3-aes-128-gcm` — 16-byte base64 PSK
+- `2022-blake3-aes-256-gcm` — 32-byte base64 PSK
+- `2022-blake3-chacha20-poly1305` — 32-byte base64 PSK
+
+Single-user keys are accepted for all three methods. Colon-delimited extensible
+identity chains (`relay-key:server-key:user-key`, up to 16 keys) are accepted for
+the two AES-GCM methods; this multi-user construction does not support ChaCha20.
+Key syntax and decoded length are checked before a core is downloaded or the
+active tunnel is changed. Standards-compliant links run through sing-box. The
+older Xray-specific 32-byte AES-128 key form remains supported through xray-core
+so existing links do not regress; subscription rows show a compatibility warning
+for that form.
+
+SS2022 replay protection requires reasonably synchronized client/server clocks.
+Multiplexing and UDP-over-TCP are not silently enabled because the provider server
+must explicitly support them; forcing either option would break ordinary SS2022
+servers. Native TCP and UDP forwarding remain enabled by the core defaults.
 
 ## Subscriptions and JSON pools
 
