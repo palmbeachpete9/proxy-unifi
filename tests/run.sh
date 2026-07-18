@@ -49,6 +49,10 @@ static_tests() {
     if python3 -m py_compile "$SRC"/mkxray.py "$SRC"/mksingbox.py "$SRC"/mksub.py "$SRC"/mkawg.py "$SRC"/mkjson.py "$SRC"/proxylib.py "$SRC"/safeexec.py 2>/dev/null
     then ok "python compile"; else bad "python compile"; fi
     rm -rf "$SRC/__pycache__"
+    if grep -Fq "sys.version_info < (3, 9)" "$ROOT/install.sh" \
+       && grep -Fq "Python 3.9 or newer is required" "$ROOT/install.sh" \
+       && ! grep -F "Python 3.7" "$SRC"/*.py >/dev/null 2>&1
+    then ok "Python 3.9 gateway floor"; else bad "Python 3.9 gateway floor"; fi
 
     # A timed-out validator must terminate its complete process group, not leave
     # a grandchild consuming resources after the wrapper returns.
@@ -119,6 +123,13 @@ SH
     if sh "$_ed/endpoint.sh"; then ok "CLI WireGuard endpoint formats IPv6"
     else bad "CLI WireGuard endpoint formats IPv6"; fi
     rm -rf "$_ed"
+
+    _ping_proxy="$(sed -n '/^ping_proxy() {/,/^}/p' "$SRC/proxy-unifi")"
+    # shellcheck disable=SC2016 # Match literal variables in the extracted source.
+    if printf '%s\n' "$_ping_proxy" | grep -Fq '_proxy_scheme="socks5h"' \
+       && printf '%s\n' "$_ping_proxy" | grep -Fq '_proxy_scheme="socks5"' \
+       && printf '%s\n' "$_ping_proxy" | grep -Fq '"${_proxy_scheme}://127.0.0.1:${_port}"'
+    then ok "AWG latency probe resolves before SOCKS"; else bad "AWG latency probe resolves before SOCKS"; fi
 
     _hd="$(mktemp -d)"
     {
@@ -1380,10 +1391,13 @@ if mode == "chunked":
     resp = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n"
             b"profile-update-interval: 6\r\nConnection: close\r\n\r\n"
             + ("%x\r\n" % len(body)).encode() + body + b"\r\n0\r\n\r\n")
-else:  # gzip
+elif mode == "gzip":
     gz = gzip.compress(body)
     resp = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\n"
             b"Content-Length: %d\r\nConnection: close\r\n\r\n" % len(gz)) + gz
+else:  # deliberately truncated fixed-length response
+    resp = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+            b"Content-Length: %d\r\nConnection: close\r\n\r\n" % (len(body) + 1)) + body
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(sys.argv[3], sys.argv[4])
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", port)); s.listen(5)
@@ -1407,6 +1421,18 @@ PYEOF
     }
     _fetch chunked 18581 "fetch chunked transfer-encoding"
     _fetch gzip    18582 "fetch gzip content-encoding"
+    python3 "$_d/srv.py" 18583 truncated "$_d/cert.pem" "$_d/key.pem" >/dev/null 2>&1 &
+    _srv=$!; sleep 2
+    printf 'https://127.0.0.1:18583/sub' > "$_d/url.txt"
+    if PROXY_UNIFI_SUB_ALLOW_PRIVATE=1 SSL_CERT_FILE="$_d/cert.pem" \
+       python3 "$SRC/mksub.py" fetch --url-file "$_d/url.txt" >"$_d/truncated.out" 2>&1; then
+        bad "fetch rejects truncated fixed-length body"
+    elif grep -Fq "incomplete subscription body" "$_d/truncated.out"; then
+        ok "fetch rejects truncated fixed-length body"
+    else
+        bad "fetch rejects truncated fixed-length body"
+    fi
+    kill "$_srv" 2>/dev/null; wait "$_srv" 2>/dev/null
     rm -rf "$_d"
 }
 

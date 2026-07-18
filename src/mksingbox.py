@@ -9,7 +9,7 @@ Topology mirrors the xray path: a WireGuard *server* endpoint terminates the
 UniFi gateway's WireGuard VPN Client (same keys/port), and everything it
 receives is routed to the proxy outbound.
 
-Stdlib only (Python 3.7+).
+Stdlib only (Python 3.9+).
 """
 
 import argparse

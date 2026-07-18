@@ -20,7 +20,7 @@ This module is the *overlay + sanitizer*: it reads the provider JSON, validates
 it is a usable pool we can host, removes platform-specific fields that would
 break on UniFi (absolute log paths, etc.), and emits the overlay.
 
-Stdlib only (Python 3.7+).
+Stdlib only (Python 3.9+).
 
 Subcommands:
   overlay   --profile P.json --out-overlay O.json --out-provider Q.json
