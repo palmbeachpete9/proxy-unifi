@@ -966,8 +966,9 @@ cmd_install_binary() {
             }' "$tmp/xray.dgst")"
         _github_want="$(github_asset_digest XTLS/Xray-core "$_tag" "$_asset" 2>/dev/null)" \
             || fatal "could not obtain xray-core's GitHub asset digest"
-        [ -n "$_want" ] && [ "$_want" = "$_github_want" ] \
-            || fatal "xray-core release checksum sources disagree"
+        if [ -z "$_want" ] || [ "$_want" != "$_github_want" ]; then
+            fatal "xray-core release checksum sources disagree"
+        fi
     fi
     verify_sha256 "$tmp/xray.zip" "$_want" \
         || fatal "xray-core download failed mandatory checksum verification"
