@@ -32,6 +32,7 @@ Subcommands:
 """
 
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -125,6 +126,31 @@ def _validate_untrusted_tree(value, path="profile"):
     elif isinstance(value, str):
         if value.lower().startswith("ext:") and ("routing" in path or "domain" in path.lower()):
             die("external file-backed geodata references are not allowed")
+
+
+def _validate_tls_pin_destination(outbound, targets):
+    """Reject the certificate-pin shape affected by GHSA-5wf9-h793-w73c.
+
+    The core downloader enforces a patched Xray version too. This check keeps a
+    dangerous provider profile from becoming active if an administrator restores
+    an older local binary manually.
+    """
+    stream = outbound.get("streamSettings")
+    if not isinstance(stream, dict) or stream.get("network") not in ("grpc", "hysteria"):
+        return
+    tls = stream.get("tlsSettings")
+    if not isinstance(tls, dict) or not tls.get("pinnedPeerCertSha256"):
+        return
+    server_name = tls.get("serverName")
+    if isinstance(server_name, str) and server_name:
+        return
+    for host, _port in targets:
+        try:
+            ipaddress.ip_address(str(host).strip("[]"))
+        except ValueError:
+            continue
+        die("provider uses certificate pinning with an IP-based %s target but no "
+            "TLS serverName; this is unsafe on older Xray cores" % stream["network"])
 
 
 def _primary_inbound(cfg):
@@ -283,6 +309,7 @@ def validate_profile(cfg):
                 die("provider outbound targets a non-public address: %s" % host)
             if port not in (None, ""):
                 safe_port(port)
+        _validate_tls_pin_destination(outbound, targets)
         if outbound.get("protocol") == "freedom":
             settings = outbound.get("settings")
             redirect = settings.get("redirect") if isinstance(settings, dict) else None

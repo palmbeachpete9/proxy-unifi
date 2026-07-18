@@ -120,26 +120,30 @@ SH
     else bad "CLI WireGuard endpoint formats IPv6"; fi
     rm -rf "$_ed"
 
-    _dd="$(mktemp -d)"
+    _hd="$(mktemp -d)"
     {
+        echo 'py() { python3 "$@"; }'
+        sed -n '/^xray_min_safe_sha256() {/,/^}/p' "$SRC/proxy-unifi"
+        sed -n '/^awg_core_sha256() {/,/^}/p' "$SRC/proxy-unifi"
+        sed -n '/^xray_tag_at_least() {/,/^}/p' "$SRC/proxy-unifi"
         cat <<'SH'
-download_to() {
-    case "$1" in
-        *good*) printf ok > "$2"; return 0 ;;
-        *) return 1 ;;
-    esac
-}
+[ "$(xray_min_safe_sha256 64)" = aa11c3685c71da0ffc71e511db50404609e7e963bb914b048f59a6a00af8930e ]
+[ "$(xray_min_safe_sha256 arm64-v8a)" = 89cfe01674d7c9f6847b7dd9389537be9acb3b9dc3c6cb9fdeba87a3e4e57fc1 ]
+[ "$(xray_min_safe_sha256 arm32-v7a)" = c623b8d08d02d7a20be697619fde11c6745efb08ac5cb332ab0ff15fe567aad6 ]
+! xray_min_safe_sha256 mips >/dev/null 2>&1
+[ "$(awg_core_sha256 amd64)" = 53e763e86dc66ba4643ad9ee40a0ac890b3ee6c6a34ebcb12c375c85038aa0c3 ]
+[ "$(awg_core_sha256 arm64)" = 1fac2dfb2af6d864669144f3c40ddfee001ea0891e70f3b87b06d6f74464fca4 ]
+[ "$(awg_core_sha256 armv7)" = a6b162f69f89fb11068657a121019559f6da1d7ad822ef8330b217a96b89c070 ]
+! awg_core_sha256 mips >/dev/null 2>&1
+xray_tag_at_least v26.7.11 v26.7.11
+xray_tag_at_least v27.1.1 v26.7.11
+! xray_tag_at_least v26.7.10 v26.7.11
+! xray_tag_at_least latest v26.7.11 >/dev/null 2>&1
 SH
-        sed -n '/^DOWNLOAD_URL_USED=/,/^}/p' "$SRC/proxy-unifi"
-        cat <<'SH'
-download_any_to "$1/out" 10 https://bad.example/file https://good.example/file || exit 1
-[ "$DOWNLOAD_URL_USED" = "https://good.example/file" ] || exit 1
-[ "$(cat "$1/out")" = ok ]
-SH
-    } > "$_dd/download-any.sh"
-    if sh "$_dd/download-any.sh" "$_dd"; then ok "core downloader tries fallback URL"
-    else bad "core downloader tries fallback URL"; fi
-    rm -rf "$_dd"
+    } > "$_hd/hashes.sh"
+    if sh "$_hd/hashes.sh"; then ok "core security floors and immutable digests"
+    else bad "core security floors and immutable digests"; fi
+    rm -rf "$_hd"
 
     _ad="$(mktemp -d)"
     mkdir -p "$_ad/package"
@@ -167,7 +171,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 sb_arch() { echo arm64; }
 ensure_run_dir() { RUN_DIR="$WORK/run"; mkdir -p "$RUN_DIR"; }
 download_to() { cp "$ARCHIVE" "$2"; }
-github_asset_digest() { printf '%s\n' "$EXPECTED"; }
+awg_core_sha256() { printf '%s\n' "$EXPECTED"; }
 verify_sha256() {
     _got="$(python3 - "$1" <<'PY'
 import hashlib,sys
@@ -627,6 +631,7 @@ except SystemExit:
 # label sanitization: ANSI dropped, Unicode/emoji preserved
 got = mksub.clean("Ru \x1b[31mX")
 assert got == "Ru X", got
+assert mksub.clean("left\ud800right", 40) == "leftright"
 assert mksub.clean("Нидерланды 🇳🇱", 40) == "Нидерланды 🇳🇱"
 assert mksub.clean("🇩🇪🎯 Автовыбор | Германия", 80) == "🇩🇪🎯 Автовыбор | Германия"
 assert mksub.clean("🇺🇸 США", 40) == "🇺🇸 США"
@@ -1136,6 +1141,21 @@ try:
     mkjson.validate_profile(xhttp); raise AssertionError("accepted private XHTTP download target")
 except SystemExit:
     pass
+# Xray GHSA-5wf9-h793-w73c: an IP gRPC target plus a certificate pin and no
+# serverName must fail even if an older vulnerable core is restored locally.
+unsafe_pin = json.loads(json.dumps(prof))
+unsafe_pin["outbounds"][0] = {
+    "protocol":"vless", "tag":"proxy",
+    "settings":{"vnext":[{"address":"1.1.1.1","port":443,
+                           "users":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}]},
+    "streamSettings":{"network":"grpc","security":"tls",
+                      "tlsSettings":{"pinnedPeerCertSha256":"00"*32}}}
+try:
+    mkjson.validate_profile(unsafe_pin); raise AssertionError("accepted unsafe IP gRPC pin")
+except SystemExit:
+    pass
+unsafe_pin["outbounds"][0]["streamSettings"]["tlsSettings"]["serverName"]="vpn.example"
+mkjson.validate_profile(unsafe_pin)
 # provider geodata jobs can replace local assets and are never part of pool routing semantics
 with_geodata = json.loads(json.dumps(prof)); with_geodata["geodata"]={"cron":"* * * * *"}
 assert "geodata" not in mkjson.sanitize_provider(with_geodata)
@@ -1162,7 +1182,9 @@ download_engines() {
     case "$_m" in arm64|aarch64) _xa=arm64-v8a; _sa=arm64;; x86_64|amd64) _xa=64; _sa=amd64;; *) echo "unknown arch"; return 1;; esac
     case "$_os" in darwin) _xos=macos; _sos=darwin;; linux) _xos=linux; _sos=linux;; *) echo "unknown os"; return 1;; esac
     echo "  downloading xray ($_xos-$_xa) ..."
-    _xurl="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-${_xos}-${_xa}.zip"
+    _xtag="$(sed -n 's/^XRAY_MIN_SAFE_TAG="\([^"]*\)"/\1/p' "$SRC/proxy-unifi")"
+    [ -n "$_xtag" ] || return 1
+    _xurl="https://github.com/XTLS/Xray-core/releases/download/${_xtag}/Xray-${_xos}-${_xa}.zip"
     curl -fsSL --connect-timeout 15 --max-time 300 --retry 3 "$_xurl" -o "$CACHE/x.zip" \
         && curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 "$_xurl.dgst" -o "$CACHE/x.dgst" \
         || return 1
@@ -1206,21 +1228,22 @@ engine_tests() {
     echo "== engine =="
     XP="$(python3 -c 'import os,base64;print(base64.b64encode(os.urandom(32)).decode())')"
     UP="$(python3 -c 'import os,base64;print(base64.b64encode(os.urandom(32)).decode())')"
+    UUID="b831381d-6324-4d53-ad4f-8cda48b30811"
     _d="$(mktemp -d)"
     gx() { python3 "$SRC/mkxray.py" --link "$1" --port 51821 --secret-key "$XP" --peer-pubkey "$UP" > "$_d/c.json" 2>/dev/null \
            && "$XR" run -test -config "$_d/c.json" -format json >/dev/null 2>&1; }
     gs() { python3 "$SRC/mksingbox.py" --link "$1" --port 51821 --secret-key "$XP" --peer-pubkey "$UP" > "$_d/s.json" 2>/dev/null \
            && "$SG" check -c "$_d/s.json" >/dev/null 2>&1; }
     KEY="$("$XR" x25519 2>/dev/null | awk -F': ' '/Password|Public/{print $2}' | tail -1)"
-    gx "vless://u@h:443?security=reality&type=tcp&flow=xtls-rprx-vision&pbk=$KEY&sid=ab&sni=a&fp=chrome" && ok "xray vless reality" || bad "xray vless reality"
+    gx "vless://$UUID@h:443?security=reality&type=tcp&flow=xtls-rprx-vision&pbk=$KEY&sid=ab&sni=a&fp=chrome" && ok "xray vless reality" || bad "xray vless reality"
     gx "trojan://pw@h:443?security=tls&sni=a" && ok "xray trojan" || bad "xray trojan"
-    gx "vless://u@h:443?type=kcp&security=none" && ok "xray mKCP" || bad "xray mKCP"
+    gx "vless://$UUID@h:443?type=kcp&security=none" && ok "xray mKCP" || bad "xray mKCP"
     _pcs="$(printf '%064d' 0)"
-    gx "vless://u@h:443?security=tls&type=grpc&sni=a&authority=front.example&mode=multi&vcn=cert.example&pcs=$_pcs&user_agent=ua&idle_timeout=60&health_check_timeout=20&permit_without_stream=true&initial_windows_size=65536" \
+    gx "vless://$UUID@h:443?security=tls&type=grpc&sni=a&authority=front.example&mode=multi&vcn=cert.example&pcs=$_pcs&user_agent=ua&idle_timeout=60&health_check_timeout=20&permit_without_stream=true&initial_windows_size=65536" \
         && ok "xray current TLS/gRPC share fields" || bad "xray current TLS/gRPC share fields"
     _xextra="$(python3 -c 'import json,urllib.parse; print(urllib.parse.quote(json.dumps({"scMaxEachPostBytes":1000000})))')"
     _xfm="$(python3 -c 'import json,urllib.parse; print(urllib.parse.quote(json.dumps({"tcp":[]})))')"
-    gx "vless://u@h:443?security=tls&type=xhttp&sni=a&extra=$_xextra&fm=$_xfm" \
+    gx "vless://$UUID@h:443?security=tls&type=xhttp&sni=a&extra=$_xextra&fm=$_xfm" \
         && ok "xray current XHTTP/FinalMask share fields" || bad "xray current XHTTP/FinalMask share fields"
     gs "hysteria2://pw@h:443?sni=h" && ok "singbox hysteria2" || bad "singbox hysteria2"
     gs "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?sni=h" && ok "singbox tuic" || bad "singbox tuic"
