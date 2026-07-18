@@ -12,7 +12,7 @@ It is imported, never run directly. Each helper runs from the installed `bin/`
 directory, which Python places on sys.path[0], so the sibling proxylib.py is
 importable with no packaging.
 
-Stdlib only (Python 3.7+).
+Stdlib only (Python 3.9+).
 """
 
 import base64

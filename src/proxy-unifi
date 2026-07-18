@@ -1967,6 +1967,7 @@ _ping_cleanup() {
 ping_proxy() {   # $1 = get|head
     have curl || { err "curl is required for proxy HTTP latency tests"; return 1; }
     _m="$1"; _e="$(current_engine)"
+    _proxy_scheme="socks5h"
     _port="$(_free_port)"
     ensure_run_dir
     _cfg="$RUN_DIR/ping.json"; _pid=""
@@ -1982,6 +1983,9 @@ ping_proxy() {   # $1 = get|head
         [ -x "$ABIN" ] || { err "AmneziaWG core not installed"; _ping_cleanup; return 1; }
         _awg_profile="$(awg_selected_profile)" \
             || { err "selected AmneziaWG profile is missing"; _ping_cleanup; return 1; }
+        # The minimal AWG probe config has no DNS service. Resolve this fixed
+        # test URL on the gateway, then carry the resulting connection over AWG.
+        _proxy_scheme="socks5"
         py "$MKAWG" build --file "$_awg_profile" --socks-port "$_port" \
             --loglevel "$(sb_loglevel)" > "$_cfg" 2>/dev/null \
             || { err "could not build AmneziaWG test config"; _ping_cleanup; return 1; }
@@ -2016,7 +2020,7 @@ ping_proxy() {   # $1 = get|head
     if [ "$_m" = "head" ]; then _label="via proxy (HEAD)"; set -- -I; else _label="via proxy (GET)"; set -- -X GET; fi
     # LC_ALL=C so curl prints time_total with a '.' decimal regardless of locale
     _out="$(LC_ALL=C curl -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time "$PING_TIMEOUT" \
-             "$@" --proxy "socks5h://127.0.0.1:${_port}" "$PING_URL" 2>/dev/null)" || _out=""
+             "$@" --proxy "${_proxy_scheme}://127.0.0.1:${_port}" "$PING_URL" 2>/dev/null)" || _out=""
     _ping_cleanup
     if [ -z "$_out" ]; then c_red "${_label}: timeout (>${PING_TIMEOUT}s)"; return 1; fi
     _code="${_out%% *}"; _ms="$(_ms_from_seconds "${_out##* }")"

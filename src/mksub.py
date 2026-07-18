@@ -20,7 +20,7 @@ Subcommands:
   extract --file nodes.json --index N --meta-file F [--payload-file F]
                                        -> validated selection metadata/payload
 
-Stdlib only (Python 3.7+).
+Stdlib only (Python 3.9+).
 """
 
 import argparse
@@ -882,14 +882,16 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
         if status != 200:
             die("HTTP error %s from subscription server" % status)
         content_length = rheaders.get("content-length")
-        if content_length:
-            try:
-                if int(content_length) > MAX_BYTES:
-                    die("subscription too large (> %d compressed bytes)" % MAX_BYTES)
-            except ValueError:
+        expected_length = None
+        if content_length is not None:
+            content_length = content_length.strip()
+            if len(content_length) > 20 or not re.match(r"^[0-9]+$", content_length):
                 die("invalid Content-Length from subscription server")
+            expected_length = int(content_length)
+            if expected_length > MAX_BYTES:
+                die("subscription too large (> %d compressed bytes)" % MAX_BYTES)
         body = bytearray()
-        while True:
+        while not resp.isclosed():
             try:
                 tls.settimeout(_remaining(deadline))
                 # read1 returns after one buffered/socket read and still handles
@@ -904,6 +906,8 @@ def _https_get(url, send_hwid, hwid, ua, deadline):
             if len(body) > MAX_BYTES:
                 die("subscription too large (> %d compressed bytes)" % MAX_BYTES)
         body = bytes(body)
+        if expected_length is not None and len(body) != expected_length:
+            die("incomplete subscription body")
         enc = (rheaders.get("content-encoding") or "").strip().lower()
         if enc == "gzip":
             body = _decompress_limited(body, "gzip")

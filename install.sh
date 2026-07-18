@@ -122,8 +122,8 @@ acquire_install_lock() {
 
 preflight() {
     [ -n "$PYTHON" ] || { echo "python3 is required" >&2; return 1; }
-    "$PYTHON" -c 'import sys; raise SystemExit(sys.version_info < (3, 7))' \
-        || { echo "Python 3.7 or newer is required" >&2; return 1; }
+    "$PYTHON" -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' \
+        || { echo "Python 3.9 or newer is required" >&2; return 1; }
     have systemctl || { echo "systemctl is required" >&2; return 1; }
     for _dep in bash find sort xargs; do
         have "$_dep" || { echo "$_dep is required for boot persistence" >&2; return 1; }

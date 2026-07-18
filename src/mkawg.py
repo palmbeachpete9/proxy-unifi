@@ -5,7 +5,7 @@ The generated config runs two userspace endpoints in one amnezia-box process:
 the existing WireGuard server used by UniFi, and an AmneziaWG client endpoint.
 No provider key is passed on argv and no kernel interface or route is created.
 
-Stdlib only (Python 3.7+).
+Stdlib only (Python 3.9+).
 """
 
 import argparse

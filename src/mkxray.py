@@ -13,7 +13,7 @@ out through that proxy server.
 
 Generic link-parsing helpers (URL split, host/port validation, base64, query,
 secret-file loading, Shadowsocks credentials, and die) live in proxylib.py, shared with
-mksingbox.py. Stdlib only (Python 3.7+) so it runs on the gateway as shipped.
+mksingbox.py. Stdlib only (Python 3.9+) so it runs on the gateway as shipped.
 """
 
 import argparse

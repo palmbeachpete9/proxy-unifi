@@ -67,7 +67,11 @@ selected profile.
 
 ## Compatibility
 
-This package is compatible with UniFi OS 4.x or newer and is known to work on the following UniFi devices:
+This package is compatible with UniFi OS 4.x or newer and requires the gateway's
+system Python 3.9 or newer. The minimum was verified against the signed UDM-Pro
+4.0.6 and 5.1.19 firmware images; installation fails before making changes if an
+older interpreter is found. It is known to work on the following UniFi devices:
+
 | Model | Code |
 |---|---|
 | UniFi Cloud Gateway Ultra | `UCG-Ultra` |
