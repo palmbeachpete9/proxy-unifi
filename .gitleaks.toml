@@ -1,0 +1,10 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public X25519 parser-test key, not a credential"
+targetRules = ["generic-api-key"]
+regexTarget = "line"
+regexes = ['''^\s*KEY=cvttX9u3nd7XD16gF4LJ09KjFZ0ZN4x9nk2TQePX5jk\s*$''']
+paths = ['''^tests/run\.sh$''']
+condition = "AND"
