@@ -201,7 +201,7 @@ def clean(s, maxlen=FIELD_MAX):
     out = []
     for ch in value:
         o = ord(ch)
-        if o in _BAD or unicodedata.category(ch) == "Cc":
+        if o in _BAD or unicodedata.category(ch) in ("Cc", "Cs"):
             continue
         out.append(" " if ch in ("\t", "\n", "\r") else ch)
     r = " ".join("".join(out).split())

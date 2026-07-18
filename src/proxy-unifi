@@ -62,11 +62,15 @@ TXN_MARKER="$TXN_ROOT/active"
 PLUGIN_SERVICE_NAME="proxy-unifi-plugin"
 PLUGIN_SERVICE_FILE="/etc/systemd/system/${PLUGIN_SERVICE_NAME}.service"
 
-XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/latest/download"
 SINGBOX_RELEASES="https://github.com/SagerNet/sing-box/releases"
 AWG_CORE_RELEASES="https://github.com/palmbeachpete9/proxy-unifi/releases"
 AWG_CORE_VERSION="1.0.0"
 AWG_CORE_TAG="awg-core-v${AWG_CORE_VERSION}"
+# Xray's latest stable release (v26.3.27) is in the vulnerable range for
+# GHSA-5wf9-h793-w73c. Prefer a newer stable release when one exists, but never
+# fall below the first patched release. Its archive hashes are pinned here so a
+# release asset cannot be silently replaced together with its online checksum.
+XRAY_MIN_SAFE_TAG="v26.7.11"
 
 # defaults (overridable via settings.env)
 WG_LISTEN="127.0.0.1"
@@ -690,6 +694,39 @@ sb_arch() {
     esac
 }
 
+xray_min_safe_sha256() {
+    case "$1" in
+        64)         echo "aa11c3685c71da0ffc71e511db50404609e7e963bb914b048f59a6a00af8930e" ;;
+        arm64-v8a)  echo "89cfe01674d7c9f6847b7dd9389537be9acb3b9dc3c6cb9fdeba87a3e4e57fc1" ;;
+        arm32-v7a)  echo "c623b8d08d02d7a20be697619fde11c6745efb08ac5cb332ab0ff15fe567aad6" ;;
+        *) return 1 ;;
+    esac
+}
+
+awg_core_sha256() {
+    case "$1" in
+        amd64) echo "53e763e86dc66ba4643ad9ee40a0ac890b3ee6c6a34ebcb12c375c85038aa0c3" ;;
+        arm64) echo "1fac2dfb2af6d864669144f3c40ddfee001ea0891e70f3b87b06d6f74464fca4" ;;
+        armv7) echo "a6b162f69f89fb11068657a121019559f6da1d7ad822ef8330b217a96b89c070" ;;
+        *) return 1 ;;
+    esac
+}
+
+xray_tag_at_least() {
+    py - "$1" "$2" <<'PYEOF'
+import re
+import sys
+
+def version(value):
+    match = re.match(r"^v([0-9]+)\.([0-9]+)\.([0-9]+)$", value)
+    if not match:
+        raise SystemExit(2)
+    return tuple(int(part) for part in match.groups())
+
+raise SystemExit(0 if version(sys.argv[1]) >= version(sys.argv[2]) else 1)
+PYEOF
+}
+
 # Download <url> to <dest> using whichever of curl/wget exists. Returns nonzero on
 # failure (and removes a partial file). One place, so tag-resolution and the
 # tarball download use the same available tool.
@@ -710,20 +747,6 @@ download_to() {
     _d_size="$(wc -c < "$_d_dst" | tr -d ' ')"
     case "$_d_size" in ""|*[!0-9]*) rm -f "$_d_dst"; return 1 ;; esac
     [ "$_d_size" -le "$_d_max" ] || { rm -f "$_d_dst"; return 1; }
-}
-
-DOWNLOAD_URL_USED=""
-download_any_to() {
-    _da_dst="$1"; _da_max="$2"; shift 2
-    DOWNLOAD_URL_USED=""
-    for _da_url in "$@"; do
-        [ -n "$_da_url" ] || continue
-        if download_to "$_da_url" "$_da_dst" "$_da_max"; then
-            DOWNLOAD_URL_USED="$_da_url"
-            return 0
-        fi
-    done
-    return 1
 }
 
 # Resolve the latest tag from a .../releases/latest redirect with the available tool.
@@ -857,8 +880,8 @@ cmd_install_awg() {
     info "downloading AmneziaWG core ${AWG_CORE_VERSION} (${_aa}) ..."
     download_to "$_url" "$_tmp/core.tgz" 262144000 \
         || { rm -rf "$_tmp"; err "AmneziaWG core download failed"; return 1; }
-    _want="$(github_asset_digest palmbeachpete9/proxy-unifi "$AWG_CORE_TAG" "$_asset" 2>/dev/null)" \
-        || { rm -rf "$_tmp"; err "could not obtain the AmneziaWG core asset digest"; return 1; }
+    _want="$(awg_core_sha256 "$_aa")" \
+        || { rm -rf "$_tmp"; err "no pinned AmneziaWG core digest for $_aa"; return 1; }
     verify_sha256 "$_tmp/core.tgz" "$_want" \
         || { rm -rf "$_tmp"; err "AmneziaWG core checksum verification failed"; return 1; }
     py - "$_tmp/core.tgz" "$_tmp" <<'PYEOF' \
@@ -916,25 +939,36 @@ ensure_awg() {
 cmd_install_binary() {
     mkdir -p "$BIN_DIR"
     slug="$(arch_slug)"
-    _tag="$(resolve_latest_tag "https://github.com/XTLS/Xray-core/releases" 2>/dev/null || true)"
+    _latest_tag="$(resolve_latest_tag "https://github.com/XTLS/Xray-core/releases" 2>/dev/null || true)"
+    if [ -n "$_latest_tag" ] && xray_tag_at_least "$_latest_tag" "$XRAY_MIN_SAFE_TAG"; then
+        _tag="$_latest_tag"
+    else
+        _tag="$XRAY_MIN_SAFE_TAG"
+    fi
     _asset="Xray-linux-${slug}.zip"
-    _latest="${XRAY_RELEASE_BASE}/${_asset}"
-    _pinned=""
-    [ -n "$_tag" ] && _pinned="https://github.com/XTLS/Xray-core/releases/download/${_tag}/${_asset}"
+    _pinned="https://github.com/XTLS/Xray-core/releases/download/${_tag}/${_asset}"
     ensure_run_dir
     tmp="$RUN_DIR/xray"; mkdir -p "$tmp"
-    info "downloading xray-core${_tag:+ $_tag} ($slug) ..."
-    download_any_to "$tmp/xray.zip" 367001600 "$_pinned" "$_latest" \
-        || fatal "download failed: ${_pinned:-$_latest}"
-    _xray_url="$DOWNLOAD_URL_USED"
-    # D21: verify the archive against the release's published SHA-256 (.dgst). This
-    # is integrity (catches corruption/truncation/MITM-without-cert), not signing.
-    download_any_to "$tmp/xray.dgst" 1048576 "${_xray_url}.dgst" "${_pinned:+$_pinned.dgst}" "$_latest.dgst" 2>/dev/null \
-        || fatal "xray-core checksum file is unavailable; refusing unverified update"
-    _want="$(awk -F'= ' '
-        tolower($1) ~ /sha2-256/ {
-            value=tolower($2); gsub(/[[:space:]\r]/, "", value); print value; exit
-        }' "$tmp/xray.dgst")"
+    info "downloading xray-core $_tag ($slug) ..."
+    download_to "$_pinned" "$tmp/xray.zip" 367001600 \
+        || fatal "download failed: $_pinned"
+    if [ "$_tag" = "$XRAY_MIN_SAFE_TAG" ]; then
+        _want="$(xray_min_safe_sha256 "$slug")" \
+            || fatal "no pinned xray-core digest for $slug"
+    else
+        # Newer upstream releases must agree across both release metadata and
+        # Xray's sidecar checksum before they are accepted.
+        download_to "${_pinned}.dgst" "$tmp/xray.dgst" 1048576 2>/dev/null \
+            || fatal "xray-core checksum file is unavailable; refusing unverified update"
+        _want="$(awk -F'= ' '
+            tolower($1) ~ /sha2-256/ {
+                value=tolower($2); gsub(/[[:space:]\r]/, "", value); print value; exit
+            }' "$tmp/xray.dgst")"
+        _github_want="$(github_asset_digest XTLS/Xray-core "$_tag" "$_asset" 2>/dev/null)" \
+            || fatal "could not obtain xray-core's GitHub asset digest"
+        [ -n "$_want" ] && [ "$_want" = "$_github_want" ] \
+            || fatal "xray-core release checksum sources disagree"
+    fi
     verify_sha256 "$tmp/xray.zip" "$_want" \
         || fatal "xray-core download failed mandatory checksum verification"
     info "xray-core checksum verified."
