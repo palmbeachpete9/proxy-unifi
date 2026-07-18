@@ -11,120 +11,110 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CORE_VERSION: 1.0.0
+  CORE_VERSION: 1.0.1
   AMNEZIA_BOX_COMMIT: dbfa7d83c105d16a6b38846268a36532df04ff91
   AMNEZIAWG_GO_VERSION: v0.2.19
+  EDWARDS25519_VERSION: v1.1.1
+  GO_CHI_VERSION: v5.2.5
+  X_CRYPTO_VERSION: v0.52.0
+  X_NET_VERSION: v0.55.0
+  X_SYS_VERSION: v0.45.0
+  GOVULNCHECK_VERSION: v1.6.0
 
 jobs:
-  build:
-    name: Build ${{ matrix.arch }} core
+  release:
+    name: Build, audit, and publish pinned core release
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            goarch: amd64
-            goarm: ""
-          - arch: arm64
-            goarch: arm64
-            goarm: ""
-          - arch: armv7
-            goarch: arm
-            goarm: "7"
+    timeout-minutes: 45
+    permissions:
+      contents: write # Create the immutable, versioned project release.
     steps:
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: 1.24.4
+          go-version: 1.25.12
           cache: false
       - name: Check out pinned Amnezia source
         run: |
           set -eu
-          git clone --filter=blob:none https://github.com/amnezia-vpn/amnezia-box.git source
-          git -C source checkout --detach "$AMNEZIA_BOX_COMMIT"
+          git init source
+          git -C source remote add origin https://github.com/amnezia-vpn/amnezia-box.git
+          git -C source fetch --depth 1 origin "$AMNEZIA_BOX_COMMIT"
+          git -C source checkout --detach FETCH_HEAD
           test "$(git -C source rev-parse HEAD)" = "$AMNEZIA_BOX_COMMIT"
-      - name: Pin current AmneziaWG userspace library
+      - name: Pin audited runtime dependencies
         working-directory: source
         run: |
           set -eu
-          go get "github.com/amnezia-vpn/amneziawg-go@${AMNEZIAWG_GO_VERSION}"
+          go get \
+            "filippo.io/edwards25519@${EDWARDS25519_VERSION}" \
+            "github.com/amnezia-vpn/amneziawg-go@${AMNEZIAWG_GO_VERSION}" \
+            "github.com/go-chi/chi/v5@${GO_CHI_VERSION}" \
+            "golang.org/x/crypto@${X_CRYPTO_VERSION}" \
+            "golang.org/x/net@${X_NET_VERSION}" \
+            "golang.org/x/sys@${X_SYS_VERSION}"
           test "$(go list -m -f '{{.Version}}' github.com/amnezia-vpn/amneziawg-go)" = "$AMNEZIAWG_GO_VERSION"
+          test "$(go list -m -f '{{.Version}}' filippo.io/edwards25519)" = "$EDWARDS25519_VERSION"
+          test "$(go list -m -f '{{.Version}}' github.com/go-chi/chi/v5)" = "$GO_CHI_VERSION"
+          test "$(go list -m -f '{{.Version}}' golang.org/x/crypto)" = "$X_CRYPTO_VERSION"
+          test "$(go list -m -f '{{.Version}}' golang.org/x/net)" = "$X_NET_VERSION"
+          test "$(go list -m -f '{{.Version}}' golang.org/x/sys)" = "$X_SYS_VERSION"
+          go mod tidy
           go mod vendor
-      - name: Build static core
+      - name: Check reachable Go vulnerabilities
         working-directory: source
-        env:
-          CGO_ENABLED: "0"
-          GOOS: linux
-          GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
-          GOTOOLCHAIN: local
         run: |
           set -eu
-          go build -mod=vendor -trimpath -tags 'with_gvisor,with_wireguard,with_awg' \
-            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=proxy-unifi-awg-${CORE_VERSION}' -s -w -buildid=" \
-            -o amnezia-box ./cmd/sing-box
-          go version -m amnezia-box | grep -q 'CGO_ENABLED=0'
-          file amnezia-box | grep -q 'statically linked'
-          if [ "$GOARCH" = amd64 ]; then
-            ./amnezia-box version | grep -q "version proxy-unifi-awg-${CORE_VERSION}"
-          fi
-      - name: Package core and corresponding source
-        env:
-          PACKAGE_ARCH: ${{ matrix.arch }}
+          go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          govulncheck -tags 'with_gvisor,with_wireguard,with_awg' ./cmd/sing-box
+          go test -mod=vendor -tags 'with_gvisor,with_wireguard,with_awg' \
+            ./transport/awg ./protocol/awg ./transport/wireguard ./protocol/wireguard
+      - name: Build and package static cores
         run: |
           set -eu
-          package="proxy-unifi-amnezia-box-${CORE_VERSION}-linux-${PACKAGE_ARCH}"
+          mkdir -p dist
+          for spec in amd64:amd64: arm64:arm64: armv7:arm:7; do
+            package_arch=${spec%%:*}
+            remainder=${spec#*:}
+            goarch=${remainder%%:*}
+            goarm=${remainder#*:}
+            package="proxy-unifi-amnezia-box-${CORE_VERSION}-linux-${package_arch}"
+            mkdir -p "$package"
+            (
+              cd source
+              CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" GOARM="$goarm" GOTOOLCHAIN=local \
+                go build -mod=vendor -trimpath -tags 'with_gvisor,with_wireguard,with_awg' \
+                  -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=proxy-unifi-awg-${CORE_VERSION}' -s -w -buildid=" \
+                  -o "../$package/amnezia-box" ./cmd/sing-box
+            )
+            go version -m "$package/amnezia-box" > "$package/BUILDINFO.txt"
+            grep -q 'CGO_ENABLED=0' "$package/BUILDINFO.txt"
+            file "$package/amnezia-box" | grep -q 'statically linked'
+            if [ "$goarch" = amd64 ]; then
+              "$package/amnezia-box" version | grep -q "version proxy-unifi-awg-${CORE_VERSION}"
+            fi
+            install -m 0644 source/LICENSE "$package/LICENSE"
+            {
+              echo "amnezia-box commit: $AMNEZIA_BOX_COMMIT"
+              echo "amneziawg-go version: $AMNEZIAWG_GO_VERSION"
+              echo "Go version: 1.25.12"
+              echo "golang.org/x/crypto version: $X_CRYPTO_VERSION"
+              echo "golang.org/x/net version: $X_NET_VERSION"
+              echo "build tags: with_gvisor,with_wireguard,with_awg"
+              echo "source: https://github.com/amnezia-vpn/amnezia-box"
+            } > "$package/SOURCE.txt"
+            tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='UTC 2020-01-01' \
+              -czf "dist/$package.tar.gz" "$package"
+          done
+      - name: Prepare corresponding source and checksums
+        run: |
+          set -eu
+          package="proxy-unifi-amnezia-box-${CORE_VERSION}-source"
           mkdir -p "$package"
-          install -m 0755 source/amnezia-box "$package/amnezia-box"
-          install -m 0644 source/LICENSE "$package/LICENSE"
-          {
-            echo "amnezia-box commit: $AMNEZIA_BOX_COMMIT"
-            echo "amneziawg-go version: $AMNEZIAWG_GO_VERSION"
-            echo "build tags: with_gvisor,with_wireguard,with_awg"
-            echo "source: https://github.com/amnezia-vpn/amnezia-box"
-          } > "$package/SOURCE.txt"
+          tar --exclude=.git -C source -cf - . | tar -C "$package" -xf -
           tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='UTC 2020-01-01' \
-            -czf "$package.tar.gz" "$package"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: core-${{ matrix.arch }}
-          path: proxy-unifi-amnezia-box-*.tar.gz
-          if-no-files-found: error
-
-  release:
-    name: Publish pinned core release
-    needs: build
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write # Create or replace assets on the pinned project release.
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version: 1.24.4
-          cache: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          pattern: core-*
-          merge-multiple: true
-          path: dist
-      - name: Prepare corresponding source archive
-        run: |
-          set -eu
-          git clone --filter=blob:none https://github.com/amnezia-vpn/amnezia-box.git source
-          git -C source checkout --detach "$AMNEZIA_BOX_COMMIT"
-          cd source
-          go get "github.com/amnezia-vpn/amneziawg-go@${AMNEZIAWG_GO_VERSION}"
-          test "$(go list -m -f '{{.Version}}' github.com/amnezia-vpn/amneziawg-go)" = "$AMNEZIAWG_GO_VERSION"
-          go mod vendor
-          rm -rf .git amnezia-box
-          cd ..
-          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='UTC 2020-01-01' \
-            -czf "dist/proxy-unifi-amnezia-box-${CORE_VERSION}-source.tar.gz" source
+            -czf "dist/$package.tar.gz" "$package"
           cd dist
-          sha256sum ./* > SHA256SUMS
+          sha256sum ./*.tar.gz > SHA256SUMS
       - name: Publish pinned core release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -132,9 +122,9 @@ jobs:
           set -eu
           tag="awg-core-v${CORE_VERSION}"
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
-          else
-            gh release create "$tag" dist/* --target "$GITHUB_SHA" \
-              --title "AmneziaWG Core ${CORE_VERSION}" \
-              --notes "Pinned userspace AWG 1.5/2.0 core for proxy-unifi. Corresponding source and checksums are attached."
+            echo "release $tag already exists; refusing to replace immutable assets" >&2
+            exit 1
           fi
+          gh release create "$tag" dist/* --target "$GITHUB_SHA" \
+            --title "AmneziaWG Core ${CORE_VERSION}" \
+            --notes "Pinned userspace AWG 1.5/2.0 core for proxy-unifi. Corresponding source and checksums are published."
