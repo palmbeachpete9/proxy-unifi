@@ -134,6 +134,7 @@ SH
     _hd="$(mktemp -d)"
     {
         echo 'py() { python3 "$@"; }'
+        sed -n 's/^AWG_CORE_VERSION="\([^"]*\)"/AWG_CORE_VERSION="\1"/p' "$SRC/proxy-unifi"
         sed -n '/^xray_min_safe_sha256() {/,/^}/p' "$SRC/proxy-unifi"
         sed -n '/^awg_core_sha256() {/,/^}/p' "$SRC/proxy-unifi"
         sed -n '/^xray_tag_at_least() {/,/^}/p' "$SRC/proxy-unifi"
@@ -142,9 +143,10 @@ SH
 [ "$(xray_min_safe_sha256 arm64-v8a)" = 89cfe01674d7c9f6847b7dd9389537be9acb3b9dc3c6cb9fdeba87a3e4e57fc1 ]
 [ "$(xray_min_safe_sha256 arm32-v7a)" = c623b8d08d02d7a20be697619fde11c6745efb08ac5cb332ab0ff15fe567aad6 ]
 ! xray_min_safe_sha256 mips >/dev/null 2>&1
-[ "$(awg_core_sha256 amd64)" = 53e763e86dc66ba4643ad9ee40a0ac890b3ee6c6a34ebcb12c375c85038aa0c3 ]
-[ "$(awg_core_sha256 arm64)" = 1fac2dfb2af6d864669144f3c40ddfee001ea0891e70f3b87b06d6f74464fca4 ]
-[ "$(awg_core_sha256 armv7)" = a6b162f69f89fb11068657a121019559f6da1d7ad822ef8330b217a96b89c070 ]
+[ "$AWG_CORE_VERSION" = 1.0.1 ]
+[ "$(awg_core_sha256 amd64)" = d78128ac5451912649b9a6c4206406639c9855e23b40bb4c5221e64ce054bf5b ]
+[ "$(awg_core_sha256 arm64)" = d652e9c87508d16b82304ac6e5b21dfefd564b863ad58a30214e3ced01768314 ]
+[ "$(awg_core_sha256 armv7)" = a2ff5cad3fc6fe5d01b3dcd15c59ac6228550d24b2cc042c2373fee1a30e0870 ]
 ! awg_core_sha256 mips >/dev/null 2>&1
 xray_tag_at_least v26.7.11 v26.7.11
 xray_tag_at_least v27.1.1 v26.7.11
@@ -161,7 +163,7 @@ SH
     cat > "$_ad/package/amnezia-box" <<'SH'
 #!/bin/sh
 [ "${1:-}" = version ] || exit 2
-echo 'sing-box version proxy-unifi-awg-1.0.0'
+echo 'sing-box version proxy-unifi-awg-1.0.1'
 SH
     chmod 0755 "$_ad/package/amnezia-box"
     python3 - "$_ad/good.tgz" "$_ad/package" "$_ad/bad.tgz" <<'PY'
@@ -176,7 +178,7 @@ PY
     cat > "$_ad/install-awg.sh" <<'SH'
 set -eu
 BIN_DIR="$WORK/bin"; ABIN="$BIN_DIR/amnezia-box"; RUN_DIR=""
-AWG_CORE_VERSION=1.0.0; AWG_CORE_TAG=awg-core-v1.0.0
+AWG_CORE_VERSION=1.0.1; AWG_CORE_TAG=awg-core-v1.0.1
 AWG_CORE_RELEASES=https://invalid.example
 have() { command -v "$1" >/dev/null 2>&1; }
 sb_arch() { echo arm64; }
@@ -200,7 +202,7 @@ SH
     cat >> "$_ad/install-awg.sh" <<'SH'
 cmd_install_awg
 [ -x "$ABIN" ]
-"$ABIN" version | grep -q 'proxy-unifi-awg-1.0.0'
+"$ABIN" version | grep -q 'proxy-unifi-awg-1.0.1'
 [ ! -e "$ABIN.new" ] && [ ! -e "$ABIN.bak" ] && [ ! -e "$ABIN.bak.new" ]
 SH
     _good_digest="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$_ad/good.tgz")"

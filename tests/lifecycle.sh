@@ -97,7 +97,7 @@ SH
 cat > "$T/root/bin/amnezia-box" <<'SH'
 #!/bin/sh
 case "${1:-}" in
-    version) echo 'sing-box version proxy-unifi-awg-1.0.0' ;;
+    version) echo 'sing-box version proxy-unifi-awg-1.0.1' ;;
     check)
         shift
         [ "${1:-}" = -c ] || exit 2
