@@ -118,6 +118,7 @@ jobs:
       - name: Publish pinned core release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -eu
           tag="awg-core-v${CORE_VERSION}"
