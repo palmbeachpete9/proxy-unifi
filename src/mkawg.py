@@ -308,6 +308,8 @@ def _endpoint(value):
             host = valid_host(host)
         except SystemExit:
             fail("Peer Endpoint host is invalid")
+    if not port_text:
+        fail("Peer Endpoint port is required")
     port = _integer(port_text, "Peer Endpoint port", 1, 65535)
     core_host = "[%s]" % host if ":" in host else host
     return host, core_host, port

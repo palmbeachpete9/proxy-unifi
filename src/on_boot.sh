@@ -14,7 +14,6 @@ LOG="$ROOT/boot.log"
 # nothing to do if the package isn't installed
 [ -x "$CLI" ] || exit 0
 umask 077
-mkdir -p "$ROOT"
 exec >>"$LOG" 2>&1
 printf '%s proxy-unifi boot recovery starting\n' "$(date -Iseconds 2>/dev/null || date)"
 

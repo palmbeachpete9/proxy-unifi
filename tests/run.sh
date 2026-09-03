@@ -59,7 +59,7 @@ static_tests() {
     _sd="$(mktemp -d)"
     # shellcheck disable=SC2016 # $!/\$1 must expand inside the child shell
     python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 1 --memory-mb 64 --fsize-mb 1 -- \
-        sh -c 'sleep 30 & echo $! > "$1/child"; wait' sh "$_sd" >/dev/null 2>"$_sd/error"
+        sh -c 'trap "" TERM; sleep 30 & trap "" TERM; echo $! > "$1/child"; wait' sh "$_sd" >/dev/null 2>"$_sd/error"
     _src=$?; _child="$(cat "$_sd/child" 2>/dev/null || true)"; _dead=1
     [ -n "$_child" ] && kill -0 "$_child" 2>/dev/null && _dead=0
     if [ "$_src" = 124 ] && [ "$_dead" = 1 ]; then ok "safe validator timeout kills process group"
@@ -67,7 +67,7 @@ static_tests() {
     rm -rf "$_sd"
     if [ "$(uname -s)" = Linux ]; then
         python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 10 --memory-mb 64 --fsize-mb 1 -- \
-            python3 -c 'x=bytearray(96*1024*1024); __import__("time").sleep(2)' >/dev/null 2>&1
+            python3 -c 'import os,time; os.fork() or (x:=bytearray(96*1024*1024),time.sleep(2)); time.sleep(2)' >/dev/null 2>&1
         [ "$?" = 125 ] && ok "safe validator enforces resident-memory limit" \
             || bad "safe validator enforces resident-memory limit"
     fi
@@ -205,18 +205,18 @@ cmd_install_awg
 "$ABIN" version | grep -q 'proxy-unifi-awg-1.0.1'
 [ ! -e "$ABIN.new" ] && [ ! -e "$ABIN.bak" ] && [ ! -e "$ABIN.bak.new" ]
 SH
-    _good_digest="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$_ad/good.tgz")"
-    _bad_digest="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$_ad/bad.tgz")"
+    _good_digest="$(sha256_of "$_ad/good.tgz")"
+    _bad_digest="$(sha256_of "$_ad/bad.tgz")"
     _awg_install_ok=1
     WORK="$_ad/work" ARCHIVE="$_ad/good.tgz" EXPECTED="$_good_digest" \
         sh "$_ad/install-awg.sh" || _awg_install_ok=0
-    _old_core="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$_ad/work/bin/amnezia-box")"
+    _old_core="$(sha256_of "$_ad/work/bin/amnezia-box")"
     if WORK="$_ad/work" ARCHIVE="$_ad/bad.tgz" EXPECTED="$_bad_digest" \
         sh "$_ad/install-awg.sh" >/dev/null 2>&1; then
         _awg_install_ok=0
     fi
     [ ! -e "$_ad/work/escape" ] || _awg_install_ok=0
-    [ "$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$_ad/work/bin/amnezia-box")" = "$_old_core" ] \
+    [ "$(sha256_of "$_ad/work/bin/amnezia-box")" = "$_old_core" ] \
         || _awg_install_ok=0
     [ "$_awg_install_ok" = 1 ] && ok "AWG core installer validates and safely promotes archive" \
         || bad "AWG core installer validates and safely promotes archive"
@@ -458,6 +458,8 @@ parser_tests() {
     _bad_vmess="$(printf '{"add":"h","port":443,"id":"u"}' | base64 | tr -d '\n' | sed 's/^/!/')"
     expect mkxray.py "vmess://$_bad_vmess" reject "invalid base64 characters rejected"
     expect mksingbox.py "hysteria2://pw@h:443?sni=h&obfs=salamander" reject "incomplete hysteria2 obfs rejected"
+    expect mksingbox.py "hysteria2://pw@h:443?insecure=1" reject "sing-box TLS disable rejected"
+    expect mksingbox.py "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?allowInsecure=true" reject "TUIC TLS disable rejected"
     expect mksingbox.py "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?sni=h&udp_over_stream=maybe" reject "invalid TUIC boolean rejected"
     expect mksingbox.py "$(ss_test_link 2022-blake3-aes-128-gcm "$SS15")" reject "SS2022 short key rejected"
     expect mkxray.py "$(ss_test_link 2022-blake3-aes-256-gcm "$SS16")" reject "SS2022 wrong AES-256 key rejected"
@@ -676,7 +678,7 @@ for b in [b"", base64.b64encode(b"nothing here"), b"<html></html>", base64.b64en
     except SystemExit:
         pass
 # JSON balancer profile feed (Remnawave/Happ) parses into selectable pool nodes
-prof = {"remarks": "DE Auto", "outbounds": [
+prof = {"remarks": "DE Auto", "inbounds": [{"tag": "socks", "protocol": "socks", "settings": {}}], "outbounds": [
             {"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{"address": "a.example.com", "port": 443}]}},
             {"protocol": "vless", "tag": "proxy-2", "settings": {"vnext": [{"address": "b.example.com", "port": 443}]}},
             {"protocol": "blackhole", "tag": "block"}],
@@ -750,12 +752,15 @@ vm_private = "vmess://" + base64.b64encode(json.dumps({"add":"192.168.1.2","port
 ss_private = "ss://" + base64.b64encode(b"aes-256-gcm:pw@192.168.1.3:8388").decode()
 assert mksub.node_from_link(vm_private)["recognized"] is False
 assert mksub.node_from_link(ss_private)["recognized"] is False
+# Historical numeric IPv4 spellings must not bypass the shared non-public-target guard.
+for host in ("2130706433", "0x7f000001", "0177.0.0.1", "127.1"):
+    assert mksub.node_from_link("vless://u@%s:443#x" % host)["recognized"] is False, host
 # Xray Trojan/SS profile shapes use settings.servers and must classify correctly
 for proto in ("trojan", "shadowsocks"):
-    shape={"outbounds":[{"protocol":proto,"tag":"proxy","settings":{"servers":[{"address":"public.example","port":443}]}}]}
+    shape={"inbounds":[{"protocol":"socks","settings":{}}],"outbounds":[{"protocol":proto,"tag":"proxy","settings":{"servers":[{"address":"public.example","port":443}]}}]}
     assert mksub._classify_profile(shape)[0] is True, (proto,mksub._classify_profile(shape))
 # Current direct settings.address shape is also classified and safety-checked.
-http_shape={"outbounds":[{"protocol":"http","tag":"proxy","settings":{"address":"public.example","port":3128}}]}
+http_shape={"inbounds":[{"protocol":"socks","settings":{}}],"outbounds":[{"protocol":"http","tag":"proxy","settings":{"address":"public.example","port":3128}}]}
 assert mksub._classify_profile(http_shape)[0] is True
 # JSON profile key ordering does not change identity, but provider remarks do.
 p1=dict(prof); p1["remarks"]="one"
@@ -1069,6 +1074,12 @@ assert m == 2 and strat == "leastPing" and tag == "B", (m, strat, tag)
 clean = mkjson.sanitize_provider(prof)
 assert "access" not in clean["log"]      # platform path stripped
 assert prof["log"]["access"] == "/Users/x/log"  # source profile stays immutable
+# A non-SOCKS primary cannot be meaningfully replaced with a WireGuard inbound.
+non_socks = json.loads(json.dumps(prof)); non_socks["inbounds"][0]["protocol"] = "dokodemo-door"
+try:
+    mkjson.validate_profile(non_socks); raise AssertionError("accepted non-SOCKS primary inbound")
+except SystemExit:
+    pass
 # SECURITY: a hostile profile's extra inbounds (open relay / dokodemo to LAN) and
 # control-plane blocks must be dropped, leaving the overlay as the sole inbound.
 evil = json.loads(json.dumps(prof))
