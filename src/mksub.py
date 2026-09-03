@@ -25,7 +25,9 @@ Stdlib only (Python 3.9+).
 
 import argparse
 import base64
+import contextlib
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -37,6 +39,7 @@ from urllib.parse import urlsplit, unquote, parse_qsl, urlencode, urlunsplit
 from proxylib import (dispatch_subcommand, is_non_public_host,
                       nested_too_deep, xray_outbound_servers,
                       shadowsocks_method_password, shadowsocks_engine)
+from mkjson import validate_profile
 # Network-only modules (ssl, http.client, socket, time, urljoin) are
 # imported lazily inside fetch_url()/_https_get()/_public_ips(); the hot local
 # subcommands (render/extract/match) never touch the
@@ -586,61 +589,30 @@ def _process_json(text, headers):
 
 
 def _classify_profile(prof):
-    """(recognized, reason, members, strategy, servers) for an Xray JSON profile.
-    A profile is unrecognized if it has no outbounds, or its only proxy server is
-    the provider's 'App not supported' 0.0.0.0 placeholder, or it relies on
-    source/SOCKS-auth routing a WireGuard inbound can't reproduce."""
-    outs = prof.get("outbounds")
-    if not isinstance(outs, list) or not outs:
-        return False, "no outbounds", 0, "", []
-    if len(outs) > 256:
-        return False, "too many outbounds", 0, "", []
-    servers = []
-    for o in outs:
-        if not isinstance(o, dict):
-            continue
-        servers.extend(host for host, _port in xray_outbound_servers(o))
-    for server in servers:
-        if _CONTROL_RE.search(server):
-            return False, "server contains control characters", 0, "", servers
-        if is_non_public_host(server):
-            return False, "non-public/placeholder provider destinations", 0, "", servers
-    if not servers:
-        return False, "no supported proxy servers", 0, "", servers
-    # source/user routing can't be reproduced by a WireGuard inbound
-    routing = prof.get("routing", {})
-    rules = routing.get("rules", []) if isinstance(routing, dict) else []
-    if not isinstance(rules, list):
-        return False, "routing.rules must be an array", 0, "", servers
-    for r in rules:
-        if isinstance(r, dict) and (r.get("user") or r.get("source") or r.get("sourcePort")):
-            return False, "routing needs source/user identity", 0, "", servers
-    bals = routing.get("balancers") if isinstance(routing, dict) else None
+    """Classify a pool with the same contract used during activation."""
+    error = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(error):
+            validate_profile(prof)
+    except SystemExit:
+        reason = error.getvalue().strip().split(": error: ", 1)[-1]
+        return False, reason or "profile is not supported by the WireGuard overlay", 0, "", []
+    outs = prof["outbounds"]
+    servers = [host for outbound in outs for host, _port in xray_outbound_servers(outbound)]
+    routing = prof.get("routing") or {}
+    bals = routing.get("balancers") or []
+    tags = [str(outbound.get("tag", "")) for outbound in outs]
     members, strategies = 0, []
-    if bals is not None and not isinstance(bals, list):
-        return False, "routing.balancers must be an array", 0, "", servers
-    if isinstance(bals, list) and len(bals) > 64:
-        return False, "too many balancers", 0, "", servers
-    tags = [str(o.get("tag", "")) for o in outs if isinstance(o, dict)]
-    for bal in bals or []:
-        if not isinstance(bal, dict):
-            return False, "malformed balancer", 0, "", servers
-        sels = bal.get("selector", [])
-        if not isinstance(sels, list) or not all(isinstance(s, str) for s in sels):
-            return False, "balancer selector must be an array of strings", 0, "", servers
-        members += sum(1 for tag in tags if any(tag.startswith(s) for s in sels))
+    for bal in bals:
+        selectors = bal.get("selector", [])
+        members += sum(1 for tag in tags if any(tag.startswith(selector) for selector in selectors))
         strategy = bal.get("strategy")
         if isinstance(strategy, dict) and strategy.get("type"):
             strategies.append(str(strategy["type"]))
     if not bals:
         members = len(servers)
-    direct_bypass = False
-    for bal in bals or []:
-        if isinstance(bal, dict) and bal.get("fallbackTag") == "direct":
-            direct_bypass = True
-    for rule in rules:
-        if isinstance(rule, dict) and rule.get("outboundTag") == "direct":
-            direct_bypass = True
+    direct_bypass = any(bal.get("fallbackTag") == "direct" for bal in bals) or any(
+        rule.get("outboundTag") == "direct" for rule in routing.get("rules", []))
     warning = "provider routing permits direct bypass" if direct_bypass else ""
     return True, warning, members, ",".join(dict.fromkeys(strategies)) or "single", servers
 
@@ -1051,21 +1023,6 @@ def _validate_node(nd):
             die("catalog node field '%s' is not a string" % f)
     return nd
 
-
-def _migrate(cat):
-    """Bring an older catalog up to the current schema, or return None if it
-    cannot be migrated safely (caller then forces a refresh)."""
-    nodes = cat.get("nodes")
-    if not isinstance(nodes, list):
-        return None
-    # schema 1 (pre-versioning): had 'supported' instead of 'recognized', short
-    # 8-char ids, and no 'schema' key. We can't reconstruct full-hash ids from the
-    # old short ones, so a stored selection won't match -> force a refresh.
-    if cat.get("schema") != SCHEMA_VERSION:
-        return None
-    return cat
-
-
 def _load(path):
     try:
         if os.path.getsize(path) > MAX_BYTES * 8:
@@ -1076,7 +1033,7 @@ def _load(path):
         die("could not read catalog: %s" % e)
     if not isinstance(cat, dict) or not isinstance(cat.get("nodes"), list):
         die("catalog is malformed")
-    if _migrate(cat) is None:
+    if cat.get("schema") != SCHEMA_VERSION:
         die("subscription catalog is from an older version; run a refresh "
             "(menu -> Import or replace -> subscription -> Refresh)")
     seen_n = set()

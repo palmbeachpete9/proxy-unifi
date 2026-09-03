@@ -101,7 +101,8 @@ def _validate_remote_url(value, label, schemes=("http", "https")):
         die("%s is malformed" % label)
     if parsed.scheme not in schemes or not parsed.hostname:
         die("%s uses an unsupported or hostless URL scheme" % label)
-    if _is_non_public(parsed.hostname):
+    host = valid_host(parsed.hostname)
+    if _is_non_public(host):
         die("%s targets a non-public address" % label)
 
 
@@ -154,17 +155,14 @@ def _validate_tls_pin_destination(outbound, targets):
 
 
 def _primary_inbound(cfg):
-    """The provider's local entry inbound that user traffic enters through.
-    Prefer a socks inbound, else the first inbound. Returns (index, inbound)."""
+    """Return the provider SOCKS entry point reproducible by our WG overlay."""
     ibs = cfg.get("inbounds")
     if not isinstance(ibs, list) or not ibs:
         die("profile has no inbounds (not a runnable client profile)")
     for index, inbound in enumerate(ibs):
         if isinstance(inbound, dict) and inbound.get("protocol") == "socks":
             return index, inbound
-    if not isinstance(ibs[0], dict):
-        die("profile's primary inbound is malformed")
-    return 0, ibs[0]
+    die("profile has no SOCKS inbound that the WireGuard overlay can reproduce")
 
 
 def _balancer_info(cfg):
@@ -320,6 +318,8 @@ def validate_profile(cfg):
                     redirect_host = urlsplit("//" + redirect).hostname
                 except ValueError:
                     die("freedom redirect is malformed")
+                if redirect_host:
+                    redirect_host = valid_host(redirect_host)
                 if redirect_host and _is_non_public(redirect_host):
                     die("freedom redirect targets a non-public address")
 
@@ -346,7 +346,10 @@ def validate_profile(cfg):
                     host = urlsplit("//" + candidate).hostname
                 except ValueError:
                     die("profile contains a malformed DNS server")
-                if not host or _is_non_public(host):
+                if not host:
+                    die("profile contains a malformed DNS server")
+                host = valid_host(host)
+                if _is_non_public(host):
                     die("profile DNS targets a non-public address")
         hosts = dns.get("hosts", {})
         if not isinstance(hosts, dict) or len(hosts) > 1024:
@@ -357,6 +360,7 @@ def validate_profile(cfg):
                 die("profile contains a malformed DNS hosts mapping")
             for item in mapped_values:
                 candidate = item[len("domain:"):] if item.startswith("domain:") else item
+                candidate = valid_host(candidate)
                 if _is_non_public(candidate):
                     die("profile DNS hosts mapping targets a non-public address")
 

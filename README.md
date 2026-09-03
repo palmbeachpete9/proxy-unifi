@@ -253,9 +253,8 @@ Re-running the installer only overwrites `bin/` (script + binaries) and the `sys
 ## Uninstall
 
 ```sh
-proxy            # menu → Uninstall
-# or:
-rm -rf /data/proxy-unifi   # also wipe keys/config
+proxy uninstall   # stop services, remove units/guards, keep data
+rm -rf /data/proxy-unifi   # optional: purge keys and configuration afterward
 ```
 Then delete the WireGuard VPN Client in the UniFi UI.
 
