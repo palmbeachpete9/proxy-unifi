@@ -325,7 +325,10 @@ run_step() {
 
 ensure_unifi_common() {
     mkdir -p "$ONBOOT_DIR"
-    if systemctl list-unit-files 2>/dev/null | grep -q '^udm-boot\.service'; then
+    # Reuse a working unifi-common unit. One that systemd could not load (e.g.
+    # the unbalanced-quote ExecStart shipped by earlier proxy-unifi installers)
+    # is replaced below.
+    if [ "$(systemctl show -p LoadState --value udm-boot 2>/dev/null)" = loaded ]; then
         systemctl enable udm-boot >/dev/null 2>&1
         return
     fi
@@ -342,7 +345,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
-ExecStart=bash -c 'mkdir -p /data/on_boot.d && find -L /data/on_boot.d -mindepth 1 -maxdepth 1 -type f -print0 | sort -z | xargs -0 -r -n 1 -- sh -c '\''if test -x "$0"; then echo "%n: running $0"; "$0"; else case "$0" in *.sh) echo "%n: sourcing $0"; . "$0";; *) echo "%n: ignoring $0";; esac; fi'\''
+ExecStart=bash -c 'mkdir -p /data/on_boot.d && find -L /data/on_boot.d -mindepth 1 -maxdepth 1 -type f -print0 | sort -z | xargs -0 -r -n 1 -- sh -c '\''if test -x "$0"; then echo "%n: running $0"; "$0"; else case "$0" in *.sh) echo "%n: sourcing $0"; . "$0";; *) echo "%n: ignoring $0";; esac; fi'\'
 RemainAfterExit=true
 
 [Install]
