@@ -104,7 +104,7 @@ The proxy engine is chosen automatically based on the imported link:
 | Shadowsocks + v2ray-plugin | sing-box |
 | Hysteria2 | sing-box |
 | TUIC | sing-box |
-| AmneziaWG 1.5 / 2.0 configuration | AmneziaWG core |
+| AmneziaWG 1.5 / 2.0 / 3.0 / 3.1 configuration | AmneziaWG core |
 
 Only one core runs at a time. All three use the **same** WireGuard keys/port, so the
 single UniFi VPN Client entry works no matter which core is active.
@@ -169,7 +169,7 @@ be projected safely are rejected before xray-core is started.
 
 ## AmneziaWG profiles
 
-The second menu block manages standalone AmneziaWG 1.5 and 2.0 client
+The second menu block manages standalone AmneziaWG 1.5, 2.0, 3.0, and 3.1 client
 configurations. Choose **Create a new profile**, enter a display name, paste the
 configuration into `nano`, and save with `Ctrl+X`, `Y`, `Enter`. Saved profiles
 can be listed, selected and activated, edited, renamed, or deleted; `*` marks the
@@ -184,7 +184,13 @@ UI. The AWG core is downloaded on first activation and is pinned to the project
 release and an architecture-specific SHA-256 digest embedded in proxy-unifi.
 
 The importer accepts AWG obfuscation fields `Jc`, `Jmin`, `Jmax`, `S1-S4`,
-`H1-H4`, and `I1-I5`, including AWG 2.0 header ranges and CPS packet templates.
+`H1-H4`, and `I1-I5`, including AWG 2.0 header ranges and CPS packet templates,
+plus the AWG 3.0 fields `HeaderProtectionKey`, `ContentPaddingAddition`,
+`RekeyAfterTime`, `RekeyTimeout`, `RejectAfterTime`, `KeepaliveTimeout`, and
+`MaxHandshakeAttempts`, and the AWG 3.1 flags `RandomTrailers` and `DisableCookies`.
+AWG 3.x settings must match the server. A server with `HeaderProtectionKey` accepts
+only AWG 3.x clients, and header protection requires `S1-S4` to be at least 12.
+A `PersistentKeepalive` range such as `20-30` uses its lower bound.
 Multiple peers, IPv4/IPv6 addresses, preshared keys, and keepalives are supported.
 Unsafe `wg-quick` hooks and routing commands are rejected. A profile's client-side
 `ListenPort` is retained in its saved source but omitted from the outbound runtime
@@ -253,9 +259,8 @@ Re-running the installer only overwrites `bin/` (script + binaries) and the `sys
 ## Uninstall
 
 ```sh
-proxy            # menu → Uninstall
-# or:
-rm -rf /data/proxy-unifi   # also wipe keys/config
+proxy uninstall   # stop services, remove units/guards, keep data
+rm -rf /data/proxy-unifi   # optional: purge keys and configuration afterward
 ```
 Then delete the WireGuard VPN Client in the UniFi UI.
 

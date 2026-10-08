@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parse AmneziaWG profiles and build the proxy-unifi bridge config.
+"""Parse AmneziaWG 1.0-3.1 profiles and build the proxy-unifi bridge config.
 
 The generated config runs two userspace endpoints in one amnezia-box process:
 the existing WireGuard server used by UniFi, and an AmneziaWG client endpoint.
@@ -60,7 +60,24 @@ INTERFACE_KEYS = {
     "i3": "i3",
     "i4": "i4",
     "i5": "i5",
+    # AWG 3.0
+    "headerprotectionkey": "header_protection_key",
+    "contentpaddingaddition": "content_padding_addition",
+    "rekeyaftertime": "rekey_after_time",
+    "rekeytimeout": "rekey_timeout",
+    "rejectaftertime": "reject_after_time",
+    "keepalivetimeout": "keepalive_timeout",
+    "maxhandshakeattempts": "max_handshake_attempts",
+    # AWG 3.1
+    "randomtrailers": "random_trailers",
+    "disablecookies": "disable_cookies",
 }
+AWG3_RANGES = ("content_padding_addition", "rekey_after_time", "rekey_timeout",
+               "reject_after_time", "keepalive_timeout", "max_handshake_attempts")
+AWG31_FLAGS = ("random_trailers", "disable_cookies")
+# amneziawg-go uses the first 12 bytes of every S1-S4 padding as the header
+# protection nonce and refuses to start with a shorter padding.
+HEADER_NONCE_BYTES = 12
 PEER_KEYS = {
     "publickey": "public_key",
     "presharedkey": "preshared_key",
@@ -211,25 +228,41 @@ def _integer(value, label, minimum, maximum):
     return number
 
 
-def _header(value, label):
+def _range(value, label, maximum=0xFFFFFFFF):
     if value is None or value == "":
         return None
     match = HEADER_RE.match(value)
     if not match:
         fail("%s must be an unsigned integer or range (start-end)" % label)
-    if len(match.group(1)) > 10 or len(match.group(2) or "") > 10:
-        fail("%s exceeds the 32-bit header range" % label)
+    digits = len(str(maximum))
+    if len(match.group(1)) > digits or len(match.group(2) or "") > digits:
+        fail("%s must be within 0-%d" % (label, maximum))
     start = int(match.group(1))
     end = int(match.group(2) or match.group(1))
-    if start > 0xFFFFFFFF or end > 0xFFFFFFFF:
-        fail("%s exceeds the 32-bit header range" % label)
+    if start > maximum or end > maximum:
+        fail("%s must be within 0-%d" % (label, maximum))
     if end < start:
         fail("%s range ends before it starts" % label)
-    # amneziawg-go calculates (end - start + 1) as uint32 before handing it to
-    # crypto/rand. The complete 0..2^32-1 range wraps to zero and can panic.
+    # amneziawg-go calculates (end - start + 1) as uint32 before picking a
+    # random value. The complete 0..2^32-1 range wraps to zero.
     if start == 0 and end == 0xFFFFFFFF:
         fail("%s range is too wide" % label)
     return value, start, end
+
+
+def _flag(value, label):
+    # Accept both the awg-tools (on/off, integers) and amneziawg-go
+    # (true/false) spellings, then emit a JSON boolean for the core.
+    if value is None or value == "":
+        return False
+    folded = value.lower()
+    if folded in ("on", "true"):
+        return True
+    if folded in ("off", "false"):
+        return False
+    if re.match(r"^[0-9]{1,10}$", value):
+        return int(value) != 0
+    fail("%s must be on/off, true/false, or 0/1" % label)
 
 
 def _cps(value, label):
@@ -308,6 +341,8 @@ def _endpoint(value):
             host = valid_host(host)
         except SystemExit:
             fail("Peer Endpoint host is invalid")
+    if not port_text:
+        fail("Peer Endpoint port is required")
     port = _integer(port_text, "Peer Endpoint port", 1, 65535)
     core_host = "[%s]" % host if ":" in host else host
     return host, core_host, port
@@ -398,7 +433,7 @@ def load_profile(path):
 
     headers = []
     for number in range(1, 5):
-        parsed = _header(raw_interface.get("h%d" % number), "H%d" % number)
+        parsed = _range(raw_interface.get("h%d" % number), "H%d" % number)
         interface["h%d" % number] = parsed[0] if parsed else ""
         headers.append(parsed)
     if any(headers) and not all(headers):
@@ -417,12 +452,35 @@ def load_profile(path):
         cps_sizes.append(size)
     interface["cps_sizes"] = cps_sizes
 
+    interface["header_protection_key"] = _strict_key(
+        raw_interface.get("header_protection_key", ""), "HeaderProtectionKey",
+        allow_empty=True, reject_zero=True)
+    if interface["header_protection_key"]:
+        for number in range(1, 5):
+            if interface["s%d" % number] < HEADER_NONCE_BYTES:
+                fail("HeaderProtectionKey requires S1-S4 to be at least %d" %
+                     HEADER_NONCE_BYTES)
+    labels = {"content_padding_addition": "ContentPaddingAddition",
+              "rekey_after_time": "RekeyAfterTime", "rekey_timeout": "RekeyTimeout",
+              "reject_after_time": "RejectAfterTime",
+              "keepalive_timeout": "KeepaliveTimeout",
+              "max_handshake_attempts": "MaxHandshakeAttempts",
+              "random_trailers": "RandomTrailers", "disable_cookies": "DisableCookies"}
+    # awg-tools stores these AWG 3 values as 16-bit ranges.
+    for key in AWG3_RANGES:
+        parsed = _range(raw_interface.get(key), labels[key], 0xFFFF)
+        interface[key] = parsed[0] if parsed else ""
+    for key in AWG31_FLAGS:
+        interface[key] = _flag(raw_interface.get(key), labels[key])
+
     peers = []
     public_keys = set()
     for index, raw in enumerate(raw_peers, 1):
         host, core_host, port = _endpoint(raw.get("endpoint", ""))
-        keepalive = _integer(raw.get("persistent_keepalive"),
-                             "Peer %d PersistentKeepalive" % index, 0, 65535)
+        # AWG 3 allows a range here. Keepalive is client-side only and the core
+        # takes one interval, so the shortest (most NAT-friendly) bound is used.
+        keepalive = _range(raw.get("persistent_keepalive"),
+                           "Peer %d PersistentKeepalive" % index, 0xFFFF)
         peer = {
             "public_key": _strict_key(raw.get("public_key", ""),
                                       "Peer %d PublicKey" % index,
@@ -434,7 +492,7 @@ def load_profile(path):
             "host": host,
             "core_host": core_host,
             "port": port,
-            "persistent_keepalive": keepalive,
+            "persistent_keepalive": keepalive[1] if keepalive else 0,
         }
         if peer["public_key"] in public_keys:
             fail("Peer %d duplicates an earlier PublicKey" % index)
@@ -445,7 +503,13 @@ def load_profile(path):
     has_cps = any(interface["i%d" % n] for n in range(1, 6))
     has_v2 = any(key in raw_interface for key in ("s3", "s4", "i2", "i3", "i4", "i5")) \
         or any(header and header[1] != header[2] for header in headers)
-    if has_v2:
+    has_v3 = any(key in raw_interface for key in ("header_protection_key",) + AWG3_RANGES) \
+        or any("-" in raw.get("persistent_keepalive", "") for raw in raw_peers)
+    if any(key in raw_interface for key in AWG31_FLAGS):
+        version = "3.1"
+    elif has_v3:
+        version = "3.0"
+    elif has_v2:
         version = "2.0"
     elif has_cps:
         version = "1.5"
@@ -466,12 +530,10 @@ def _endpoint_json(profile):
     # A client-side ListenPort is not needed for the outbound and would create a
     # second externally reachable UDP listener outside proxy-unifi's WG guard.
     # Keep it in the saved source profile, but deliberately omit it at runtime.
-    numeric = ("jc", "jmin", "jmax", "s1", "s2", "s3", "s4")
-    text = ("h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4", "i5")
-    for key in numeric:
-        if interface[key]:
-            endpoint[key] = interface[key]
-    for key in text:
+    optional = ("jc", "jmin", "jmax", "s1", "s2", "s3", "s4",
+                "h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4", "i5",
+                "header_protection_key") + AWG3_RANGES + AWG31_FLAGS
+    for key in optional:
         if interface[key]:
             endpoint[key] = interface[key]
     for peer in profile["peers"]:

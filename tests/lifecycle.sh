@@ -32,6 +32,8 @@ sed \
     -e "s|^SERVICE_FILE=.*|SERVICE_FILE=\"$T/proxy-unifi.service\"|" \
     -e "s|^REFRESH_SERVICE_FILE=.*|REFRESH_SERVICE_FILE=\"$T/proxy-unifi-refresh.service\"|" \
     -e "s|^REFRESH_TIMER_FILE=.*|REFRESH_TIMER_FILE=\"$T/proxy-unifi-refresh.timer\"|" \
+    -e "s|^GUARD_SERVICE_FILE=.*|GUARD_SERVICE_FILE=\"$T/proxy-unifi-guard.service\"|" \
+    -e "s|^GUARD_TIMER_FILE=.*|GUARD_TIMER_FILE=\"$T/proxy-unifi-guard.timer\"|" \
     -e "s|^ONBOOT_DST=.*|ONBOOT_DST=\"$T/on_boot.sh\"|" \
     -e "s|^PROXY_LINK=\"/usr/bin/proxy\"|PROXY_LINK=\"$T/proxy\"|" \
     "$REPO/src/proxy-unifi" > "$T/root/bin/proxy-base"
@@ -97,7 +99,7 @@ SH
 cat > "$T/root/bin/amnezia-box" <<'SH'
 #!/bin/sh
 case "${1:-}" in
-    version) echo 'sing-box version proxy-unifi-awg-1.0.1' ;;
+    version) echo 'sing-box version proxy-unifi-awg-1.1.0' ;;
     check)
         shift
         [ "${1:-}" = -c ] || exit 2

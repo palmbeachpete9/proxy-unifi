@@ -59,7 +59,7 @@ static_tests() {
     _sd="$(mktemp -d)"
     # shellcheck disable=SC2016 # $!/\$1 must expand inside the child shell
     python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 1 --memory-mb 64 --fsize-mb 1 -- \
-        sh -c 'sleep 30 & echo $! > "$1/child"; wait' sh "$_sd" >/dev/null 2>"$_sd/error"
+        sh -c 'trap "" TERM; sleep 30 & trap "" TERM; echo $! > "$1/child"; wait' sh "$_sd" >/dev/null 2>"$_sd/error"
     _src=$?; _child="$(cat "$_sd/child" 2>/dev/null || true)"; _dead=1
     [ -n "$_child" ] && kill -0 "$_child" 2>/dev/null && _dead=0
     if [ "$_src" = 124 ] && [ "$_dead" = 1 ]; then ok "safe validator timeout kills process group"
@@ -67,7 +67,7 @@ static_tests() {
     rm -rf "$_sd"
     if [ "$(uname -s)" = Linux ]; then
         python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 10 --memory-mb 64 --fsize-mb 1 -- \
-            python3 -c 'x=bytearray(96*1024*1024); __import__("time").sleep(2)' >/dev/null 2>&1
+            python3 -c 'import os,time; os.fork() or (x:=bytearray(96*1024*1024),time.sleep(2)); time.sleep(2)' >/dev/null 2>&1
         [ "$?" = 125 ] && ok "safe validator enforces resident-memory limit" \
             || bad "safe validator enforces resident-memory limit"
     fi
@@ -143,10 +143,10 @@ SH
 [ "$(xray_min_safe_sha256 arm64-v8a)" = 89cfe01674d7c9f6847b7dd9389537be9acb3b9dc3c6cb9fdeba87a3e4e57fc1 ]
 [ "$(xray_min_safe_sha256 arm32-v7a)" = c623b8d08d02d7a20be697619fde11c6745efb08ac5cb332ab0ff15fe567aad6 ]
 ! xray_min_safe_sha256 mips >/dev/null 2>&1
-[ "$AWG_CORE_VERSION" = 1.0.1 ]
-[ "$(awg_core_sha256 amd64)" = d78128ac5451912649b9a6c4206406639c9855e23b40bb4c5221e64ce054bf5b ]
-[ "$(awg_core_sha256 arm64)" = d652e9c87508d16b82304ac6e5b21dfefd564b863ad58a30214e3ced01768314 ]
-[ "$(awg_core_sha256 armv7)" = a2ff5cad3fc6fe5d01b3dcd15c59ac6228550d24b2cc042c2373fee1a30e0870 ]
+[ "$AWG_CORE_VERSION" = 1.1.0 ]
+[ "$(awg_core_sha256 amd64)" = 70f5a34514a25ab53ccc47011a8be11a2a497df08f1a0d90117708c92876202e ]
+[ "$(awg_core_sha256 arm64)" = 68cd53823b7a6e386c161ce08e194a5b061a27ffc058b6dfbc480abf1eb63f52 ]
+[ "$(awg_core_sha256 armv7)" = 7a547f4ded5e4fe90bbdcabc9bfe20383140a7e397c54a02494715729a381aa7 ]
 ! awg_core_sha256 mips >/dev/null 2>&1
 xray_tag_at_least v26.7.11 v26.7.11
 xray_tag_at_least v27.1.1 v26.7.11
@@ -163,7 +163,7 @@ SH
     cat > "$_ad/package/amnezia-box" <<'SH'
 #!/bin/sh
 [ "${1:-}" = version ] || exit 2
-echo 'sing-box version proxy-unifi-awg-1.0.1'
+echo 'sing-box version proxy-unifi-awg-1.1.0'
 SH
     chmod 0755 "$_ad/package/amnezia-box"
     python3 - "$_ad/good.tgz" "$_ad/package" "$_ad/bad.tgz" <<'PY'
@@ -178,7 +178,7 @@ PY
     cat > "$_ad/install-awg.sh" <<'SH'
 set -eu
 BIN_DIR="$WORK/bin"; ABIN="$BIN_DIR/amnezia-box"; RUN_DIR=""
-AWG_CORE_VERSION=1.0.1; AWG_CORE_TAG=awg-core-v1.0.1
+AWG_CORE_VERSION=1.1.0; AWG_CORE_TAG=awg-core-v1.1.0
 AWG_CORE_RELEASES=https://invalid.example
 have() { command -v "$1" >/dev/null 2>&1; }
 sb_arch() { echo arm64; }
@@ -202,21 +202,21 @@ SH
     cat >> "$_ad/install-awg.sh" <<'SH'
 cmd_install_awg
 [ -x "$ABIN" ]
-"$ABIN" version | grep -q 'proxy-unifi-awg-1.0.1'
+"$ABIN" version | grep -q 'proxy-unifi-awg-1.1.0'
 [ ! -e "$ABIN.new" ] && [ ! -e "$ABIN.bak" ] && [ ! -e "$ABIN.bak.new" ]
 SH
-    _good_digest="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$_ad/good.tgz")"
-    _bad_digest="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$_ad/bad.tgz")"
+    _good_digest="$(sha256_of "$_ad/good.tgz")"
+    _bad_digest="$(sha256_of "$_ad/bad.tgz")"
     _awg_install_ok=1
     WORK="$_ad/work" ARCHIVE="$_ad/good.tgz" EXPECTED="$_good_digest" \
         sh "$_ad/install-awg.sh" || _awg_install_ok=0
-    _old_core="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$_ad/work/bin/amnezia-box")"
+    _old_core="$(sha256_of "$_ad/work/bin/amnezia-box")"
     if WORK="$_ad/work" ARCHIVE="$_ad/bad.tgz" EXPECTED="$_bad_digest" \
         sh "$_ad/install-awg.sh" >/dev/null 2>&1; then
         _awg_install_ok=0
     fi
     [ ! -e "$_ad/work/escape" ] || _awg_install_ok=0
-    [ "$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$_ad/work/bin/amnezia-box")" = "$_old_core" ] \
+    [ "$(sha256_of "$_ad/work/bin/amnezia-box")" = "$_old_core" ] \
         || _awg_install_ok=0
     [ "$_awg_install_ok" = 1 ] && ok "AWG core installer validates and safely promotes archive" \
         || bad "AWG core installer validates and safely promotes archive"
@@ -458,6 +458,8 @@ parser_tests() {
     _bad_vmess="$(printf '{"add":"h","port":443,"id":"u"}' | base64 | tr -d '\n' | sed 's/^/!/')"
     expect mkxray.py "vmess://$_bad_vmess" reject "invalid base64 characters rejected"
     expect mksingbox.py "hysteria2://pw@h:443?sni=h&obfs=salamander" reject "incomplete hysteria2 obfs rejected"
+    expect mksingbox.py "hysteria2://pw@h:443?insecure=1" reject "sing-box TLS disable rejected"
+    expect mksingbox.py "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?allowInsecure=true" reject "TUIC TLS disable rejected"
     expect mksingbox.py "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?sni=h&udp_over_stream=maybe" reject "invalid TUIC boolean rejected"
     expect mksingbox.py "$(ss_test_link 2022-blake3-aes-128-gcm "$SS15")" reject "SS2022 short key rejected"
     expect mkxray.py "$(ss_test_link 2022-blake3-aes-256-gcm "$SS16")" reject "SS2022 wrong AES-256 key rejected"
@@ -676,7 +678,7 @@ for b in [b"", base64.b64encode(b"nothing here"), b"<html></html>", base64.b64en
     except SystemExit:
         pass
 # JSON balancer profile feed (Remnawave/Happ) parses into selectable pool nodes
-prof = {"remarks": "DE Auto", "outbounds": [
+prof = {"remarks": "DE Auto", "inbounds": [{"tag": "socks", "protocol": "socks", "settings": {}}], "outbounds": [
             {"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{"address": "a.example.com", "port": 443}]}},
             {"protocol": "vless", "tag": "proxy-2", "settings": {"vnext": [{"address": "b.example.com", "port": 443}]}},
             {"protocol": "blackhole", "tag": "block"}],
@@ -750,12 +752,15 @@ vm_private = "vmess://" + base64.b64encode(json.dumps({"add":"192.168.1.2","port
 ss_private = "ss://" + base64.b64encode(b"aes-256-gcm:pw@192.168.1.3:8388").decode()
 assert mksub.node_from_link(vm_private)["recognized"] is False
 assert mksub.node_from_link(ss_private)["recognized"] is False
+# Historical numeric IPv4 spellings must not bypass the shared non-public-target guard.
+for host in ("2130706433", "0x7f000001", "0177.0.0.1", "127.1"):
+    assert mksub.node_from_link("vless://u@%s:443#x" % host)["recognized"] is False, host
 # Xray Trojan/SS profile shapes use settings.servers and must classify correctly
 for proto in ("trojan", "shadowsocks"):
-    shape={"outbounds":[{"protocol":proto,"tag":"proxy","settings":{"servers":[{"address":"public.example","port":443}]}}]}
+    shape={"inbounds":[{"protocol":"socks","settings":{}}],"outbounds":[{"protocol":proto,"tag":"proxy","settings":{"servers":[{"address":"public.example","port":443}]}}]}
     assert mksub._classify_profile(shape)[0] is True, (proto,mksub._classify_profile(shape))
 # Current direct settings.address shape is also classified and safety-checked.
-http_shape={"outbounds":[{"protocol":"http","tag":"proxy","settings":{"address":"public.example","port":3128}}]}
+http_shape={"inbounds":[{"protocol":"socks","settings":{}}],"outbounds":[{"protocol":"http","tag":"proxy","settings":{"address":"public.example","port":3128}}]}
 assert mksub._classify_profile(http_shape)[0] is True
 # JSON profile key ordering does not change identity, but provider remarks do.
 p1=dict(prof); p1["remarks"]="one"
@@ -796,7 +801,7 @@ for bad_header in ("bad\r\nX: y", "emoji-\U0001f600", "\u043a\u0438\u0440\u0438\
 print("mksub-ok")
 PY
 
-    # mkawg: AWG 1.5/2.0 parser, bridge generator, profile catalog, and UI safety.
+    # mkawg: AWG 1.5-3.1 parser, bridge generator, profile catalog, and UI safety.
     python3 - "$SRC" <<'PY' && ok "mkawg parser and UI corpus" || bad "mkawg parser and UI corpus"
 import base64
 import contextlib
@@ -881,6 +886,18 @@ I2 = <rc 8><rd 8>
 I3 = <t><dz 2>
 I4 = <b abcd>
 I5 = <r 1>"""
+HPK = base64.b64encode(bytes(range(128, 160))).decode()
+awg30 = awg20.replace("S3 = 8", "S3 = 12") + """
+HeaderProtectionKey = %s
+ContentPaddingAddition = 0-64
+RekeyAfterTime = 100-120
+RekeyTimeout = 3-5
+RejectAfterTime = 170-180
+KeepaliveTimeout = 10
+MaxHandshakeAttempts = 10""" % HPK
+awg31 = awg30 + """
+RandomTrailers = on
+DisableCookies = off"""
 
 with tempfile.TemporaryDirectory() as directory:
     p15 = write(directory, text(awg15))
@@ -893,6 +910,22 @@ with tempfile.TemporaryDirectory() as directory:
     assert profile20["peers"][0]["core_host"] == "[2001:db8::10]"
     p10 = write(directory, text(""), "v1.conf")
     assert mkawg.load_profile(p10)["version"] == "1.0"
+    p30 = write(directory, text(awg30).replace("PersistentKeepalive = 25",
+                                               "PersistentKeepalive = 20-30"), "v3.conf")
+    profile30 = mkawg.load_profile(p30)
+    assert profile30["version"] == "3.0"
+    assert profile30["peers"][0]["persistent_keepalive"] == 20
+    awg30_json = mkawg._endpoint_json(profile30)
+    assert awg30_json["header_protection_key"] == HPK
+    assert awg30_json["content_padding_addition"] == "0-64"
+    assert awg30_json["rekey_timeout"] == "3-5"
+    assert awg30_json["max_handshake_attempts"] == "10"
+    assert "random_trailers" not in awg30_json
+    p31 = write(directory, text(awg31), "v31.conf")
+    profile31 = mkawg.load_profile(p31)
+    assert profile31["version"] == "3.1"
+    awg31_json = mkawg._endpoint_json(profile31)
+    assert awg31_json["random_trailers"] is True and "disable_cookies" not in awg31_json
 
     secret = write(directory, INNER, "inner.key")
     peer = write(directory, INNER_PEER, "peer.key")
@@ -997,6 +1030,15 @@ rejected(text(awg20).replace("H2 = 200-299", "H2 = 150-299"))
 rejected(text(awg15).replace("I1 = <b 0x01020304><r 16><t><d><ds><dz 2>", "I1 = junk<b 00>"))
 rejected(text(awg15).replace("I1 = <b 0x01020304><r 16><t><d><ds><dz 2>", "I1 = <r 65508>"))
 rejected(text(awg15).replace("S1 = 0", "S1 = 65507"))
+rejected(text(awg30).replace("S3 = 12", "S3 = 8"))
+rejected(text(awg30).replace("HeaderProtectionKey = " + HPK, "HeaderProtectionKey = invalid"))
+rejected(text(awg30).replace("HeaderProtectionKey = " + HPK,
+                             "HeaderProtectionKey = " + base64.b64encode(bytes(32)).decode()))
+rejected(text(awg30).replace("ContentPaddingAddition = 0-64", "ContentPaddingAddition = 0-65536"))
+rejected(text(awg30).replace("RekeyTimeout = 3-5", "RekeyTimeout = 5-3"))
+rejected(text(awg30).replace("KeepaliveTimeout = 10", "KeepaliveTimeout = 10\nKeepaliveTimeout = 11"))
+rejected(text(awg31).replace("RandomTrailers = on", "RandomTrailers = maybe"))
+rejected(text(awg15).replace("PersistentKeepalive = 25", "PersistentKeepalive = 30-20"))
 rejected(text(awg15).replace("Jc = 4", "Jc = " + "9" * 10000))
 rejected(text(awg15).replace("H1 = 1", "H1 = " + "9" * 10000))
 rejected(text(awg15).replace("<r 16>", "<r " + "9" * 10000 + ">"))
@@ -1069,6 +1111,12 @@ assert m == 2 and strat == "leastPing" and tag == "B", (m, strat, tag)
 clean = mkjson.sanitize_provider(prof)
 assert "access" not in clean["log"]      # platform path stripped
 assert prof["log"]["access"] == "/Users/x/log"  # source profile stays immutable
+# A non-SOCKS primary cannot be meaningfully replaced with a WireGuard inbound.
+non_socks = json.loads(json.dumps(prof)); non_socks["inbounds"][0]["protocol"] = "dokodemo-door"
+try:
+    mkjson.validate_profile(non_socks); raise AssertionError("accepted non-SOCKS primary inbound")
+except SystemExit:
+    pass
 # SECURITY: a hostile profile's extra inbounds (open relay / dokodemo to LAN) and
 # control-plane blocks must be dropped, leaving the overlay as the sole inbound.
 evil = json.loads(json.dumps(prof))
@@ -1229,7 +1277,22 @@ PY
         && cp "$_sbdir/sing-box" "$CACHE/sing-box.new" \
         && mv -f "$CACHE/sing-box.new" "$CACHE/sing-box" \
         && chmod +x "$CACHE/sing-box" \
-        && "$CACHE/sing-box" version | grep -q "version $_v"
+        && "$CACHE/sing-box" version | grep -q "version $_v" || return 1
+    # The project-owned AWG core is published for Linux only, under the same
+    # pinned digest the gateway installer enforces.
+    [ "$_sos" = linux ] || return 0
+    _av="$(sed -n 's/^AWG_CORE_VERSION="\([^"]*\)"/\1/p' "$SRC/proxy-unifi")"
+    _awant="$(sed -n "/^awg_core_sha256() {/,/^}/s/^ *$_sa) echo \"\([0-9a-f]*\)\".*/\1/p" "$SRC/proxy-unifi")"
+    _aname="proxy-unifi-amnezia-box-${_av}-linux-${_sa}"
+    echo "  downloading AmneziaWG core $_av ($_sa) ..."
+    curl -fsSL --connect-timeout 15 --max-time 300 --retry 3 \
+        "https://github.com/palmbeachpete9/proxy-unifi/releases/download/awg-core-v${_av}/${_aname}.tar.gz" \
+        -o "$CACHE/awg.tgz" || return 1
+    [ -n "$_awant" ] && [ "$(sha256_of "$CACHE/awg.tgz")" = "$_awant" ] \
+        && tar xzf "$CACHE/awg.tgz" -C "$CACHE" \
+        && cp "$CACHE/$_aname/amnezia-box" "$CACHE/amnezia-box.new" \
+        && mv -f "$CACHE/amnezia-box.new" "$CACHE/amnezia-box" \
+        && "$CACHE/amnezia-box" version | grep -q "version proxy-unifi-awg-$_av"
 }
 
 engine_tests() {
@@ -1351,6 +1414,113 @@ finally:
             proc.kill(); proc.wait()
 PY
         then ok "amnezia-box AWG endpoint runtime"; else bad "amnezia-box AWG endpoint runtime"; fi
+
+        # Two real cores complete an AWG 3.1 handshake only with a matching
+        # HeaderProtectionKey; a wrong key must keep the tunnel down.
+        if python3 - "$AB" "$SRC" <<'PY'
+import base64, json, os, socket, subprocess, sys, tempfile, threading, time
+
+core, src = sys.argv[1], sys.argv[2]
+
+def keypair():
+    out = subprocess.check_output([core, "generate", "wg-keypair"], text=True)
+    return [line.split(": ", 1)[1] for line in out.splitlines()]
+
+def relay(sock):
+    # amnezia-box ignores listen_port, so both cores dial this hub and it
+    # forwards opaque datagrams between the two learned source addresses.
+    peers = []
+    try:
+        while True:
+            data, addr = sock.recvfrom(65535)
+            if addr not in peers:
+                peers.append(addr)
+            for other in peers:
+                if other != addr:
+                    sock.sendto(data, other)
+    except OSError:
+        pass
+
+spriv, spub = keypair()
+cpriv, cpub = keypair()
+key = base64.b64encode(os.urandom(32)).decode()
+
+def handshake(server_key):
+    work = tempfile.mkdtemp()
+    hub = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    hub.bind(("127.0.0.1", 0))
+    threading.Thread(target=relay, args=(hub,), daemon=True).start()
+    port = hub.getsockname()[1]
+    with open(work + "/client.conf", "w") as conf:
+        conf.write("""[Interface]
+PrivateKey = %s
+Address = 10.66.0.2/32
+Jc = 3
+Jmin = 40
+Jmax = 70
+S1 = 16
+S2 = 24
+S3 = 12
+S4 = 20
+H1 = 100-199
+H2 = 200-299
+H3 = 300-399
+H4 = 400-499
+I1 = <b 0x16030100><r 8>
+HeaderProtectionKey = %s
+ContentPaddingAddition = 0-32
+RekeyTimeout = 1
+RandomTrailers = on
+DisableCookies = on
+
+[Peer]
+PublicKey = %s
+AllowedIPs = 0.0.0.0/0
+Endpoint = 127.0.0.1:%d
+PersistentKeepalive = 1-5
+""" % (cpriv, key, spub, port))
+    client = json.loads(subprocess.check_output(
+        [sys.executable, src + "/mkawg.py", "build", "--file", work + "/client.conf",
+         "--socks-port", "1", "--loglevel", "debug"]))
+    # The server mirrors the client's obfuscation through the same generator.
+    server = json.loads(json.dumps(client))
+    server["endpoints"][0].update(
+        private_key=spriv, address=["10.66.0.1/32"], header_protection_key=server_key,
+        peers=[{"address": "127.0.0.1", "port": port, "public_key": cpub,
+                "allowed_ips": ["10.66.0.2/32"], "persistent_keepalive_interval": 1}])
+    for name, config in (("client", client), ("server", server)):
+        config.pop("inbounds")
+        config.pop("route")
+        with open("%s/%s.json" % (work, name), "w") as output:
+            json.dump(config, output)
+    procs = [subprocess.Popen([core, "run", "-c", "%s/%s.json" % (work, name)],
+                              stdout=subprocess.DEVNULL,
+                              stderr=open("%s/%s.log" % (work, name), "w"))
+             for name in ("server", "client")]
+    try:
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            if any(p.poll() is not None for p in procs):
+                return False
+            # Decrypted keepalives in both directions prove the handshake and
+            # header-protected transport packets interoperate.
+            logs = [open("%s/%s.log" % (work, name), errors="replace").read()
+                    for name in ("server", "client")]
+            if all("receiving keepalive packet" in log for log in logs):
+                return True
+            time.sleep(0.2)
+        return False
+    finally:
+        for p in procs:
+            p.terminate()
+            p.wait(5)
+        hub.close()
+
+assert handshake(key), "AWG 3.1 handshake failed"
+assert not handshake(base64.b64encode(os.urandom(32)).decode()), \
+    "AWG 3.1 handshake ignored HeaderProtectionKey"
+PY
+        then ok "amnezia-box AWG 3.1 handshake"; else bad "amnezia-box AWG 3.1 handshake"; fi
     else
         printf '  skip amnezia-box validation (set PROXY_UNIFI_AWG_CORE or cache tests/.cache/amnezia-box)\n'
     fi
@@ -1369,8 +1539,9 @@ EOF
     then ok "xray balancer pool (-confdir)"; else bad "xray balancer pool (-confdir)"; fi
     rm -rf "$_d"
 
-    if sh "$ROOT/tests/lifecycle.sh" "$XR" >/dev/null 2>&1; then ok "sandboxed CLI lifecycle + rollback"
-    else bad "sandboxed CLI lifecycle + rollback"; fi
+    if sh "$ROOT/tests/lifecycle.sh" "$XR" >"$_d.lifecycle" 2>&1; then ok "sandboxed CLI lifecycle + rollback"
+    else bad "sandboxed CLI lifecycle + rollback"; tail -n 20 "$_d.lifecycle"; fi
+    rm -f "$_d.lifecycle"
 }
 
 # -------------------------------------------------------------------------

@@ -31,18 +31,38 @@ def _limit(kind, value):
     resource.setrlimit(kind, (target, target))
 
 
-def _rss_bytes(pid):
-    """Current Linux resident set for the validator (all threads share it)."""
+def _group_rss_bytes(pgid):
+    """Total Linux resident set for members of the validator process group."""
     if not sys.platform.startswith("linux"):
         return 0
+    total = 0
     try:
-        with open("/proc/%d/status" % pid, "r", encoding="ascii") as status:
-            for line in status:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) * 1024
-    except (OSError, ValueError, IndexError):
+        entries = os.listdir("/proc")
+    except OSError:
         return 0
-    return 0
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % entry, "r", encoding="ascii") as stat_file:
+                fields = stat_file.read().rsplit(")", 1)[1].split()
+            if len(fields) < 3 or int(fields[2]) != pgid:
+                continue
+            with open("/proc/%s/status" % entry, "r", encoding="ascii") as status:
+                for line in status:
+                    if line.startswith("VmRSS:"):
+                        total += int(line.split()[1]) * 1024
+                        break
+        except (OSError, ValueError, IndexError):
+            continue
+    return total
+
+
+def _kill_group(pgid, signum):
+    try:
+        os.killpg(pgid, signum)
+    except OSError:
+        pass
 
 
 def main():
@@ -90,10 +110,7 @@ def main():
         return fail("could not start validator: %s" % exc)
 
     def forward(signum, _frame):
-        try:
-            os.killpg(proc.pid, signum)
-        except OSError:
-            pass
+        _kill_group(proc.pid, signum)
     signal.signal(signal.SIGTERM, forward)
     signal.signal(signal.SIGINT, forward)
     deadline = time.monotonic() + args.timeout
@@ -103,23 +120,19 @@ def main():
         if time.monotonic() >= deadline:
             reason = "validator exceeded %.1fs timeout" % args.timeout
             break
-        if _rss_bytes(proc.pid) > memory_limit:
+        if _group_rss_bytes(proc.pid) > memory_limit:
             reason = "validator exceeded %d MB resident-memory limit" % args.memory_mb
             break
         time.sleep(0.05)
     if not reason:
         return proc.returncode
+    _kill_group(proc.pid, signal.SIGTERM)
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
         proc.wait(timeout=2)
-    except OSError:
-        proc.wait()
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        proc.wait()
+        pass
+    _kill_group(proc.pid, signal.SIGKILL)
+    proc.wait()
     sys.stderr.write("safeexec: %s\n" % reason)
     return 124 if "timeout" in reason else 125
 

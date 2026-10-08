@@ -33,6 +33,40 @@ ACTIVE_PID=""
 LOCK_DIR="$ROOT/.lock"
 PROMOTION_MARKER="$WORKDIR/promotion-active"
 PROMOTION_BACKUP="$WORKDIR/bin-backup"
+SERVICE_STATE_BACKUP="$WORKDIR/service-state-backup"
+SERVICE_STATE_MARKER="$WORKDIR/service-state-active"
+
+snapshot_service_state() {
+    mkdir -p "$SERVICE_STATE_BACKUP"
+    for _unit in proxy-unifi.service proxy-unifi-refresh.service proxy-unifi-refresh.timer proxy-unifi-guard.service proxy-unifi-guard.timer; do
+        if [ -e "/etc/systemd/system/$_unit" ]; then
+            : > "$SERVICE_STATE_BACKUP/$_unit.present"
+            cp -p "/etc/systemd/system/$_unit" "$SERVICE_STATE_BACKUP/$_unit" || return 1
+        fi
+        if systemctl is-active --quiet "$_unit" 2>/dev/null; then : > "$SERVICE_STATE_BACKUP/$_unit.active"; fi
+        if systemctl is-enabled --quiet "$_unit" 2>/dev/null; then : > "$SERVICE_STATE_BACKUP/$_unit.enabled"; fi
+    done
+    : > "$SERVICE_STATE_BACKUP/snapshotted"
+    : > "$SERVICE_STATE_MARKER"
+}
+
+restore_service_state() {
+    [ -f "$SERVICE_STATE_MARKER" ] || return 0
+    [ -f "$SERVICE_STATE_BACKUP/snapshotted" ] || return 0
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+    for _unit in proxy-unifi.service proxy-unifi-refresh.service proxy-unifi-refresh.timer proxy-unifi-guard.service proxy-unifi-guard.timer; do
+        if [ ! -f "$SERVICE_STATE_BACKUP/$_unit.present" ]; then
+            systemctl disable --now "$_unit" >/dev/null 2>&1 || true
+            rm -f "/etc/systemd/system/$_unit"
+            continue
+        fi
+        cp -p "$SERVICE_STATE_BACKUP/$_unit" "/etc/systemd/system/$_unit" || return 1
+        if [ -f "$SERVICE_STATE_BACKUP/$_unit.enabled" ]; then systemctl enable "$_unit" >/dev/null 2>&1 || return 1
+        else systemctl disable "$_unit" >/dev/null 2>&1 || true; fi
+        if [ -f "$SERVICE_STATE_BACKUP/$_unit.active" ]; then systemctl start "$_unit" >/dev/null 2>&1 || return 1
+        else systemctl stop "$_unit" >/dev/null 2>&1 || true; fi
+    done
+}
 
 restore_promotion() {
     [ -f "$PROMOTION_MARKER" ] || return 0
@@ -64,6 +98,12 @@ cleanup() {
     if ! restore_promotion; then
         red "Automatic script rollback was incomplete; recovery backup kept at $WORKDIR"
         _keep_workdir=1
+    fi
+    if ! restore_service_state; then
+        red "Service-state rollback was incomplete; recovery backup kept at $WORKDIR"
+        _keep_workdir=1
+    else
+        rm -f "$SERVICE_STATE_MARKER"
     fi
     release_install_lock
     [ "$_keep_workdir" = 1 ] || rm -rf "$WORKDIR"
@@ -220,17 +260,8 @@ PY
 
 fetch_remote() {
     _base="$1"; _src="$2"; _dst="$3"; _mode="${4:-0755}"
-    if have curl; then
-        bounded_curl "$_base/src/$_src?cb=$CACHEBUST" "$_dst" 2097152 \
-            && chmod "$_mode" "$_dst"
-    elif have wget; then
-        ( ulimit -f 4096 2>/dev/null || exit 1
-          wget -q --timeout=30 --tries=3 -O "$_dst" "$_base/src/$_src?cb=$CACHEBUST" ) \
-            && [ "$(wc -c < "$_dst" | tr -d ' ')" -le 2097152 ] \
-            && chmod "$_mode" "$_dst"
-    else
-        return 1
-    fi
+    bounded_curl "$_base/src/$_src?cb=$CACHEBUST" "$_dst" 2097152 \
+        && chmod "$_mode" "$_dst"
 }
 
 fetch() {
@@ -246,7 +277,7 @@ fetch() {
     elif fetch_remote "$_raw" "$src" "$dst" "${3:-0755}"; then
         :
     else
-        echo "need curl/wget or a usable source archive" >&2; return 1
+        echo "need curl or a usable source archive" >&2; return 1
     fi
 }
 
@@ -340,6 +371,7 @@ _install_files_locked() {
     head -1 "$_stage/proxy-unifi" | grep -q '^#!/bin/sh' || { echo "fetched proxy-unifi looks wrong" >&2; return 1; }
     sh -n "$_stage/proxy-unifi" && sh -n "$_stage/on_boot.sh" || return 1
     "$PYTHON" -m py_compile "$_stage"/*.py || return 1
+    snapshot_service_state
     _backup="$PROMOTION_BACKUP"; mkdir -p "$_backup"
     for f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py \
              xray sing-box amnezia-box geoip.dat geosite.dat; do
@@ -391,7 +423,7 @@ run_step "Preparing boot persistence" ensure_unifi_common
 run_step "Installing files"           install_files
 run_step "Updating proxy cores"       "$BIN_DIR/proxy-unifi" update
 run_step "Installing service"         install_and_verify_service
-rm -f "$PROMOTION_MARKER" || { red "Could not commit installation transaction."; exit 1; }
+rm -f "$PROMOTION_MARKER" "$SERVICE_STATE_MARKER" || { red "Could not commit installation transaction."; exit 1; }
 printf '\n'
 grn "Installed."
 cat <<'EOF'

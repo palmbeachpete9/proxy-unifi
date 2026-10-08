@@ -52,6 +52,9 @@ SERVICE_GROUP="proxy-unifi"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 REFRESH_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}-refresh.service"
 REFRESH_TIMER_FILE="/etc/systemd/system/${SERVICE_NAME}-refresh.timer"
+GUARD_SERVICE_NAME="${SERVICE_NAME}-guard"
+GUARD_SERVICE_FILE="/etc/systemd/system/${GUARD_SERVICE_NAME}.service"
+GUARD_TIMER_FILE="/etc/systemd/system/${GUARD_SERVICE_NAME}.timer"
 ONBOOT_DST="/data/on_boot.d/15-proxy-unifi.sh"
 LOCK_DIR="$ROOT/.lock"
 TXN_ROOT="$ROOT/.transactions"
@@ -64,7 +67,7 @@ PLUGIN_SERVICE_FILE="/etc/systemd/system/${PLUGIN_SERVICE_NAME}.service"
 
 SINGBOX_RELEASES="https://github.com/SagerNet/sing-box/releases"
 AWG_CORE_RELEASES="https://github.com/palmbeachpete9/proxy-unifi/releases"
-AWG_CORE_VERSION="1.0.1"
+AWG_CORE_VERSION="1.1.0"
 AWG_CORE_TAG="awg-core-v${AWG_CORE_VERSION}"
 # Xray's latest stable release (v26.3.27) is in the vulnerable range for
 # GHSA-5wf9-h793-w73c. Prefer a newer stable release when one exists, but never
@@ -435,6 +438,7 @@ restore_runtime_state() {
     else
         systemctl stop "${SERVICE_NAME}-refresh.timer" >/dev/null 2>&1 || true
     fi
+    fw_reconcile || true
 }
 
 recover_transaction() {
@@ -705,9 +709,9 @@ xray_min_safe_sha256() {
 
 awg_core_sha256() {
     case "$1" in
-        amd64) echo "d78128ac5451912649b9a6c4206406639c9855e23b40bb4c5221e64ce054bf5b" ;;
-        arm64) echo "d652e9c87508d16b82304ac6e5b21dfefd564b863ad58a30214e3ced01768314" ;;
-        armv7) echo "a2ff5cad3fc6fe5d01b3dcd15c59ac6228550d24b2cc042c2373fee1a30e0870" ;;
+        amd64) echo "70f5a34514a25ab53ccc47011a8be11a2a497df08f1a0d90117708c92876202e" ;;
+        arm64) echo "68cd53823b7a6e386c161ce08e194a5b061a27ffc058b6dfbc480abf1eb63f52" ;;
+        armv7) echo "7a547f4ded5e4fe90bbdcabc9bfe20383140a7e397c54a02494715729a381aa7" ;;
         *) return 1 ;;
     esac
 }
@@ -928,7 +932,10 @@ PYEOF
 }
 
 ensure_awg() {
-    [ -x "$ABIN" ] || cmd_install_awg || true
+    # An older pinned core rejects newer profile fields (e.g. AWG 3.x), so a
+    # version mismatch is treated like a missing core.
+    "$ABIN" version 2>/dev/null | grep -q "version proxy-unifi-awg-${AWG_CORE_VERSION}\$" \
+        || cmd_install_awg || true
     [ -x "$ABIN" ] || fatal "the AmneziaWG core is required but could not be installed"
 }
 
@@ -1090,10 +1097,9 @@ _fw_lock_one() {
 }
 
 _fw_unlock_one() {
-    _ipt="$1"; _n=0
-    while [ "$_n" -lt 16 ] && "$_ipt" -C INPUT -j "$FW_CHAIN" 2>/dev/null; do
+    _ipt="$1"
+    while "$_ipt" -C INPUT -j "$FW_CHAIN" 2>/dev/null; do
         "$_ipt" -D INPUT -j "$FW_CHAIN" 2>/dev/null || break
-        _n=$((_n + 1))
     done
     "$_ipt" -F "$FW_CHAIN" 2>/dev/null || true
     "$_ipt" -X "$FW_CHAIN" 2>/dev/null || true
@@ -1231,10 +1237,13 @@ ProtectSystem=strict
 ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
 ProtectClock=true
 ProtectHostname=true
 RestrictSUIDSGID=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
 LockPersonality=true
 RestrictRealtime=true
 MemoryDenyWriteExecute=true
@@ -1296,6 +1305,21 @@ disable_refresh_timer() {
     systemctl disable --now "${SERVICE_NAME}-refresh.timer" >/dev/null 2>&1 || true
 }
 
+disable_guard_timer() {
+    systemctl disable --now "$GUARD_TIMER_FILE" >/dev/null 2>&1 || true
+    rm -f "$GUARD_SERVICE_FILE" "$GUARD_TIMER_FILE"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+fw_reconcile() {
+    if { [ "$(current_engine)" = "singbox" ] || [ "$(current_engine)" = "awg" ]; } \
+            && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        fw_lock
+    else
+        fw_unlock
+    fi
+}
+
 # Remove any leftover SIP003 plugin unit from older (external-plugin) installs.
 cleanup_legacy_plugin() {
     if [ -f "$PLUGIN_SERVICE_FILE" ]; then
@@ -1321,6 +1345,30 @@ install_service() {
     else
         write_refresh_timer || true
     fi
+    atomic_write "$GUARD_SERVICE_FILE" 644 <<EOF || fatal "could not write firewall guard service"
+[Unit]
+Description=proxy-unifi firewall guard reconciliation
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$BIN_DIR/proxy-unifi _fw-reconcile
+EOF
+    atomic_write "$GUARD_TIMER_FILE" 644 <<EOF || fatal "could not write firewall guard timer"
+[Unit]
+Description=proxy-unifi firewall guard timer
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+Unit=$GUARD_SERVICE_NAME.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || fatal "could not reload systemd"
+    systemctl enable "$GUARD_TIMER_FILE" >/dev/null 2>&1 || fatal "could not enable firewall guard timer"
+    systemctl start "$GUARD_TIMER_FILE" >/dev/null 2>&1 || fatal "could not start firewall guard timer"
 }
 
 boot_recover() {
@@ -1329,6 +1377,7 @@ boot_recover() {
         && [ "$(cat "$AUTOSTART_FILE" 2>/dev/null || echo enabled)" != "disabled" ]; then
         restart_service || fatal "service failed its boot recovery health check"
     fi
+    fw_reconcile || fatal "could not reconcile firewall guard"
 }
 
 # Build + validate from a mode-600 candidate link file. No proxy credential or
@@ -2826,6 +2875,7 @@ cmd_uninstall() {
         && fatal "service is still running; refusing to remove its unit"
     systemctl disable --now "$PLUGIN_SERVICE_NAME" 2>/dev/null || true
     fw_unlock                       # drop the userspace-core firewall guard, if any
+    disable_guard_timer
     rm -f "$SERVICE_FILE" "$PLUGIN_SERVICE_FILE" "$REFRESH_SERVICE_FILE" "$REFRESH_TIMER_FILE" "$ONBOOT_DST"
     remove_proxy_link
     systemctl daemon-reload 2>/dev/null || true
@@ -2887,6 +2937,7 @@ case "$cmd" in
     install-binary)  cmd_install_binary ;;
     install-service) install_service ;;
     boot-recover)    boot_recover ;;
+    _fw-reconcile)   fw_reconcile ;;
     sub-refresh-auto) _AUTO_REFRESH=1 sub_refresh ;;
     _fw-lock)        fw_lock ;;
     _fw-unlock)      fw_unlock ;;
