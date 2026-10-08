@@ -513,7 +513,7 @@ on_exit() {
         UPDATE_BACKUP=""
     fi
     if [ -n "$GEO_BACKUP" ]; then
-        _restore_geo_backup "$GEO_BACKUP" || err "geo update rollback was incomplete"
+        _restore_update_backup "$GEO_BACKUP" geoip.dat geosite.dat || err "geo update rollback was incomplete"
         if [ "$GEO_WAS_ACTIVE" = 1 ]; then systemctl restart "$SERVICE_NAME" 2>/dev/null || true
         else systemctl stop "$SERVICE_NAME" 2>/dev/null || true; fi
         GEO_BACKUP=""
@@ -731,35 +731,23 @@ raise SystemExit(0 if version(sys.argv[1]) >= version(sys.argv[2]) else 1)
 PYEOF
 }
 
-# Download <url> to <dest> using whichever of curl/wget exists. Returns nonzero on
-# failure (and removes a partial file). One place, so tag-resolution and the
-# tarball download use the same available tool.
+# Download <url> to <dest> with a size cap. Returns nonzero on failure (and
+# removes a partial file). curl is an installer prerequisite.
 download_to() {
     _d_url="$1"; _d_dst="$2"; _d_max="${3:-419430400}"
-    if have curl; then
-        ( ulimit -f $(((_d_max + 511) / 512)) 2>/dev/null || exit 1
-          curl -fsSL --connect-timeout 30 --max-time 600 --retry 6 --retry-delay 3 \
-              --max-filesize "$_d_max" "$_d_url" -o "$_d_dst" ) \
-            || { rm -f "$_d_dst"; return 1; }
-    elif have wget; then
-        ( ulimit -f $(((_d_max + 511) / 512)) 2>/dev/null || exit 1
-          wget -q --timeout=45 --tries=6 -O "$_d_dst" "$_d_url" ) \
-            || { rm -f "$_d_dst"; return 1; }
-    else
-        return 1
-    fi
+    ( ulimit -f $(((_d_max + 511) / 512)) 2>/dev/null || exit 1
+      curl -fsSL --connect-timeout 30 --max-time 600 --retry 6 --retry-delay 3 \
+          --max-filesize "$_d_max" "$_d_url" -o "$_d_dst" ) \
+        || { rm -f "$_d_dst"; return 1; }
     _d_size="$(wc -c < "$_d_dst" | tr -d ' ')"
     case "$_d_size" in ""|*[!0-9]*) rm -f "$_d_dst"; return 1 ;; esac
     [ "$_d_size" -le "$_d_max" ] || { rm -f "$_d_dst"; return 1; }
 }
 
-# Resolve the latest tag from a .../releases/latest redirect with the available tool.
+# Resolve the latest tag from a .../releases/latest redirect.
 resolve_latest_tag() {
-    if have curl; then
-        curl -fsSLI --connect-timeout 30 --max-time 120 --retry 5 --retry-delay 3 "$1/latest" 2>/dev/null
-    elif have wget; then
-        wget -qS --timeout=45 --tries=5 --max-redirect=0 "$1/latest" -O /dev/null 2>&1
-    fi | awk -F'/tag/' '
+    curl -fsSLI --connect-timeout 30 --max-time 120 --retry 5 --retry-delay 3 "$1/latest" 2>/dev/null \
+        | awk -F'/tag/' '
         tolower($0) ~ /location:/ {
             value=$2; sub(/[[:space:]\r].*$/, "", value); tag=value
         }
@@ -810,9 +798,26 @@ raise SystemExit(1)
 PYEOF
 }
 
+# Extract <archive.tgz> into <dir>, refusing links, devices, path escapes and
+# oversized content.
+safe_untar() {
+    py - "$1" "$2" <<'PYEOF'
+import os,sys,tarfile
+src,dest=sys.argv[1],os.path.realpath(sys.argv[2]); total=0; limit=250*1024*1024
+with tarfile.open(src,"r:gz") as archive:
+    members=archive.getmembers()
+    for member in members:
+        target=os.path.realpath(os.path.join(dest,member.name))
+        if target!=dest and not target.startswith(dest+os.sep): raise SystemExit("unsafe archive path")
+        if member.issym() or member.islnk() or member.isdev() or member.isfifo(): raise SystemExit("unsafe archive member")
+        total += max(0,member.size)
+        if total>limit: raise SystemExit("archive is too large")
+    archive.extractall(dest,members=members)
+PYEOF
+}
+
 cmd_install_singbox() {
     mkdir -p "$BIN_DIR"
-    { have curl || have wget; } || { err "need curl or wget to download sing-box"; return 1; }
     _sa="$(sb_arch)"
     _tag="$(resolve_latest_tag "$SINGBOX_RELEASES")"
     [ -n "$_tag" ] || { err "could not resolve sing-box latest version"; return 1; }
@@ -827,19 +832,7 @@ cmd_install_singbox() {
         || { rm -rf "$_tmp"; err "could not obtain sing-box's GitHub asset digest"; return 1; }
     verify_sha256 "$_tmp/sb.tgz" "$_want" \
         || { rm -rf "$_tmp"; err "sing-box checksum verification failed"; return 1; }
-    py - "$_tmp/sb.tgz" "$_tmp" <<'PYEOF' || { rm -rf "$_tmp"; err "could not safely extract sing-box"; return 1; }
-import os,sys,tarfile
-src,dest=sys.argv[1],os.path.realpath(sys.argv[2]); total=0; limit=250*1024*1024
-with tarfile.open(src,"r:gz") as archive:
-    members=archive.getmembers()
-    for member in members:
-        target=os.path.realpath(os.path.join(dest,member.name))
-        if target!=dest and not target.startswith(dest+os.sep): raise SystemExit("unsafe archive path")
-        if member.issym() or member.islnk() or member.isdev() or member.isfifo(): raise SystemExit("unsafe archive member")
-        total += max(0,member.size)
-        if total>limit: raise SystemExit("archive is too large")
-    archive.extractall(dest,members=members)
-PYEOF
+    safe_untar "$_tmp/sb.tgz" "$_tmp" || { rm -rf "$_tmp"; err "could not safely extract sing-box"; return 1; }
     _b="$(find "$_tmp" -name sing-box -type f -print -quit)"
     [ -n "$_b" ] || { rm -rf "$_tmp"; err "sing-box binary not found in archive"; return 1; }
     chmod 0755 "$_b"
@@ -875,7 +868,6 @@ ensure_singbox() {
 
 cmd_install_awg() {
     mkdir -p "$BIN_DIR"
-    { have curl || have wget; } || { err "need curl or wget to download the AmneziaWG core"; return 1; }
     _aa="$(sb_arch)"
     _asset="proxy-unifi-amnezia-box-${AWG_CORE_VERSION}-linux-${_aa}.tar.gz"
     _url="$AWG_CORE_RELEASES/download/${AWG_CORE_TAG}/${_asset}"
@@ -888,20 +880,8 @@ cmd_install_awg() {
         || { rm -rf "$_tmp"; err "no pinned AmneziaWG core digest for $_aa"; return 1; }
     verify_sha256 "$_tmp/core.tgz" "$_want" \
         || { rm -rf "$_tmp"; err "AmneziaWG core checksum verification failed"; return 1; }
-    py - "$_tmp/core.tgz" "$_tmp" <<'PYEOF' \
+    safe_untar "$_tmp/core.tgz" "$_tmp" \
         || { rm -rf "$_tmp"; err "could not safely extract the AmneziaWG core"; return 1; }
-import os,sys,tarfile
-src,dest=sys.argv[1],os.path.realpath(sys.argv[2]); total=0; limit=250*1024*1024
-with tarfile.open(src,"r:gz") as archive:
-    members=archive.getmembers()
-    for member in members:
-        target=os.path.realpath(os.path.join(dest,member.name))
-        if target!=dest and not target.startswith(dest+os.sep): raise SystemExit("unsafe archive path")
-        if member.issym() or member.islnk() or member.isdev() or member.isfifo(): raise SystemExit("unsafe archive member")
-        total += max(0,member.size)
-        if total>limit: raise SystemExit("archive is too large")
-    archive.extractall(dest,members=members)
-PYEOF
     _b="$(find "$_tmp" -name amnezia-box -type f -print -quit)"
     [ -n "$_b" ] || { rm -rf "$_tmp"; err "AmneziaWG core binary not found in archive"; return 1; }
     chmod 0755 "$_b"
@@ -1884,10 +1864,12 @@ cmd_update() {
     else c_grn "Updated. Service remains stopped."; fi
 }
 
+# _restore_update_backup <backup-dir> [names...] (default: every core and asset)
 _restore_update_backup() {
-    _backup="$1"
+    _backup="$1"; shift
+    [ "$#" -gt 0 ] || set -- xray sing-box amnezia-box geoip.dat geosite.dat
     _restore_rc=0
-    for _name in xray sing-box amnezia-box geoip.dat geosite.dat; do
+    for _name in "$@"; do
         if [ -f "$_backup/$_name.absent" ]; then rm -f "$BIN_DIR/$_name" || _restore_rc=1
         elif [ -f "$_backup/$_name" ]; then
             install -m "$( [ -x "$_backup/$_name" ] && echo 0755 || echo 0644 )" \
@@ -1915,15 +1897,15 @@ cmd_geo_update() {
         GEO_BACKUP="$_backup"
         info "downloading $f ..."
         download_to "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${_tag}/$f" "$BIN_DIR/$f.new" 209715200 \
-            || { rm -f "$BIN_DIR/$f.new"; _restore_geo_backup "$_backup" || fatal "download failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "failed to fetch $f"; }
+            || { rm -f "$BIN_DIR/$f.new"; _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "download failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "failed to fetch $f"; }
         _want="$(github_asset_digest Loyalsoldier/v2ray-rules-dat "$_tag" "$f" 2>/dev/null)" \
-            || { rm -f "$BIN_DIR/$f.new"; _restore_geo_backup "$_backup" || fatal "digest lookup failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "could not obtain digest for $f"; }
+            || { rm -f "$BIN_DIR/$f.new"; _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "digest lookup failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "could not obtain digest for $f"; }
         verify_sha256 "$BIN_DIR/$f.new" "$_want" \
-            || { rm -f "$BIN_DIR/$f.new"; _restore_geo_backup "$_backup" || fatal "checksum failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "checksum failed for $f"; }
+            || { rm -f "$BIN_DIR/$f.new"; _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "checksum failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "checksum failed for $f"; }
         mv -f "$BIN_DIR/$f.new" "$BIN_DIR/$f"
     done
     if [ "$_geo_was_active" = 1 ] && ! restart_service; then
-        _restore_geo_backup "$_backup" || fatal "geo runtime check failed and rollback was incomplete"
+        _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "geo runtime check failed and rollback was incomplete"
         GEO_BACKUP=""
         systemctl restart "$SERVICE_NAME" 2>/dev/null || true
         fatal "geo update failed runtime health checks; rolled back"
@@ -1933,16 +1915,6 @@ cmd_geo_update() {
     else c_grn "Geo files updated. Service remains stopped."; fi
 }
 
-_restore_geo_backup() {
-    _backup="$1"
-    _restore_rc=0
-    for _name in geoip.dat geosite.dat; do
-        if [ -f "$_backup/$_name.absent" ]; then rm -f "$BIN_DIR/$_name" || _restore_rc=1
-        elif [ -f "$_backup/$_name" ]; then install -m 0644 "$_backup/$_name" "$BIN_DIR/$_name" || _restore_rc=1
-        fi
-    done
-    return "$_restore_rc"
-}
 
 # Print 'host<TAB>port' for the current link using the engine-appropriate generator.
 _server_hp() {

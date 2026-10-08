@@ -190,7 +190,8 @@ plus the AWG 3.0 fields `HeaderProtectionKey`, `ContentPaddingAddition`,
 `MaxHandshakeAttempts`, and the AWG 3.1 flags `RandomTrailers` and `DisableCookies`.
 AWG 3.x settings must match the server. A server with `HeaderProtectionKey` accepts
 only AWG 3.x clients, and header protection requires `S1-S4` to be at least 12.
-A `PersistentKeepalive` range such as `20-30` uses its lower bound.
+A `PersistentKeepalive` range such as `20-30` uses its lower bound, and the
+kernel-module peer switch `AdvancedSecurity = on` is accepted.
 Multiple peers, IPv4/IPv6 addresses, preshared keys, and keepalives are supported.
 Unsafe `wg-quick` hooks and routing commands are rejected. A profile's client-side
 `ListenPort` is retained in its saved source but omitted from the outbound runtime
