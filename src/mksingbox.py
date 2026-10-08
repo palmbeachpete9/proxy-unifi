@@ -47,7 +47,7 @@ def _tls(sni, q, default_alpn=None):
         tls["alpn"] = default_alpn
     if _bool_value(qg(q, "insecure", "allowInsecure", "allow_insecure"),
                    "TLS insecure option"):
-        tls["insecure"] = True
+        die("TLS insecure verification is not supported")
     fp = qg(q, "fp", "fingerprint")
     if fp:
         tls["utls"] = {"enabled": True, "fingerprint": fp}

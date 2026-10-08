@@ -147,6 +147,8 @@ def valid_host(host):
     # literal; urlsplit().hostname removes them for normal URI forms.
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
+    if not host:
+        die("link is missing a server host")
     if len(host) > 255:
         die("server host is too long")
     if host[0] == "-":
@@ -181,18 +183,56 @@ def valid_host(host):
     return ascii_host
 
 
+def _legacy_ipv4(host):
+    """Return an IPv4Address for a historical numeric spelling, else None."""
+    value = host.rstrip(".")
+    if not value or ":" in value:
+        return None
+    parts = value.split(".")
+    if len(parts) > 4 or any(part == "" for part in parts):
+        return None
+    try:
+        def parse_part(part):
+            if part.lower().startswith("0x"):
+                return int(part[2:], 16)
+            if len(part) > 1 and part.startswith("0"):
+                return int(part, 8)
+            return int(part, 10)
+        numbers = [parse_part(part) for part in parts]
+    except ValueError:
+        return None
+    if any(number < 0 for number in numbers):
+        return None
+    try:
+        if len(numbers) == 1:
+            number = numbers[0]
+        else:
+            widths = (8, 8, 8, 8)
+            if any(number >= 1 << width for number, width in zip(numbers[:-1], widths)):
+                return None
+            remaining = 32 - 8 * (len(numbers) - 1)
+            if numbers[-1] >= 1 << remaining:
+                return None
+            number = 0
+            for item in numbers[:-1]:
+                number = (number << 8) | item
+            number = (number << remaining) | numbers[-1]
+        return ipaddress.IPv4Address(number)
+    except ipaddress.AddressValueError:
+        return None
+
+
 def is_non_public_host(host):
     low = host.rstrip(".").lower()
     if low == "localhost" or low in ("metadata.google.internal", "metadata.aws.internal") \
             or low.endswith((".localhost", ".local", ".internal", ".lan", ".home.arpa")):
         return True
     candidate = host.split("%", 1)[0]
-    if ":" not in candidate and any(ch not in "0123456789." for ch in candidate):
-        return False
     try:
-        return not ipaddress.ip_address(candidate).is_global
+        address = ipaddress.ip_address(candidate)
     except ValueError:
-        return False
+        address = _legacy_ipv4(candidate)
+    return address is not None and not address.is_global
 
 
 def validate_xhttp_download_settings(value):

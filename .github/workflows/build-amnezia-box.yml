@@ -11,15 +11,16 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CORE_VERSION: 1.0.1
-  AMNEZIA_BOX_COMMIT: dbfa7d83c105d16a6b38846268a36532df04ff91
-  AMNEZIAWG_GO_VERSION: v0.2.19
-  EDWARDS25519_VERSION: v1.1.1
-  GO_CHI_VERSION: v5.2.5
-  X_CRYPTO_VERSION: v0.52.0
-  X_NET_VERSION: v0.55.0
-  X_SYS_VERSION: v0.45.0
-  GOVULNCHECK_VERSION: v1.6.0
+  CORE_VERSION: 1.1.0
+  AMNEZIA_BOX_COMMIT: 16724484cfa00d9b2c14d8280dc055564e2e12ba
+  AMNEZIAWG_GO_VERSION: v3.1.20260828
+  EDWARDS25519_VERSION: v1.2.0
+  GO_CHI_VERSION: v5.3.2
+  X_CRYPTO_VERSION: v0.57.0
+  X_NET_VERSION: v0.59.0
+  X_SYS_VERSION: v0.48.0
+  GOVULNCHECK_VERSION: v1.8.0
+  GO_VERSION: 1.26.8
 
 jobs:
   release:
@@ -31,7 +32,7 @@ jobs:
     steps:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: 1.25.12
+          go-version: ${{ env.GO_VERSION }}
           cache: false
       - name: Check out pinned Amnezia source
         run: |
@@ -47,12 +48,12 @@ jobs:
           set -eu
           go get \
             "filippo.io/edwards25519@${EDWARDS25519_VERSION}" \
-            "github.com/amnezia-vpn/amneziawg-go@${AMNEZIAWG_GO_VERSION}" \
+            "github.com/amnezia-vpn/amneziawg-go/v3@${AMNEZIAWG_GO_VERSION}" \
             "github.com/go-chi/chi/v5@${GO_CHI_VERSION}" \
             "golang.org/x/crypto@${X_CRYPTO_VERSION}" \
             "golang.org/x/net@${X_NET_VERSION}" \
             "golang.org/x/sys@${X_SYS_VERSION}"
-          test "$(go list -m -f '{{.Version}}' github.com/amnezia-vpn/amneziawg-go)" = "$AMNEZIAWG_GO_VERSION"
+          test "$(go list -m -f '{{.Version}}' github.com/amnezia-vpn/amneziawg-go/v3)" = "$AMNEZIAWG_GO_VERSION"
           test "$(go list -m -f '{{.Version}}' filippo.io/edwards25519)" = "$EDWARDS25519_VERSION"
           test "$(go list -m -f '{{.Version}}' github.com/go-chi/chi/v5)" = "$GO_CHI_VERSION"
           test "$(go list -m -f '{{.Version}}' golang.org/x/crypto)" = "$X_CRYPTO_VERSION"
@@ -96,7 +97,7 @@ jobs:
             {
               echo "amnezia-box commit: $AMNEZIA_BOX_COMMIT"
               echo "amneziawg-go version: $AMNEZIAWG_GO_VERSION"
-              echo "Go version: 1.25.12"
+              echo "Go version: $GO_VERSION"
               echo "golang.org/x/crypto version: $X_CRYPTO_VERSION"
               echo "golang.org/x/net version: $X_NET_VERSION"
               echo "build tags: with_gvisor,with_wireguard,with_awg"
@@ -128,4 +129,4 @@ jobs:
           fi
           gh release create "$tag" dist/* --target "$GITHUB_SHA" \
             --title "AmneziaWG Core ${CORE_VERSION}" \
-            --notes "Pinned userspace AWG 1.5/2.0 core for proxy-unifi. Corresponding source and checksums are published."
+            --notes "Pinned userspace AWG 1.5/2.0/3.0/3.1 core for proxy-unifi. Corresponding source and checksums are published."
