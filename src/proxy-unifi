@@ -67,7 +67,7 @@ PLUGIN_SERVICE_FILE="/etc/systemd/system/${PLUGIN_SERVICE_NAME}.service"
 
 SINGBOX_RELEASES="https://github.com/SagerNet/sing-box/releases"
 AWG_CORE_RELEASES="https://github.com/palmbeachpete9/proxy-unifi/releases"
-AWG_CORE_VERSION="1.0.1"
+AWG_CORE_VERSION="1.1.0"
 AWG_CORE_TAG="awg-core-v${AWG_CORE_VERSION}"
 # Xray's latest stable release (v26.3.27) is in the vulnerable range for
 # GHSA-5wf9-h793-w73c. Prefer a newer stable release when one exists, but never
@@ -709,9 +709,9 @@ xray_min_safe_sha256() {
 
 awg_core_sha256() {
     case "$1" in
-        amd64) echo "d78128ac5451912649b9a6c4206406639c9855e23b40bb4c5221e64ce054bf5b" ;;
-        arm64) echo "d652e9c87508d16b82304ac6e5b21dfefd564b863ad58a30214e3ced01768314" ;;
-        armv7) echo "a2ff5cad3fc6fe5d01b3dcd15c59ac6228550d24b2cc042c2373fee1a30e0870" ;;
+        amd64) echo "70f5a34514a25ab53ccc47011a8be11a2a497df08f1a0d90117708c92876202e" ;;
+        arm64) echo "68cd53823b7a6e386c161ce08e194a5b061a27ffc058b6dfbc480abf1eb63f52" ;;
+        armv7) echo "7a547f4ded5e4fe90bbdcabc9bfe20383140a7e397c54a02494715729a381aa7" ;;
         *) return 1 ;;
     esac
 }
