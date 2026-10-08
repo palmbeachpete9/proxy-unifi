@@ -932,7 +932,10 @@ PYEOF
 }
 
 ensure_awg() {
-    [ -x "$ABIN" ] || cmd_install_awg || true
+    # An older pinned core rejects newer profile fields (e.g. AWG 3.x), so a
+    # version mismatch is treated like a missing core.
+    "$ABIN" version 2>/dev/null | grep -q "version proxy-unifi-awg-${AWG_CORE_VERSION}\$" \
+        || cmd_install_awg || true
     [ -x "$ABIN" ] || fatal "the AmneziaWG core is required but could not be installed"
 }
 
@@ -1234,10 +1237,13 @@ ProtectSystem=strict
 ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
 ProtectClock=true
 ProtectHostname=true
 RestrictSUIDSGID=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
 LockPersonality=true
 RestrictRealtime=true
 MemoryDenyWriteExecute=true
