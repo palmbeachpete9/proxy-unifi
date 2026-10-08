@@ -43,8 +43,8 @@ snapshot_service_state() {
             : > "$SERVICE_STATE_BACKUP/$_unit.present"
             cp -p "/etc/systemd/system/$_unit" "$SERVICE_STATE_BACKUP/$_unit" || return 1
         fi
-        systemctl is-active --quiet "$_unit" 2>/dev/null && : > "$SERVICE_STATE_BACKUP/$_unit.active" || true
-        systemctl is-enabled --quiet "$_unit" 2>/dev/null && : > "$SERVICE_STATE_BACKUP/$_unit.enabled" || true
+        if systemctl is-active --quiet "$_unit" 2>/dev/null; then : > "$SERVICE_STATE_BACKUP/$_unit.active"; fi
+        if systemctl is-enabled --quiet "$_unit" 2>/dev/null; then : > "$SERVICE_STATE_BACKUP/$_unit.enabled"; fi
     done
     : > "$SERVICE_STATE_BACKUP/snapshotted"
     : > "$SERVICE_STATE_MARKER"

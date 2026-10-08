@@ -1539,8 +1539,9 @@ EOF
     then ok "xray balancer pool (-confdir)"; else bad "xray balancer pool (-confdir)"; fi
     rm -rf "$_d"
 
-    if sh "$ROOT/tests/lifecycle.sh" "$XR" >/dev/null 2>&1; then ok "sandboxed CLI lifecycle + rollback"
-    else bad "sandboxed CLI lifecycle + rollback"; fi
+    if sh "$ROOT/tests/lifecycle.sh" "$XR" >"$_d.lifecycle" 2>&1; then ok "sandboxed CLI lifecycle + rollback"
+    else bad "sandboxed CLI lifecycle + rollback"; tail -n 20 "$_d.lifecycle"; fi
+    rm -f "$_d.lifecycle"
 }
 
 # -------------------------------------------------------------------------
