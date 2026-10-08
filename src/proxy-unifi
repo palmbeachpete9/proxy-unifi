@@ -1286,7 +1286,7 @@ disable_refresh_timer() {
 }
 
 disable_guard_timer() {
-    systemctl disable --now "$GUARD_TIMER_FILE" >/dev/null 2>&1 || true
+    systemctl disable --now "$GUARD_SERVICE_NAME.timer" >/dev/null 2>&1 || true
     rm -f "$GUARD_SERVICE_FILE" "$GUARD_TIMER_FILE"
     systemctl daemon-reload >/dev/null 2>&1 || true
 }
@@ -1347,8 +1347,9 @@ Unit=$GUARD_SERVICE_NAME.service
 WantedBy=timers.target
 EOF
     systemctl daemon-reload >/dev/null 2>&1 || fatal "could not reload systemd"
-    systemctl enable "$GUARD_TIMER_FILE" >/dev/null 2>&1 || fatal "could not enable firewall guard timer"
-    systemctl start "$GUARD_TIMER_FILE" >/dev/null 2>&1 || fatal "could not start firewall guard timer"
+    # systemctl takes unit names here; a file path is not a startable unit.
+    systemctl enable --now "$GUARD_SERVICE_NAME.timer" >/dev/null 2>&1 \
+        || fatal "could not start firewall guard timer"
 }
 
 boot_recover() {
