@@ -54,6 +54,8 @@ D="${MOCK_STATE:?}"
 cmd="$1"; shift || true
 unit=""
 for arg in "$@"; do case "$arg" in --*) : ;; *) unit="$arg" ;; esac; done
+# Real systemctl cannot start/stop a unit by its file path.
+case "$unit" in /*) echo "mock systemctl: '$unit' is a path, not a unit name" >&2; exit 1 ;; esac
 key="$(printf '%s' "$unit" | tr '/.' '__')"
 start_service() {
     if [ -s "$D/pid" ]; then kill "$(cat "$D/pid")" 2>/dev/null || true; fi
