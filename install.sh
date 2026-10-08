@@ -74,7 +74,10 @@ restore_promotion() {
     for _r in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py \
               xray sing-box amnezia-box geoip.dat geosite.dat; do
         if [ -f "$PROMOTION_BACKUP/$_r.absent" ]; then rm -f "$BIN_DIR/$_r" || _restore_rc=1
-        elif [ -f "$PROMOTION_BACKUP/$_r" ]; then cp -p "$PROMOTION_BACKUP/$_r" "$BIN_DIR/$_r" || _restore_rc=1
+        # Copy then rename: a running core cannot be overwritten in place (ETXTBSY).
+        elif [ -f "$PROMOTION_BACKUP/$_r" ]; then
+            { cp -p "$PROMOTION_BACKUP/$_r" "$BIN_DIR/$_r.restore" \
+                && mv -f "$BIN_DIR/$_r.restore" "$BIN_DIR/$_r"; } || _restore_rc=1
         else _restore_rc=1; fi
     done
     if [ -f "$PROMOTION_BACKUP/on_boot.sh.absent" ]; then rm -f "$ONBOOT_DST" || _restore_rc=1
