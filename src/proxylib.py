@@ -6,7 +6,8 @@ The two share-link generators parse the same family of proxy URIs into an engine
 outbound; only the generic plumbing (URL splitting, host/port validation,
 base64, query helpers, secret-file loading, Shadowsocks credentials, and error
 handling) is shared here instead of being copy-pasted into each.
-mkawg.py also reuses the strict host validator for AmneziaWG peer endpoints.
+mkawg.py also reuses the strict host validator for AmneziaWG peer endpoints,
+and both catalog UIs share the terminal display-width helpers.
 
 It is imported, never run directly. Each helper runs from the installed `bin/`
 directory, which Python places on sys.path[0], so the sibling proxylib.py is
@@ -20,6 +21,7 @@ import ipaddress
 import json
 import os
 import sys
+import unicodedata
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 _B64_ALPHABET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_=")
@@ -486,3 +488,44 @@ def dispatch_subcommand(parser):
         parser.print_help()
         sys.exit(2)
     args.fn(args)
+
+
+def display_width(ch):
+    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    o = ord(ch)
+    if 0x1F000 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF:
+        return 2
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def terminal_emoji_fallback(value):
+    """Avoid mojibake in terminals that cannot render 4-byte UTF-8 emoji.
+
+    UniFi/web SSH terminals commonly render BMP Unicode correctly (Cyrillic,
+    arrows, hourglass, star) but corrupt supplementary-plane symbols such as
+    regional-indicator flags and newer Wi-Fi emoji. Keep stored labels intact;
+    this is display-only and opt-in via PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1.
+    """
+    out = []
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        code = ord(ch)
+        if 0x1F1E6 <= code <= 0x1F1FF and i + 1 < len(value):
+            nxt = value[i + 1]
+            ncode = ord(nxt)
+            if 0x1F1E6 <= ncode <= 0x1F1FF:
+                country = chr(ord("A") + code - 0x1F1E6) \
+                    + chr(ord("A") + ncode - 0x1F1E6)
+                out.append("[%s] " % country)
+                i += 2
+                continue
+        if ch in ("\U0001f6dc", "\U0001f4f6"):
+            out.append("Wi-Fi ")
+        elif code > 0xFFFF:
+            out.append("")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)

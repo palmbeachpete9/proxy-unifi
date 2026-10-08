@@ -39,7 +39,7 @@ import re
 import sys
 from urllib.parse import urlsplit
 
-from proxylib import (valid_host, safe_port, xray_outbound_servers,
+from proxylib import (die, valid_host, safe_port, xray_outbound_servers,
                       is_non_public_host as _is_non_public,
                       validate_xhttp_download_settings, nested_too_deep,
                       dispatch_subcommand)
@@ -54,11 +54,6 @@ _FORBIDDEN_KEYS = {"certificateFile", "keyFile", "masterKeyLog",
                    "socketPath", "unixSocket", "unixSocketPath"}
 _PATHLIKE_KEY = re.compile(
     r"(?:File|FilePath|SocketPath|KeyLog)$|(?:^|_)(?:file|file_path|socket_path|key_log)$")
-
-
-def die(msg):
-    sys.stderr.write("mkjson: error: %s\n" % msg)
-    sys.exit(2)
 
 
 def _load(path):

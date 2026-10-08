@@ -22,7 +22,7 @@ import stat
 import sys
 import unicodedata
 
-from proxylib import valid_host
+from proxylib import display_width, terminal_emoji_fallback, valid_host
 
 
 MAX_CONFIG_BYTES = 256 * 1024
@@ -85,6 +85,7 @@ PEER_KEYS = {
     "endpoint": "endpoint",
     "persistentkeepalive": "persistent_keepalive",
     "persistentkeepaliveinterval": "persistent_keepalive",
+    "advancedsecurity": "advanced_security",
 }
 WG_QUICK_KEYS = {
     "table", "preup", "postup", "predown", "postdown", "saveconfig", "fwmark"
@@ -494,6 +495,10 @@ def load_profile(path):
             "port": port,
             "persistent_keepalive": keepalive[1] if keepalive else 0,
         }
+        # awg showconf emits this kernel-module per-peer switch. The userspace
+        # core always applies AWG obfuscation, so only "on" is meaningful.
+        if not _flag(raw.get("advanced_security", "on"), "Peer %d AdvancedSecurity" % index):
+            fail("Peer %d AdvancedSecurity = off (plain WireGuard peer) is not supported" % index)
         if peer["public_key"] in public_keys:
             fail("Peer %d duplicates an earlier PublicKey" % index)
         public_keys.add(peer["public_key"])
@@ -599,56 +604,22 @@ def _read_secret(path):
     return _read_regular(path, 4096).strip()
 
 
-def _terminal_fallback(value):
-    if os.environ.get("PROXY_UNIFI_TERMINAL_SAFE_EMOJI") != "1":
-        return value
-    result = []
-    index = 0
-    while index < len(value):
-        ch = value[index]
-        code = ord(ch)
-        if 0x1F1E6 <= code <= 0x1F1FF and index + 1 < len(value):
-            next_code = ord(value[index + 1])
-            if 0x1F1E6 <= next_code <= 0x1F1FF:
-                country = chr(ord("A") + code - 0x1F1E6) + \
-                    chr(ord("A") + next_code - 0x1F1E6)
-                result.append("[%s] " % country)
-                index += 2
-                continue
-        elif ch in ("\U0001F6DC", "\U0001F4F6"):
-            result.append("Wi-Fi ")
-        elif code > 0xFFFF:
-            result.append("")
-        else:
-            result.append(ch)
-        index += 1
-    return "".join(result)
-
-
-def _display_width(ch):
-    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
-        return 0
-    code = ord(ch)
-    if 0x1F000 <= code <= 0x1FAFF or 0x2600 <= code <= 0x27BF:
-        return 2
-    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
-
-
 def _display(value, maximum=80):
     value = unicodedata.normalize("NFC", value)
     value = "".join("" if _unsafe_text_char(ch) else ch
                     for ch in value)
     value = " ".join(value.split())
-    value = _terminal_fallback(value)
+    if os.environ.get("PROXY_UNIFI_TERMINAL_SAFE_EMOJI") == "1":
+        value = terminal_emoji_fallback(value)
     value = " ".join(value.split())
     output = []
     width = 0
     for ch in value:
-        char_width = _display_width(ch)
+        char_width = display_width(ch)
         if width + char_width > maximum:
             while output and width + 3 > maximum:
                 removed = output.pop()
-                width -= _display_width(removed)
+                width -= display_width(removed)
             return "".join(output).rstrip() + "..."
         output.append(ch)
         width += char_width
@@ -817,9 +788,7 @@ def main():
         return
 
     profile = load_profile(args.file)
-    if args.command == "validate":
-        print_info(profile)
-    elif args.command == "info":
+    if args.command in ("validate", "info"):
         print_info(profile)
     elif args.command == "server":
         peer = profile["peers"][0]

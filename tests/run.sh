@@ -46,6 +46,25 @@ static_tests() {
         done
         if [ "$_d" = 0 ]; then ok "dash -n"; else bad "dash -n"; fi
     else printf '  skip dash -n (not installed)\n'; fi
+    # The embedded unifi-common unit must stay loadable: an unbalanced quote in
+    # ExecStart makes systemd drop the line and refuse the whole unit.
+    _ud="$(mktemp -d)"
+    sed -n "/^    cat > \"\$_unit\" <<'EOF'/,/^EOF/p" "$ROOT/install.sh" | sed '1d;$d' > "$_ud/udm-boot.service"
+    sed "s|fi'\\\\'\$|fi'\\\\''|" "$_ud/udm-boot.service" > "$_ud/broken.service"
+    if python3 - "$_ud/udm-boot.service" <<'PY'
+import shlex, subprocess, sys
+line = [l for l in open(sys.argv[1]) if l.startswith("ExecStart=")][0][10:].rstrip("\n")
+argv = shlex.split(line)
+assert argv[:2] == ["bash", "-c"] and len(argv) == 3
+subprocess.check_call(["bash", "-n", "-c", argv[2]])
+PY
+    then ok "unifi-common boot unit parses"; else bad "unifi-common boot unit parses"; fi
+    if have systemd-analyze; then
+        if systemd-analyze verify "$_ud/udm-boot.service" >/dev/null 2>&1 \
+           && ! systemd-analyze verify "$_ud/broken.service" >/dev/null 2>&1
+        then ok "systemd verifies unifi-common boot unit"; else bad "systemd verifies unifi-common boot unit"; fi
+    fi
+    rm -rf "$_ud"
     if python3 -m py_compile "$SRC"/mkxray.py "$SRC"/mksingbox.py "$SRC"/mksub.py "$SRC"/mkawg.py "$SRC"/mkjson.py "$SRC"/proxylib.py "$SRC"/safeexec.py 2>/dev/null
     then ok "python compile"; else bad "python compile"; fi
     rm -rf "$SRC/__pycache__"
@@ -198,7 +217,7 @@ current_engine() { echo xray; }
 info() { :; }; err() { :; }; c_grn() { :; }
 core_version() { "$1" version | head -1; }
 SH
-    sed -n '/^cmd_install_awg() {/,/^}/p' "$SRC/proxy-unifi" >> "$_ad/install-awg.sh"
+    sed -n '/^safe_untar() {/,/^}/p; /^cmd_install_awg() {/,/^}/p' "$SRC/proxy-unifi" >> "$_ad/install-awg.sh"
     cat >> "$_ad/install-awg.sh" <<'SH'
 cmd_install_awg
 [ -x "$ABIN" ]
@@ -926,6 +945,9 @@ with tempfile.TemporaryDirectory() as directory:
     assert profile31["version"] == "3.1"
     awg31_json = mkawg._endpoint_json(profile31)
     assert awg31_json["random_trailers"] is True and "disable_cookies" not in awg31_json
+    pas = write(directory, text(awg31).replace("PersistentKeepalive = 25",
+                                               "AdvancedSecurity = on"), "as.conf")
+    assert mkawg.load_profile(pas)["version"] == "3.1"
 
     secret = write(directory, INNER, "inner.key")
     peer = write(directory, INNER_PEER, "peer.key")
@@ -983,7 +1005,7 @@ with tempfile.TemporaryDirectory() as directory:
         narrow = output.getvalue()
         assert "endpoint:" in narrow
         for line in narrow.splitlines():
-            assert sum(mkawg._display_width(ch) for ch in line) <= 60, line
+            assert sum(mkawg.display_width(ch) for ch in line) <= 60, line
     finally:
         if old_columns is None:
             os.environ.pop("COLUMNS", None)
@@ -1039,6 +1061,7 @@ rejected(text(awg30).replace("RekeyTimeout = 3-5", "RekeyTimeout = 5-3"))
 rejected(text(awg30).replace("KeepaliveTimeout = 10", "KeepaliveTimeout = 10\nKeepaliveTimeout = 11"))
 rejected(text(awg31).replace("RandomTrailers = on", "RandomTrailers = maybe"))
 rejected(text(awg15).replace("PersistentKeepalive = 25", "PersistentKeepalive = 30-20"))
+rejected(text(awg15).replace("PersistentKeepalive = 25", "AdvancedSecurity = off"))
 rejected(text(awg15).replace("Jc = 4", "Jc = " + "9" * 10000))
 rejected(text(awg15).replace("H1 = 1", "H1 = " + "9" * 10000))
 rejected(text(awg15).replace("<r 16>", "<r " + "9" * 10000 + ">"))
@@ -1064,11 +1087,11 @@ except mkawg.ProfileError:
     pass
 assert mkawg.validate_name("Семья 👨‍👩‍👧‍👦") == "Семья 👨‍👩‍👧‍👦"
 safe = mkawg._display("日本日本日本日本", 7)
-assert safe.endswith("...") and sum(mkawg._display_width(ch) for ch in safe) <= 7
-assert mkawg._display_width("\ufe0f") == 0 and mkawg._display_width("\u200d") == 0
+assert safe.endswith("...") and sum(mkawg.display_width(ch) for ch in safe) <= 7
+assert mkawg.display_width("\ufe0f") == 0 and mkawg.display_width("\u200d") == 0
 subsafe = mksub.clean("日本日本日本日本", 7)
-assert subsafe.endswith("…") and sum(mksub._display_width(ch) for ch in subsafe) <= 7
-assert mksub._display_width("\ufe0f") == 0 and mksub._display_width("\u200d") == 0
+assert subsafe.endswith("…") and sum(mksub.display_width(ch) for ch in subsafe) <= 7
+assert mksub.display_width("\ufe0f") == 0 and mksub.display_width("\u200d") == 0
 
 # CLI errors are concise and never duplicate proxylib's message or leak traceback.
 with tempfile.TemporaryDirectory() as directory:
