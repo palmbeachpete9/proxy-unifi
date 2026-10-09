@@ -1204,6 +1204,10 @@ $_fwpre
 ExecStart=$_exec
 $_fwpost
 Environment=XRAY_LOCATION_ASSET=$BIN_DIR
+# Per-packet tunnel work allocates heavily: halve GC frequency, with a soft heap
+# ceiling below MemoryMax so the runtime collects before the cgroup OOM-kills.
+Environment=GOGC=200
+Environment=GOMEMLIMIT=384MiB
 WorkingDirectory=$ROOT
 Restart=on-failure
 RestartSec=5
@@ -1233,7 +1237,10 @@ AmbientCapabilities=
 ReadOnlyPaths=$ROOT
 TasksMax=256
 MemoryMax=512M
-CPUQuota=200%
+# No hard CPUQuota: it capped the core at two CPUs (Go >= 1.25 also sizes
+# GOMAXPROCS from it) and throttled bursts. A lower weight still lets UniFi's
+# own services win whenever the CPUs are contended.
+CPUWeight=50
 TimeoutStopSec=15
 
 [Install]
