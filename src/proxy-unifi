@@ -1525,8 +1525,9 @@ _ingress_setup() {
     if ! _is_xa="$(_ingress_ipv4 "$XRAY_ADDR")" || ! _is_ua="$(_ingress_ipv4 "$UNIFI_ADDR")"; then
         _ingress_failed="tunnel addresses must be single IPv4 addresses"; return 1
     fi
-    [ -s "$WG_DIR/wg_private.key" ] && [ -s "$WG_DIR/unifi_public.key" ] \
-        || { _ingress_failed="WireGuard keys are missing"; return 1; }
+    if [ ! -s "$WG_DIR/wg_private.key" ] || [ ! -s "$WG_DIR/unifi_public.key" ]; then
+        _ingress_failed="WireGuard keys are missing"; return 1
+    fi
     # The kernel's socket binds every address: admit only loopback before it exists.
     fw_lock >/dev/null 2>&1 || { _ingress_failed="could not install the WireGuard port guard"; return 1; }
     _ingress_step ip netns add "$INGRESS_NS" || return 1

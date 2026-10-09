@@ -11,7 +11,7 @@
 # "INFO text" lines; exits 77 when this host cannot run it.
 set -eu
 
-[ $# -eq 1 ] && [ -x "$1" ] || { echo "usage: ingress-lab.sh /path/to/xray" >&2; exit 2; }
+if [ $# -ne 1 ] || [ ! -x "$1" ]; then echo "usage: ingress-lab.sh /path/to/xray" >&2; exit 2; fi
 [ "$(id -u)" = 0 ] || { echo "INFO needs root"; exit 77; }
 for _tool in ip iptables ss curl python3; do
     command -v "$_tool" >/dev/null 2>&1 || { echo "INFO needs $_tool"; exit 77; }
@@ -158,12 +158,12 @@ def publish(name, port):
     os.rename(os.path.join(out, name + ".tmp"), os.path.join(out, name))
 class Bulk(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        chunk = bytes(1 << 20)
+        chunk, count = (bytes(1024), 1) if self.path == "/small" else (bytes(1 << 20), 256)
         self.send_response(200)
-        self.send_header("Content-Length", str(len(chunk) * 256))
+        self.send_header("Content-Length", str(len(chunk) * count))
         self.end_headers()
         try:
-            for _ in range(256):
+            for _ in range(count):
                 self.wfile.write(chunk)
         except OSError:
             pass
@@ -248,7 +248,7 @@ ip -n "$CLIENT" link set lo up
 
 # 1. Kernel path up.
 cli _ingress-up > "$T/up.log" 2>&1 && _up=0 || _up=$?
-cat "$T/up.log" | sed 's/^/INFO   /'
+sed 's/^/INFO   /' "$T/up.log"
 check "ingress-up succeeds" [ "$_up" = 0 ]
 check "kernel path marked active" [ -f "$T/run/kernel-ingress" ]
 check "overlay replaces the WireGuard inbound by tag" python3 - "$T/run/ingress.json" "$HOST_IP" "$PORT" <<'PY'
@@ -358,10 +358,24 @@ if [ "$MODE" = wireguard ]; then
     ip netns exec "$CLIENT" wg set "$CDEV" peer "$_server" endpoint "127.0.0.1:$WG_PORT" allowed-ips 0.0.0.0/0
     start_core "$T/run/ingress.json"
     check "fallback core holds the WireGuard port" wait_listen -lun "127.0.0.1:$WG_PORT"
+    check "UDP through Xray's WireGuard" [ "$(client_udp "$ECHO")" = ok ]
+    _small="$(ip netns exec "$CLIENT" curl -s -o /dev/null --noproxy '*' --max-time 5 \
+        -w '%{size_download}' "http://$TARGET:$BULK/small" 2>/dev/null || true)"
+    check "small TCP response through Xray's WireGuard" [ "$_small" = 1024 ]
     _tcp="$(client_tcp)"
-    [ "${_tcp%% *}" -gt 0 ] 2>/dev/null || _tcp="$(client_tcp)"   # first try may race the handshake
-    check "TCP through Xray's WireGuard" [ "${_tcp%% *}" -gt 0 ] 2>/dev/null
-    info "userspace path: $(printf '%s\n' "$_tcp" | mbit) Mbit/s in this lab"
+    if [ "${_tcp%% *}" -gt 0 ] 2>/dev/null; then
+        pass "TCP through Xray's WireGuard"
+        info "userspace path: $(printf '%s\n' "$_tcp" | mbit) Mbit/s in this lab"
+    else
+        fail "TCP through Xray's WireGuard"
+        info "client transfer: $(ip netns exec "$CLIENT" wg show "$CDEV" transfer | tr '\t' ' ')"
+        ip -n "$CLIENT" -s link show "$CDEV" | sed 's/^/INFO client link: /'
+        ip netns exec "$CLIENT" curl -sv -o /dev/null --noproxy '*' --max-time 3 \
+            "http://$TARGET:$BULK/" 2>&1 | tail -8 | sed 's/^/INFO curl: /'
+        ip netns exec "$CLIENT" nstat -az 2>/dev/null \
+            | awk '$2 > 0 && /Tcp(InErrs|InCsumErrors|RetransSegs|OutRsts)|IpInHdrErrors|IpInDiscards|TcpExtTCP(OFODrop|RcvQDrop|ZeroWindowDrop)|TcpExtPAWS/' \
+            | sed 's/^/INFO client nstat: /'
+    fi
     stop_core
 fi
 cli _ingress-down >/dev/null 2>&1
