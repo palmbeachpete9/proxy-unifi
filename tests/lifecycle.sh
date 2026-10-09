@@ -423,4 +423,11 @@ printf '3\n6\n1\ny\n\n0\n' | menu_input >/dev/null
 [ ! -e "$T/root/.transactions/active" ] || exit 1
 [ ! -e "$T/root/.lock" ] || exit 1
 
+# The benchmark validates its arguments before starting any download or core.
+if run_cli bench 1 > "$T/bench.out" 2>&1; then exit 1; fi
+grep -q 'bench duration must be 5-60 seconds' "$T/bench.out"
+if run_cli bench 5 'ftp://example.com/x' > "$T/bench.out" 2>&1; then exit 1; fi
+grep -q 'bench URL must start with http:// or https://' "$T/bench.out"
+run_cli help | grep -q '^  proxy bench '
+
 echo lifecycle-ok

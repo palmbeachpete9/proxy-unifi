@@ -207,6 +207,7 @@ Run `proxy` for the interactive menu, or use the direct commands:
 | `proxy` | Main menu |
 | `proxy status` | Engine, configured server, and listener status |
 | `proxy ping [...]` | Test the link — `...` = `get`·`head`·`tcp`·`icmp` (default `get`) |
+| `proxy bench [s] [url]` | Throughput of the WAN alone, then of the active outbound alone (no WireGuard), with gateway and core CPU use; compare with a speed test through the VPN Client |
 | `proxy start` · `stop` · `restart` | Service controls |
 | `proxy logs [args]` | Service logs (passed to `journalctl`) |
 | `proxy help` | Show help |
