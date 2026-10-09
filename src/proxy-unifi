@@ -74,9 +74,8 @@ AWG_CORE_TAG="awg-core-v${AWG_CORE_VERSION}"
 # fall below the first patched release. Its archive hashes are pinned here so a
 # release asset cannot be silently replaced together with its online checksum.
 XRAY_MIN_SAFE_TAG="v26.7.11"
-# Go runtime tuning shared by the service unit and the bench probe core: halve
-# GC frequency, with a soft heap ceiling below the unit's MemoryMax=512M.
-CORE_GOGC="200"
+# Soft Go heap ceiling below the unit's MemoryMax=512M: near it the runtime
+# collects harder instead of being OOM-killed. Shared with the bench probe core.
 CORE_GOMEMLIMIT="384MiB"
 
 # defaults (overridable via settings.env)
@@ -284,6 +283,21 @@ py_bin() {
     elif have python; then echo python
     else return 1
     fi
+}
+
+cpu_count() {
+    _cc="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    if _uint "$_cc" && [ "$_cc" -ge 1 ]; then echo "$_cc"; else echo 1; fi
+}
+
+# Go threads for the core: every CPU but one, which stays free for the kernel's
+# WireGuard/NAT work and UniFi's services, and never fewer than two where the
+# gateway has them. Measured on the WireGuard-to-gRPC path, 3 of 4 matched 2 of
+# 4 when idle CPUs remained and beat it by 20% under CPU contention, while 4 of
+# 4 lost in both cases (the runtime schedules onto threads the kernel stalls).
+core_gomaxprocs() {
+    _cg="$(cpu_count)"
+    if [ "$_cg" -le 2 ]; then echo "$_cg"; else echo $((_cg - 1)); fi
 }
 
 RUN_DIR=""
@@ -1215,8 +1229,8 @@ $_fwpre
 ExecStart=$_exec
 $_fwpost
 Environment=XRAY_LOCATION_ASSET=$BIN_DIR
-# Per-packet tunnel work allocates heavily: see CORE_GOGC/CORE_GOMEMLIMIT.
-Environment=GOGC=$CORE_GOGC
+# See core_gomaxprocs and CORE_GOMEMLIMIT.
+Environment=GOMAXPROCS=$(core_gomaxprocs)
 Environment=GOMEMLIMIT=$CORE_GOMEMLIMIT
 WorkingDirectory=$ROOT
 Restart=on-failure
@@ -1247,10 +1261,10 @@ AmbientCapabilities=
 ReadOnlyPaths=$ROOT
 TasksMax=256
 MemoryMax=512M
-# No hard CPUQuota: it capped the core at two CPUs (Go >= 1.25 also sizes
-# GOMAXPROCS from it) and throttled bursts. A lower weight still lets UniFi's
-# own services win whenever the CPUs are contended.
-CPUWeight=50
+# The core's parallelism comes from GOMAXPROCS, not a CPU quota (a quota of
+# 200% made Go use two threads on any gateway). Its own cgroup at the default
+# weight keeps the scheduling share it had before and reports CPU usage.
+CPUAccounting=yes
 TimeoutStopSec=15
 
 [Install]
@@ -2256,8 +2270,7 @@ cmd_bench() {   # [seconds] [url]
     need_root
     have curl || fatal "curl is required for the benchmark"
     _require_outbound || return 1
-    _ncpu="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-    { _uint "$_ncpu" && [ "$_ncpu" -ge 1 ]; } || _ncpu=1
+    _ncpu="$(cpu_count)"
     # safeexec allows the probe core at most 300 CPU-seconds, which a core
     # busy on every CPU spends ncpu times faster than wall time.
     _max=$((300 / _ncpu - 10)); [ "$_max" -le 60 ] || _max=60; [ "$_max" -ge 5 ] || _max=5
@@ -2267,10 +2280,11 @@ cmd_bench() {   # [seconds] [url]
     case "$_url" in http://*|https://*) : ;; *) fatal "bench URL must start with http:// or https://" ;; esac
     case "$_url" in *[[:space:]]*|*[[:cntrl:]]*) fatal "bench URL must not contain spaces or control characters" ;; esac
     _quota="$(sed -n 's/^CPUQuota=//p' "$SERVICE_FILE" 2>/dev/null)"
+    _procs="$(sed -n 's/^Environment=GOMAXPROCS=//p' "$SERVICE_FILE" 2>/dev/null)"
 
     c_bold "proxy-unifi bench: ${_secs}s per test, ${BENCH_STREAMS} parallel downloads"
     echo "target:  $_url"
-    echo "gateway: ${_ncpu} CPU cores, tunnel service CPU limit: ${_quota:-none}"
+    echo "gateway: ${_ncpu} CPU cores; tunnel core: ${_procs:-default} Go threads${_quota:+, CPU quota $_quota}"
     echo
     printf '%-38s' "1. WAN direct (no proxy)"
     _r="$(_bench_run "$_secs" "$_url")" || _r=""
@@ -2281,16 +2295,17 @@ EOF
     echo "$(c_grn "$_wan Mbit/s")   gateway CPU ${_wan_busy}%"
 
     printf '%-38s' "2. Proxy outbound only (no WireGuard)"
-    # The probe core gets the service's Go tuning and memory ceiling; safeexec's
+    # The probe core gets the service's Go settings and memory ceiling; safeexec's
     # CPU-time limit equals its budget, so scale the budget with the core count.
     _budget=$(( (_secs + 20) * _ncpu )); [ "$_budget" -le 300 ] || _budget=300
-    export GOGC="$CORE_GOGC" GOMEMLIMIT="$CORE_GOMEMLIMIT"
+    GOMAXPROCS="$(core_gomaxprocs)"; GOMEMLIMIT="$CORE_GOMEMLIMIT"
+    export GOMAXPROCS GOMEMLIMIT
     _r=""
     if _probe_start "$_budget" 512; then
         _r="$(_bench_run "$_secs" "$_url" "${_proxy_scheme}://127.0.0.1:${_port}" "$_pid")" || _r=""
         _ping_cleanup
     fi
-    unset GOGC GOMEMLIMIT
+    unset GOMAXPROCS GOMEMLIMIT
     read -r _out _out_busy _core <<EOF
 ${_r:-0 0 0}
 EOF
