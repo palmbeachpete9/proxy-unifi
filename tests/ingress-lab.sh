@@ -134,15 +134,22 @@ python3 - "$T/root/etc/config.json" "$WG_PORT" "$(cat "$T/root/etc/wg/wg_private
 import json, sys
 path, port, secret, peer = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 json.dump({
-    "log": {"loglevel": "warning"},
+    "log": {"loglevel": "info"},
     "inbounds": [{
         "tag": "wg-in", "listen": "127.0.0.1", "port": port, "protocol": "wireguard",
         "settings": {"secretKey": secret, "address": ["10.7.0.1/32"], "mtu": 1340,
                      "noKernelTun": True,
                      "peers": [{"publicKey": peer, "allowedIPs": ["0.0.0.0/0", "::/0"]}]},
         "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": True}}],
-    # Every destination is served on loopback, keeping its port.
-    "outbounds": [{"tag": "proxy", "protocol": "freedom", "settings": {"redirect": "127.0.0.1:0"}}],
+    # Every destination is served on loopback, keeping its port. That target is
+    # private, which Xray refuses on direct routes from WireGuard inbounds (and
+    # the kernel overlay keeps refusing), so this route allows it explicitly;
+    # 10.9.9.0/24 goes through a direct route that does not.
+    "outbounds": [
+        {"tag": "proxy", "protocol": "freedom",
+         "settings": {"redirect": "127.0.0.1:0", "finalRules": [{"action": "allow", "ip": ["127.0.0.0/8"]}]}},
+        {"tag": "direct", "protocol": "freedom", "settings": {"redirect": "127.0.0.1:0"}}],
+    "routing": {"rules": [{"inboundTag": ["wg-in"], "ip": ["10.9.9.0/24"], "outboundTag": "direct"}]},
 }, open(path, "w"))
 PY
 chmod 755 "$T/root" "$T/root/etc"; chmod 644 "$T/root/etc/config.json"
@@ -222,6 +229,10 @@ client_tcp() {  # bytes fetched through the tunnel within 3 s
     ip netns exec "$CLIENT" curl -s -o /dev/null --noproxy '*' --max-time 3 \
         -w '%{size_download} %{speed_download}' "http://$TARGET:$BULK/" 2>/dev/null || true
 }
+client_private() {  # bytes fetched from a private target over the direct route
+    ip netns exec "$CLIENT" curl -s -o /dev/null --noproxy '*' --max-time 2 \
+        -w '%{size_download}' "http://10.9.9.9:$BULK/small" 2>/dev/null || true
+}
 client_udp() {  # <port>: "ok" when the echo comes back through the tunnel
     ip netns exec "$CLIENT" python3 - "$TARGET" "$1" <<'PY'
 import socket, sys
@@ -287,6 +298,8 @@ _tcp="$(client_tcp)"
 check "TCP through the kernel path" [ "${_tcp%% *}" -gt 0 ] 2>/dev/null
 info "kernel path: $(printf '%s\n' "$_tcp" | mbit) Mbit/s in this lab"
 check "UDP through the kernel path" [ "$(client_udp "$ECHO")" = ok ]
+check "direct routes still refuse private targets" [ "$(client_private)" = 0 ]
+check "the core logged the refusal" grep -q 'blocked target: tcp:127.0.0.1' "$T/core.log"
 check "UDP reply on a port the host shares (SO_REUSEADDR)" [ "$(client_udp "$SHARED")" = ok ]
 check "UDP reply on a port the host holds is lost" [ "$(client_udp "$CLASH")" = timeout ]
 if [ "$MODE" = wireguard ]; then
@@ -362,6 +375,7 @@ if [ "$MODE" = wireguard ]; then
     _small="$(ip netns exec "$CLIENT" curl -s -o /dev/null --noproxy '*' --max-time 5 \
         -w '%{size_download}' "http://$TARGET:$BULK/small" 2>/dev/null || true)"
     check "small TCP response through Xray's WireGuard" [ "$_small" = 1024 ]
+    check "Xray's WireGuard refuses the same private target" [ "$(client_private)" = 0 ]
     _tcp="$(client_tcp)"
     if [ "${_tcp%% *}" -gt 0 ] 2>/dev/null; then
         pass "TCP through Xray's WireGuard"

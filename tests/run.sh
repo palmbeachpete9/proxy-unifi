@@ -543,6 +543,53 @@ SH
     if sh "$_kd/decide.sh"; then ok "kernel ingress only where it applies"
     else bad "kernel ingress only where it applies"; fi
 
+    # The kernel overlay follows Xray's merge of the loaded configs and keeps
+    # the private-target block Xray gives WireGuard inbounds on direct routes.
+    {
+        echo 'py() { python3 "$@"; }'
+        echo 'INGRESS_HOST_IP=169.254.77.1; INGRESS_PORT=41820'
+        fn_src ingress_overlay_for
+    } > "$_kd/overlay.sh"
+    if python3 - "$_kd" <<'PY'
+import json, os, subprocess, sys
+work = sys.argv[1]
+wg = {"tag": "in", "protocol": "wireguard", "sniffing": {"enabled": True, "routeOnly": True}}
+def overlay(*configs):
+    paths = []
+    for number, config in enumerate(configs):
+        paths.append(os.path.join(work, "c%d.json" % number))
+        json.dump(config, open(paths[-1], "w"))
+    run = subprocess.run(["sh", "-c", '. "$0/overlay.sh"; ingress_overlay_for "$@"', work] + paths,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    return json.loads(run.stdout) if run.returncode == 0 else None
+allow = {"action": "allow", "ip": ["10.1.1.1/32"]}
+result = overlay({"inbounds": [wg], "outbounds": [
+    {"tag": "proxy", "protocol": "vless"},
+    {"tag": "direct", "protocol": "freedom", "settings": {"finalRules": [allow]}},
+    {"tag": "alias", "protocol": "direct"}, {"tag": "block", "protocol": "blackhole"}]})
+inbound, = result["inbounds"]
+assert (inbound["tag"], inbound["protocol"], inbound["port"]) == ("in", "dokodemo-door", 41820)
+assert inbound["sniffing"] == wg["sniffing"]
+direct, alias = result["outbounds"]
+assert direct["tag"] == "direct" and direct["settings"]["finalRules"][0] == allow
+assert direct["settings"]["finalRules"][1]["action"] == "block"
+assert {"10.0.0.0/8", "127.0.0.0/8", "192.168.0.0/16"} <= set(direct["settings"]["finalRules"][1]["ip"])
+assert alias["tag"] == "alias" and alias["settings"]["finalRules"][0]["action"] == "block"
+# Nothing to guard: no outbounds in the overlay.
+assert "outbounds" not in overlay({"inbounds": [wg], "outbounds": [{"tag": "p", "protocol": "vless"}]})
+# A lone untagged direct outbound is replaced in place; beside another
+# untagged outbound it cannot be, so kernel mode is refused.
+assert overlay({"inbounds": [wg], "outbounds": [{"protocol": "freedom"}, {"tag": "p", "protocol": "vless"}]})
+assert overlay({"inbounds": [wg], "outbounds": [{"protocol": "freedom"}, {"protocol": "blackhole"}]}) is None
+# Later configs replace by tag, as Xray merges them.
+socks = {"tag": "in", "protocol": "socks"}
+assert overlay({"inbounds": [socks]}, {"inbounds": [wg]})["inbounds"][0]["tag"] == "in"
+assert overlay({"inbounds": [wg]}, {"inbounds": [socks]}) is None
+assert overlay({"inbounds": [wg, dict(wg, tag="other")]}) is None
+PY
+    then ok "kernel overlay keeps Xray's private-target guard"
+    else bad "kernel overlay keeps Xray's private-target guard"; fi
+
     # Health: in kernel mode the kernel holds the WireGuard port and the core
     # must own the transparent listener; otherwise the core owns the port.
     {
@@ -1827,26 +1874,39 @@ EOF
         fn_src ingress_overlay_for
     } > "$_d/overlay.sh"
     echo '{}' > "$_d/empty.json"
-    # shellcheck disable=SC2016 # $1-$5 expand inside the child shell.
+    # shellcheck disable=SC2016 # $1-$6 expand inside the child shell.
     if gx "vless://$UUID@h:443?security=tls&type=grpc&sni=a" \
-       && sh -c '. "$1"; ingress_overlay_for "$2" > "$3" && ingress_overlay_for "$4" > "$5"' sh \
-           "$_d/overlay.sh" "$_d/c.json" "$_d/kernel.json" "$_d/pool/99-overlay.json" "$_d/pool-kernel.json" \
+       && sh -c '. "$1"; ingress_overlay_for "$2" > "$3" && ingress_overlay_for "$4" "$5" > "$6"' sh \
+           "$_d/overlay.sh" "$_d/c.json" "$_d/kernel.json" \
+           "$_d/pool/01-provider.json" "$_d/pool/99-overlay.json" "$_d/pool-kernel.json" \
        && "$XR" run -dump -config "$_d/c.json" -config "$_d/kernel.json" > "$_d/link.dump" 2>/dev/null \
        && "$XR" run -dump -config "$_d/pool/01-provider.json" -config "$_d/pool/99-overlay.json" \
            -config "$_d/pool-kernel.json" > "$_d/pool.dump" 2>/dev/null \
        && "$XR" run -dump -config "$_d/c.json" -config "$_d/empty.json" > "$_d/empty.dump" 2>/dev/null \
        && python3 - "$_d" <<'PY'
 import json, os, sys
-def inbounds(name):
-    return json.load(open(os.path.join(sys.argv[1], name)))["inbounds"]
+def dump(name):
+    return json.load(open(os.path.join(sys.argv[1], name)))
 for name, tag in (("link.dump", "wg-in"), ("pool.dump", "socks")):
-    only, = inbounds(name)
+    only, = dump(name)["inbounds"]
     assert (only["tag"], only["protocol"]) == (tag, "dokodemo-door"), only
     assert (only["listen"], only["port"]) == ("169.254.77.1", 41820), only
     assert only["streamSettings"]["sockopt"]["tproxy"] == "tproxy", only
     assert only["sniffing"]["enabled"] is True, only
-only, = inbounds("empty.dump")
+def guarded(outbound):
+    rules = (outbound.get("settings") or {}).get("finalRules") or []
+    return bool(rules) and rules[-1]["action"] == "block" and "127.0.0.0/8" in rules[-1]["ip"]
+# Direct outbounds carry the private-target block, in their original places.
+link = dump("link.dump")["outbounds"]
+assert [o["tag"] for o in link] == ["proxy", "direct", "block"], link
+assert guarded(link[1]) and not guarded(link[0]), link
+pool = dump("pool.dump")["outbounds"]
+assert [o["tag"] for o in pool] == ["proxy", "proxy-2", "block"], pool
+assert guarded(pool[0]) and guarded(pool[1]), pool
+empty = dump("empty.dump")
+only, = empty["inbounds"]
 assert (only["tag"], only["protocol"]) == ("wg-in", "wireguard"), only
+assert not any(guarded(o) for o in empty["outbounds"]), empty["outbounds"]
 PY
     then ok "xray loads the kernel ingress overlay (link and pool)"
     else bad "xray loads the kernel ingress overlay (link and pool)"; fi

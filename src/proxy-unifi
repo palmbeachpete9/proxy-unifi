@@ -1451,39 +1451,86 @@ ingress_note_exit() {
 }
 ingress_retry() { rm -f "$INGRESS_FAILS"; }
 
-# Print the overlay that replaces the WireGuard inbound in <config.json>.
+# ingress_overlay_for <config.json>...: print the kernel-mode overlay for the
+# configs Xray loads, in their order. It replaces the WireGuard inbound by tag,
+# and keeps a protection that comes with that inbound: since v26.7.11 Xray's
+# freedom ("direct") outbound refuses private and loopback targets for traffic
+# from WireGuard inbounds, but not from dokodemo-door. So every freedom outbound
+# is replaced by a copy that ends with the same rule (after its own final rules,
+# which Xray also checks first); otherwise tunnel clients could reach the
+# gateway's own services and other networks through direct routes.
 ingress_overlay_for() {
-    py - "$1" "$INGRESS_HOST_IP" "$INGRESS_PORT" <<'PYEOF'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as source:
-    inbounds = json.load(source).get("inbounds") or []
-wireguard = [i for i in inbounds if isinstance(i, dict)
-             and i.get("protocol") == "wireguard" and i.get("tag")]
+    py - "$INGRESS_HOST_IP" "$INGRESS_PORT" "$@" <<'PYEOF'
+import copy, json, sys
+# Xray's own list (common/geodata: GetPrivateIPMatcher).
+PRIVATE = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+           "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24",
+           "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
+           "224.0.0.0/3", "::/127", "fc00::/7", "fe80::/10", "ff00::/8"]
+
+def merge(current, extra, prepend):
+    # Xray's multi-config merge: replace the first entry with the same tag,
+    # otherwise append inbounds and prepend outbounds.
+    added = []
+    for entry in extra:
+        tags = [item.get("tag", "") for item in current]
+        if entry.get("tag", "") in tags:
+            current[tags.index(entry.get("tag", ""))] = entry
+        else:
+            added.append(entry)
+    return added + current if prepend else current + added
+
+inbounds, outbounds = [], []
+for number, path in enumerate(sys.argv[3:]):
+    with open(path, encoding="utf-8") as source:
+        config = json.load(source)
+    found_in = [i for i in config.get("inbounds") or [] if isinstance(i, dict)]
+    found_out = [o for o in config.get("outbounds") or [] if isinstance(o, dict)]
+    inbounds = merge(inbounds, found_in, False) if number else found_in
+    outbounds = merge(outbounds, found_out, True) if number else found_out
+wireguard = [i for i in inbounds if i.get("protocol") == "wireguard" and i.get("tag")]
 if len(wireguard) != 1:
-    sys.exit("expected one tagged WireGuard inbound in " + sys.argv[1])
+    sys.exit("expected one tagged WireGuard inbound")
 inbound = dict(
-    tag=wireguard[0]["tag"], listen=sys.argv[2], port=int(sys.argv[3]),
+    tag=wireguard[0]["tag"], listen=sys.argv[1], port=int(sys.argv[2]),
     protocol="dokodemo-door",
     settings={"network": "tcp,udp", "followRedirect": True},
     streamSettings={"sockopt": {"tproxy": "tproxy"}})
 if "sniffing" in wireguard[0]:
     inbound["sniffing"] = wireguard[0]["sniffing"]
-json.dump({"inbounds": [inbound]}, sys.stdout, indent=2)
+overlay = {"inbounds": [inbound]}
+untagged = [o for o in outbounds if not o.get("tag")]
+for outbound in outbounds:
+    if str(outbound.get("protocol", "")).lower() not in ("freedom", "direct"):
+        continue
+    if not outbound.get("tag") and len(untagged) != 1:
+        sys.exit("an untagged direct outbound sits among other untagged outbounds")
+    guarded = copy.deepcopy(outbound)
+    settings = guarded.setdefault("settings", {})
+    rules = settings.get("finalRules") if isinstance(settings, dict) else None
+    if not isinstance(settings, dict) or not isinstance(rules or [], list):
+        sys.exit("unexpected direct outbound settings")
+    settings["finalRules"] = (rules or []) + [{"action": "block", "ip": PRIVATE}]
+    overlay.setdefault("outbounds", []).append(guarded)
+json.dump(overlay, sys.stdout, indent=2)
 print()
 PYEOF
 }
 
-# validate_ingress_overlay <config with the WireGuard inbound> <xray -config args>:
-# reject a profile whose kernel-mode overlay Xray would not load, before it is
-# installed (only when kernel mode is configured).
+# validate_ingress_overlay <config.json>...: reject a profile whose kernel-mode
+# overlay Xray would not load, before it is installed (only when kernel mode is
+# configured). The configs are given in the order Xray loads them.
 validate_ingress_overlay() {
     ingress_configured || return 0
-    _vo_src="$1"; shift
     _vo="$(mktemp "$ETC_DIR/.ingress.XXXXXX")" || fatal "could not create temp file"
-    if ingress_overlay_for "$_vo_src" > "$_vo" 2>/dev/null \
-        && chown root:"$SERVICE_GROUP" "$_vo" && chmod 640 "$_vo" \
-        && validate_as_service "$XRAY" run -test -format json "$@" -config "$_vo" >/dev/null 2>&1
-    then
+    _vo_ok=0
+    if ingress_overlay_for "$@" > "$_vo" 2>/dev/null \
+        && chown root:"$SERVICE_GROUP" "$_vo" && chmod 640 "$_vo"; then
+        for _vo_cfg in "$@"; do set -- "$@" -config "$_vo_cfg"; shift; done
+        validate_as_service "$XRAY" run -test -format json "$@" -config "$_vo" >/dev/null 2>&1 \
+            && _vo_ok=1
+    fi
+    if [ "$_vo_ok" = 1 ]; then
         rm -f "$_vo"
         return 0
     fi
@@ -1496,9 +1543,11 @@ validate_ingress_overlay() {
 ingress_overlay() {
     mkdir -p "$INGRESS_RUN" && chmod 755 "$INGRESS_RUN" || return 1
     if [ "$1" = kernel ]; then
-        if [ "$(current_engine)" = xraypool ]; then _io_src="$POOL_DIR/99-overlay.json"
-        else _io_src="$CONFIG"; fi
-        _io_json="$(ingress_overlay_for "$_io_src" 2>&1)" || { _ingress_failed="$_io_json"; return 1; }
+        if [ "$(current_engine)" = xraypool ]; then
+            _io_json="$(ingress_overlay_for "$POOL_DIR/01-provider.json" "$POOL_DIR/99-overlay.json" 2>&1)"
+        else
+            _io_json="$(ingress_overlay_for "$CONFIG" 2>&1)"
+        fi || { _ingress_failed="$_io_json"; return 1; }
     else
         _io_json="{}"
     fi
@@ -1824,7 +1873,7 @@ _build_config_file() {
             chown root:"$SERVICE_GROUP" "$tmpcfg"; chmod 640 "$tmpcfg"
             validate_as_service "$XRAY" run -test -config "$tmpcfg" -format json >/dev/null 2>&1 \
                 || fatal "xray rejected the generated config (-test failed)"
-            validate_ingress_overlay "$tmpcfg" -config "$tmpcfg"
+            validate_ingress_overlay "$tmpcfg"
         fi
     fi
     [ -s "$tmpcfg" ] || fatal "generated config is empty"
@@ -1916,8 +1965,7 @@ _build_pool() {
     chown root:"$SERVICE_GROUP" "$_stage"/*.json; chmod 640 "$_stage"/*.json
     validate_as_service "$XRAY" run -test -confdir "$_stage" >/dev/null 2>&1 \
         || fatal "xray rejected the pool profile (-test failed)"
-    validate_ingress_overlay "$_stage/99-overlay.json" \
-        -config "$_stage/01-provider.json" -config "$_stage/99-overlay.json"
+    validate_ingress_overlay "$_stage/01-provider.json" "$_stage/99-overlay.json"
     ensure_run_dir
     _old_pool="$RUN_DIR/pool.old"
     rm -rf "$_old_pool"
