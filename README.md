@@ -90,6 +90,8 @@ to Xray, which routes it exactly as before (same inbound tag and sniffing).
   lists the ports. TCP is unaffected.
 - **Privilege:** only in this mode, the core gets one capability, `CAP_NET_RAW`,
   which transparent sockets require.
+- **Private addresses:** as with Xray's WireGuard inbound, direct (freedom) routes
+  refuse private and loopback targets for tunnel clients.
 - **Measure:** the third line of `proxy bench` tests the full tunnel through the
   gateway's own VPN Client.
 
