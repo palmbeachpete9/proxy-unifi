@@ -24,6 +24,21 @@ PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+# py_case <name> [args...] runs the Python test program on stdin and reports one
+# result. Its output (expected rejection messages, progress) is shown only on
+# failure, so a passing run stays readable and a failing one keeps its traceback.
+py_case() {
+    _pc_name="$1"; shift
+    if _pc_out="$(python3 - "$@" 2>&1)"; then ok "$_pc_name"
+    else bad "$_pc_name"; printf '%s\n' "$_pc_out" | sed 's/^/       /'; fi
+}
+# A killed process stays a zombie until its parent reaps it; orphans go to PID 1,
+# and some container inits never reap. kill -0 still succeeds on a zombie, which
+# holds no resources, so only a live (non-zombie) process counts as surviving.
+proc_alive() {
+    kill -0 "$1" 2>/dev/null || return 1
+    case "$(ps -o stat= -p "$1" 2>/dev/null)" in Z*) return 1 ;; esac
+}
 sha256_of() {
     if have sha256sum; then sha256sum "$1" | awk '{print $1}'
     else shasum -a 256 "$1" | awk '{print $1}'; fi
@@ -34,10 +49,14 @@ sha256_of() {
 # -------------------------------------------------------------------------
 static_tests() {
     echo "== static =="
+    # ShellCheck is the slowest static check; run it alongside the others and
+    # report it at the end of this tier.
+    _sc_log=""
     if have shellcheck; then
-        if shellcheck -s sh "$SRC/proxy-unifi" "$SRC/on_boot.sh" "$ROOT/install.sh" \
-            "$ROOT/tests/run.sh" "$ROOT/tests/lifecycle.sh"
-        then ok "shellcheck"; else bad "shellcheck"; fi
+        _sc_log="$(mktemp)"
+        shellcheck -s sh "$SRC/proxy-unifi" "$SRC/on_boot.sh" "$ROOT/install.sh" \
+            "$ROOT/tests/run.sh" "$ROOT/tests/lifecycle.sh" > "$_sc_log" 2>&1 &
+        _sc_pid=$!
     else printf '  skip shellcheck (not installed)\n'; fi
     if have dash; then
         _d=0
@@ -80,7 +99,7 @@ PY
     python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 1 --memory-mb 64 --fsize-mb 1 -- \
         sh -c 'trap "" TERM; sleep 30 & trap "" TERM; echo $! > "$1/child"; wait' sh "$_sd" >/dev/null 2>"$_sd/error"
     _src=$?; _child="$(cat "$_sd/child" 2>/dev/null || true)"; _dead=1
-    [ -n "$_child" ] && kill -0 "$_child" 2>/dev/null && _dead=0
+    [ -n "$_child" ] && proc_alive "$_child" && _dead=0
     if [ "$_src" = 124 ] && [ "$_dead" = 1 ]; then ok "safe validator timeout kills process group"
     else bad "safe validator timeout kills process group"; [ "$_dead" = 1 ] || kill "$_child" 2>/dev/null || true; fi
     rm -rf "$_sd"
@@ -392,6 +411,12 @@ SH
     if WORK="$_fd" sh "$_fd/fw.sh"; then ok "firewall guard owns rules and fails closed on IPv6"
     else bad "firewall guard owns rules and fails closed on IPv6"; fi
     rm -rf "$_fd"
+
+    if [ -n "$_sc_log" ]; then
+        if wait "$_sc_pid"; then ok "shellcheck"
+        else bad "shellcheck"; cat "$_sc_log"; fi
+        rm -f "$_sc_log"
+    fi
 }
 
 # -------------------------------------------------------------------------
@@ -494,7 +519,7 @@ parser_tests() {
     out="$(python3 "$SRC/mkxray.py" --link "$(printf 'vless://u@h\033[2Jx:443?security=tls&sni=a')" --port 51821 --secret-key AAAA --peer-pubkey BBBB 2>&1)" || true
     if printf '%s' "$out" | grep -qi 'control\|unsafe\|malformed'; then ok "ESC host rejected"; else bad "ESC host rejected"; fi
 
-    python3 - "$SRC" <<'PY' && ok "current share-link fields preserved" || bad "current share-link fields preserved"
+    py_case "current share-link fields preserved" "$SRC" <<'PY'
 import sys,urllib.parse
 sys.path.insert(0,sys.argv[1])
 import mkxray,mksingbox
@@ -512,7 +537,7 @@ out,_,_=mksingbox.parse_tuic("tuic://u:p@h:443?sni=h&network=tcp")
 assert out["network"]=="tcp"
 PY
 
-    python3 - "$SRC" <<'PY' && ok "SS2022 strict classifier and key fuzz" || bad "SS2022 strict classifier and key fuzz"
+    py_case "SS2022 strict classifier and key fuzz" "$SRC" <<'PY'
 import base64,contextlib,io,random,string,sys
 sys.path.insert(0,sys.argv[1])
 import mkxray,mksingbox,proxylib
@@ -561,7 +586,7 @@ for _ in range(20000):
 PY
 
     # mksub: classification + safety (pure python)
-    python3 - "$SRC" <<'PY' && ok "mksub parser corpus" || bad "mksub parser corpus"
+    py_case "mksub parser corpus" "$SRC" <<'PY'
 import sys, base64, json, gzip, contextlib, io, os, tempfile, types
 sys.path.insert(0, sys.argv[1])
 import mksub
@@ -817,11 +842,10 @@ for bad_header in ("bad\r\nX: y", "emoji-\U0001f600", "\u043a\u0438\u0440\u0438\
         raise AssertionError("accepted bad header")
     except SystemExit:
         pass
-print("mksub-ok")
 PY
 
     # mkawg: AWG 1.5-3.1 parser, bridge generator, profile catalog, and UI safety.
-    python3 - "$SRC" <<'PY' && ok "mkawg parser and UI corpus" || bad "mkawg parser and UI corpus"
+    py_case "mkawg parser and UI corpus" "$SRC" <<'PY'
 import base64
 import contextlib
 import io
@@ -1108,11 +1132,10 @@ with tempfile.TemporaryDirectory() as directory:
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert proc.returncode != 0 and "\x1b" not in proc.stderr
     assert not any(ord(ch) < 32 and ch not in "\r\n\t" for ch in proc.stderr)
-print("mkawg-ok")
 PY
 
     # mkjson: balancer profile validation + overlay tag matching (pure python)
-    python3 - "$SRC" <<'PY' && ok "mkjson profile validation" || bad "mkjson profile validation"
+    py_case "mkjson profile validation" "$SRC" <<'PY'
 import sys, json
 sys.path.insert(0, sys.argv[1])
 import mkjson
@@ -1243,7 +1266,6 @@ mkjson.validate_profile(unsafe_pin)
 # provider geodata jobs can replace local assets and are never part of pool routing semantics
 with_geodata = json.loads(json.dumps(prof)); with_geodata["geodata"]={"cron":"* * * * *"}
 assert "geodata" not in mkjson.sanitize_provider(with_geodata)
-print("mkjson-ok")
 PY
 }
 
@@ -1276,7 +1298,12 @@ download_engines() {
     [ -n "$_xwant" ] && [ "$(sha256_of "$CACHE/x.zip")" = "$_xwant" ] || return 1
     unzip -oq "$CACHE/x.zip" -d "$CACHE" && chmod +x "$CACHE/xray" \
         && "$CACHE/xray" version >/dev/null 2>&1 || return 1
-    _tag="$(curl -fsSLI --connect-timeout 15 --max-time 60 --retry 3 https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | tr -d '\r' | awk -F'/tag/' 'tolower($0)~/location:/{print $2}' | awk '{print $1}' | tail -1)"; _v="${_tag#v}"
+    # One API call names the latest stable release and carries its asset digests.
+    curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 \
+        https://api.github.com/repos/SagerNet/sing-box/releases/latest -o "$CACHE/sb-release.json" \
+        || return 1
+    _tag="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("tag_name",""))' \
+        "$CACHE/sb-release.json")"; _v="${_tag#v}"
     [ -n "$_v" ] || return 1
     echo "  downloading sing-box $_tag ($_sos-$_sa) ..."
     _sbdir="$CACHE/sing-box-${_v}-${_sos}-${_sa}"
@@ -1284,8 +1311,6 @@ download_engines() {
     _sbname="sing-box-${_v}-${_sos}-${_sa}.tar.gz"
     curl -fsSL --connect-timeout 15 --max-time 300 --retry 3 \
         "https://github.com/SagerNet/sing-box/releases/download/${_tag}/${_sbname}" -o "$CACHE/sb.tgz" \
-        && curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 \
-        "https://api.github.com/repos/SagerNet/sing-box/releases/tags/${_tag}" -o "$CACHE/sb-release.json" \
         || return 1
     _sbwant="$(python3 - "$CACHE/sb-release.json" "$_sbname" <<'PY'
 import json,sys
@@ -1468,7 +1493,7 @@ spriv, spub = keypair()
 cpriv, cpub = keypair()
 key = base64.b64encode(os.urandom(32)).decode()
 
-def handshake(server_key):
+def handshake(server_key, timeout):
     work = tempfile.mkdtemp()
     hub = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     hub.bind(("127.0.0.1", 0))
@@ -1521,7 +1546,7 @@ PersistentKeepalive = 1-5
                               stderr=open("%s/%s.log" % (work, name), "w"))
              for name in ("server", "client")]
     try:
-        deadline = time.time() + 8
+        deadline = time.time() + timeout
         while time.time() < deadline:
             if any(p.poll() is not None for p in procs):
                 return False
@@ -1539,8 +1564,12 @@ PersistentKeepalive = 1-5
             p.wait(5)
         hub.close()
 
-assert handshake(key), "AWG 3.1 handshake failed"
-assert not handshake(base64.b64encode(os.urandom(32)).decode()), \
+started = time.time()
+assert handshake(key, 8), "AWG 3.1 handshake failed"
+# A wrong key must stay down for several times as long as the matching key
+# took here (RekeyTimeout = 1 retries every second), not a fixed 8 seconds.
+window = max(3.0, 4 * (time.time() - started))
+assert not handshake(base64.b64encode(os.urandom(32)).decode(), window), \
     "AWG 3.1 handshake ignored HeaderProtectionKey"
 PY
         then ok "amnezia-box AWG 3.1 handshake"; else bad "amnezia-box AWG 3.1 handshake"; fi
@@ -1562,7 +1591,8 @@ EOF
     then ok "xray balancer pool (-confdir)"; else bad "xray balancer pool (-confdir)"; fi
     rm -rf "$_d"
 
-    if sh "$ROOT/tests/lifecycle.sh" "$XR" >"$_d.lifecycle" 2>&1; then ok "sandboxed CLI lifecycle + rollback"
+    # Traced so a failure's tail names the step that broke (set -e stops there).
+    if sh -x "$ROOT/tests/lifecycle.sh" "$XR" >"$_d.lifecycle" 2>&1; then ok "sandboxed CLI lifecycle + rollback"
     else bad "sandboxed CLI lifecycle + rollback"; tail -n 20 "$_d.lifecycle"; fi
     rm -f "$_d.lifecycle"
 }
@@ -1580,8 +1610,8 @@ network_tests() {
         -nodes -subj '/CN=127.0.0.1' -addext 'subjectAltName=IP:127.0.0.1' >/dev/null 2>&1 \
         || { bad "network: cert gen"; rm -rf "$_d"; return; }
     cat > "$_d/srv.py" <<'PYEOF'
-import socket, ssl, sys, base64, gzip
-port, mode = int(sys.argv[1]), sys.argv[2]
+import base64, gzip, os, socket, ssl, sys
+mode, portfile = sys.argv[1], sys.argv[2]
 body = base64.b64encode(("vless://u@nl.example.com:443?security=tls&sni=a#NL\n"*3).encode())
 if mode == "chunked":
     resp = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n"
@@ -1596,8 +1626,10 @@ else:  # deliberately truncated fixed-length response
             b"Content-Length: %d\r\nConnection: close\r\n\r\n" % (len(body) + 1)) + body
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(sys.argv[3], sys.argv[4])
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", port)); s.listen(5)
-sys.stderr.write("ready\n"); sys.stderr.flush()
+s.bind(("127.0.0.1", 0)); s.listen(5)
+# Publish the ephemeral port atomically once the socket accepts connections.
+with open(portfile + ".tmp", "w") as f: f.write(str(s.getsockname()[1]))
+os.rename(portfile + ".tmp", portfile)
 while True:
     c, _ = s.accept()
     try:
@@ -1605,21 +1637,27 @@ while True:
     except Exception:
         pass
 PYEOF
-    _fetch() {  # <mode> <port> <name>
-        python3 "$_d/srv.py" "$2" "$1" "$_d/cert.pem" "$_d/key.pem" >/dev/null 2>&1 &
-        _srv=$!; sleep 2
-        printf 'https://127.0.0.1:%s/sub' "$2" > "$_d/url.txt"
+    _serve() {  # <mode>: start a server on a free port and write its URL
+        rm -f "$_d/port"
+        python3 "$_d/srv.py" "$1" "$_d/port" "$_d/cert.pem" "$_d/key.pem" >/dev/null 2>&1 &
+        _srv=$!; _i=0
+        while [ ! -s "$_d/port" ] && [ "$_i" -lt 100 ]; do
+            _i=$((_i + 1)); sleep 0.05 2>/dev/null || sleep 1
+        done
+        printf 'https://127.0.0.1:%s/sub' "$(cat "$_d/port" 2>/dev/null)" > "$_d/url.txt"
+    }
+    _stop() { kill "$_srv" 2>/dev/null; wait "$_srv" 2>/dev/null; }
+    _fetch() {  # <mode> <name>
+        _serve "$1"
         _out="$(PROXY_UNIFI_SUB_ALLOW_PRIVATE=1 SSL_CERT_FILE="$_d/cert.pem" \
             python3 "$SRC/mksub.py" fetch --url-file "$_d/url.txt" 2>&1)"
-        kill "$_srv" 2>/dev/null; wait "$_srv" 2>/dev/null
+        _stop
         if printf '%s' "$_out" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["meta"]["count"]==1 else 1)' 2>/dev/null
-        then ok "$3"; else bad "$3"; fi
+        then ok "$2"; else bad "$2"; fi
     }
-    _fetch chunked 18581 "fetch chunked transfer-encoding"
-    _fetch gzip    18582 "fetch gzip content-encoding"
-    python3 "$_d/srv.py" 18583 truncated "$_d/cert.pem" "$_d/key.pem" >/dev/null 2>&1 &
-    _srv=$!; sleep 2
-    printf 'https://127.0.0.1:18583/sub' > "$_d/url.txt"
+    _fetch chunked "fetch chunked transfer-encoding"
+    _fetch gzip    "fetch gzip content-encoding"
+    _serve truncated
     if PROXY_UNIFI_SUB_ALLOW_PRIVATE=1 SSL_CERT_FILE="$_d/cert.pem" \
        python3 "$SRC/mksub.py" fetch --url-file "$_d/url.txt" >"$_d/truncated.out" 2>&1; then
         bad "fetch rejects truncated fixed-length body"
@@ -1628,7 +1666,7 @@ PYEOF
     else
         bad "fetch rejects truncated fixed-length body"
     fi
-    kill "$_srv" 2>/dev/null; wait "$_srv" 2>/dev/null
+    _stop
     rm -rf "$_d"
 }
 
