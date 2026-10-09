@@ -44,6 +44,45 @@ sha256_of() {
     else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
 
+# start_bulk_server <dir>: serve 64 MB per GET on a free loopback port and set
+# _bulk_pid/_bulk_port. bench_lib <dir> writes the CLI's bench helper as a lib.
+start_bulk_server() {
+    cat > "$1/bulk.py" <<'BULK'
+import http.server, os, sys
+class Bulk(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        chunk, count = bytes(1 << 20), 64
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(chunk) * count))
+        self.end_headers()
+        try:
+            for _ in range(count):
+                self.wfile.write(chunk)
+        except OSError:
+            pass
+    def log_message(self, *args):
+        pass
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Bulk)
+with open(sys.argv[1] + ".tmp", "w") as f: f.write(str(server.server_address[1]))
+os.rename(sys.argv[1] + ".tmp", sys.argv[1])
+server.serve_forever()
+BULK
+    python3 "$1/bulk.py" "$1/bulk.port" >/dev/null 2>&1 &
+    _bulk_pid=$!; _i=0
+    while [ ! -s "$1/bulk.port" ] && [ "$_i" -lt 100 ]; do
+        _i=$((_i + 1)); sleep 0.05 2>/dev/null || sleep 1
+    done
+    _bulk_port="$(cat "$1/bulk.port" 2>/dev/null)"
+}
+bench_lib() {
+    {
+        # shellcheck disable=SC2016 # $1 belongs to the generated library.
+        echo 'have() { command -v "$1" >/dev/null 2>&1; }'
+        echo 'py() { python3 "$@"; }'
+        sed -n '/^BENCH_STREAMS=/p; /^_bench_run() {/,/^}/p' "$SRC/proxy-unifi"
+    } > "$1/bench-lib.sh"
+}
+
 # -------------------------------------------------------------------------
 # tier 1: static analysis
 # -------------------------------------------------------------------------
@@ -162,7 +201,7 @@ SH
     else bad "CLI WireGuard endpoint formats IPv6"; fi
     rm -rf "$_ed"
 
-    _ping_proxy="$(sed -n '/^ping_proxy() {/,/^}/p' "$SRC/proxy-unifi")"
+    _ping_proxy="$(sed -n '/^_probe_start() {/,/^}/p;/^ping_proxy() {/,/^}/p' "$SRC/proxy-unifi")"
     # shellcheck disable=SC2016 # Match literal variables in the extracted source.
     if printf '%s\n' "$_ping_proxy" | grep -Fq '_proxy_scheme="socks5h"' \
        && printf '%s\n' "$_ping_proxy" | grep -Fq '_proxy_scheme="socks5"' \
@@ -358,8 +397,11 @@ prepare_service_permissions() { :; }
 systemctl() { :; }
 atomic_write() { cat > "$1"; }
 SH
-    awk '/^write_service\(\) \{/,/^}/' "$SRC/proxy-unifi" >> "$_ud/h.sh"
-    echo 'write_service' >> "$_ud/h.sh"
+    {
+        sed -n '/^CORE_GO[A-Z]*=/p' "$SRC/proxy-unifi"
+        awk '/^write_service\(\) \{/,/^}/' "$SRC/proxy-unifi"
+        echo 'write_service'
+    } >> "$_ud/h.sh"
     _fw_ok=1
     ENG=singbox  WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
     grep -q '^ExecStartPre=+/b/proxy-unifi _fw-lock$'  "$_ud/unit" || _fw_ok=0
@@ -372,6 +414,16 @@ SH
     grep -q '^ExecStartPre=-+/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
     grep -q '_fw-lock' "$_ud/unit" && _fw_ok=0          # xray must NOT lock a port
     [ "$_fw_ok" = 1 ] && ok "singbox/AWG WG port firewalled (unit)" || bad "singbox/AWG WG port firewalled (unit)"
+    # The core may use every CPU (a hard quota also caps Go's GOMAXPROCS), and
+    # its GC tuning stays below the unit's memory ceiling.
+    _cpu_ok=1
+    grep -q '^CPUQuota=' "$_ud/unit" && _cpu_ok=0
+    grep -q '^CPUWeight=50$' "$_ud/unit" || _cpu_ok=0
+    grep -q '^MemoryMax=512M$' "$_ud/unit" || _cpu_ok=0
+    grep -q '^Environment=GOGC=200$' "$_ud/unit" || _cpu_ok=0
+    grep -q '^Environment=GOMEMLIMIT=384MiB$' "$_ud/unit" || _cpu_ok=0
+    [ "$_cpu_ok" = 1 ] && ok "service unit has no CPU cap and tuned Go GC" \
+        || bad "service unit has no CPU cap and tuned Go GC"
     rm -rf "$_ud"
 
     # Exercise firewall ownership and IPv6 fail-closed behavior against a stateful
@@ -1591,6 +1643,60 @@ EOF
     then ok "xray balancer pool (-confdir)"; else bad "xray balancer pool (-confdir)"; fi
     rm -rf "$_d"
 
+    # proxy bench: throughput and the core's CPU through a real SOCKS core that
+    # runs under safeexec exactly like the CLI's probe core.
+    _bd="$(mktemp -d)"
+    start_bulk_server "$_bd"; bench_lib "$_bd"
+    _sp="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')"
+    printf '{"inbounds":[{"listen":"127.0.0.1","port":%s,"protocol":"socks"}],"outbounds":[{"protocol":"freedom"}]}' \
+        "$_sp" > "$_bd/socks.json"
+    python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 60 --memory-mb 512 --fsize-mb 1 -- \
+        "$XR" run -config "$_bd/socks.json" >/dev/null 2>&1 &
+    _sx=$!; _i=0
+    until python3 -c 'import socket,sys; socket.create_connection(("127.0.0.1",int(sys.argv[1])),0.2)' "$_sp" 2>/dev/null \
+          || [ "$_i" -ge 50 ]; do
+        _i=$((_i + 1)); sleep 0.1 2>/dev/null || sleep 1
+    done
+    # shellcheck disable=SC2016 # $1-$4 expand inside the child shell.
+    _r="$(sh -c '. "$1"; _bench_run 3 "$2" "$3" "$4"' sh "$_bd/bench-lib.sh" \
+        "http://127.0.0.1:$_bulk_port/" "socks5h://127.0.0.1:$_sp" "$_sx")"
+    kill "$_sx" "$_bulk_pid" 2>/dev/null; wait "$_sx" "$_bulk_pid" 2>/dev/null
+    if printf '%s\n' "$_r" | awk 'NF == 3 && $1 > 0 && $3 > 0 { found=1 } END { exit !found }'
+    then ok "bench measures a SOCKS core's throughput and CPU"
+    else bad "bench measures a SOCKS core's throughput and CPU (got: $_r)"; fi
+    rm -rf "$_bd"
+
+    # A probe core must not outlive its caller: cleanup has to reach safeexec
+    # itself, which then stops the core's process group.
+    _pd="$(mktemp -d)"
+    printf 'vless://b831381d-6324-4d53-ad4f-8cda48b30811@127.0.0.1:9?security=none&type=tcp#probe' > "$_pd/link"
+    {
+        cat <<SH
+XRAY='$XR'; MKXRAY='$SRC/mkxray.py'; SAFEEXEC='$SRC/safeexec.py'
+OUTBOUND_LINK='$_pd/link'; RUN_DIR='$_pd'
+SH
+        cat <<'SH'
+have() { command -v "$1" >/dev/null 2>&1; }
+py() { python3 "$@"; }
+err() { echo "$*" >&2; }
+current_engine() { echo xray; }
+ensure_run_dir() { :; }
+ensure_service_user() { SERVICE_USER="$(id -un)"; SERVICE_GROUP="$(id -gn)"; }
+SH
+        sed -n '/^py_bin() {/,/^}/p; /^_free_port() {/,/^}/p; /^_ping_cleanup() {/,/^}/p' "$SRC/proxy-unifi"
+        sed -n '/^_socket_listening() {/,/^tcp_socket_listening()/p; /^_probe_start() {/,/^}/p' "$SRC/proxy-unifi"
+        cat <<'SH'
+_probe_start 30 256 || exit 1
+_ping_cleanup
+sleep 0.5
+! ps -eo args | awk -v cfg="$RUN_DIR/ping.json" 'index($0, cfg) && !/awk/' | grep -q .
+SH
+    } > "$_pd/probe.sh"
+    if have ss && sh "$_pd/probe.sh"; then ok "probe core stops with its caller"
+    elif have ss; then bad "probe core stops with its caller"
+    else printf '  skip probe core cleanup (ss not installed)\n'; fi
+    rm -rf "$_pd"
+
     # Traced so a failure's tail names the step that broke (set -e stops there).
     if sh -x "$ROOT/tests/lifecycle.sh" "$XR" >"$_d.lifecycle" 2>&1; then ok "sandboxed CLI lifecycle + rollback"
     else bad "sandboxed CLI lifecycle + rollback"; tail -n 20 "$_d.lifecycle"; fi
@@ -1605,6 +1711,18 @@ EOF
 network_tests() {
     have openssl || { printf '== network == (skipped: openssl not found)\n'; return; }
     echo "== network =="
+
+    # proxy bench without a proxy: streams finish, rates add up, and no core
+    # process is sampled.
+    _bd="$(mktemp -d)"
+    start_bulk_server "$_bd"; bench_lib "$_bd"
+    # shellcheck disable=SC2016 # $1-$2 expand inside the child shell.
+    _r="$(sh -c '. "$1"; _bench_run 2 "$2"' sh "$_bd/bench-lib.sh" "http://127.0.0.1:$_bulk_port/")"
+    kill "$_bulk_pid" 2>/dev/null; wait "$_bulk_pid" 2>/dev/null
+    if printf '%s\n' "$_r" | awk 'NF == 3 && $1 > 0 && $3 == 0 { found=1 } END { exit !found }'
+    then ok "bench measures a direct download"
+    else bad "bench measures a direct download (got: $_r)"; fi
+    rm -rf "$_bd"
     _d="$(mktemp -d)"
     openssl req -x509 -newkey rsa:2048 -keyout "$_d/key.pem" -out "$_d/cert.pem" -days 1 \
         -nodes -subj '/CN=127.0.0.1' -addext 'subjectAltName=IP:127.0.0.1' >/dev/null 2>&1 \

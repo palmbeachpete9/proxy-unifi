@@ -74,6 +74,10 @@ AWG_CORE_TAG="awg-core-v${AWG_CORE_VERSION}"
 # fall below the first patched release. Its archive hashes are pinned here so a
 # release asset cannot be silently replaced together with its online checksum.
 XRAY_MIN_SAFE_TAG="v26.7.11"
+# Go runtime tuning shared by the service unit and the bench probe core: halve
+# GC frequency, with a soft heap ceiling below the unit's MemoryMax=512M.
+CORE_GOGC="200"
+CORE_GOMEMLIMIT="384MiB"
 
 # defaults (overridable via settings.env)
 WG_LISTEN="127.0.0.1"
@@ -272,6 +276,13 @@ _py_run() {
     if have python3; then python3 "$@";
     elif have python; then python "$@";
     else fatal "python3 is required but was not found on this gateway.";
+    fi
+}
+# The interpreter _py_run would use, for callers that must exec it directly.
+py_bin() {
+    if have python3; then echo python3
+    elif have python; then echo python
+    else return 1
     fi
 }
 
@@ -1204,10 +1215,9 @@ $_fwpre
 ExecStart=$_exec
 $_fwpost
 Environment=XRAY_LOCATION_ASSET=$BIN_DIR
-# Per-packet tunnel work allocates heavily: halve GC frequency, with a soft heap
-# ceiling below MemoryMax so the runtime collects before the cgroup OOM-kills.
-Environment=GOGC=200
-Environment=GOMEMLIMIT=384MiB
+# Per-packet tunnel work allocates heavily: see CORE_GOGC/CORE_GOMEMLIMIT.
+Environment=GOGC=$CORE_GOGC
+Environment=GOMEMLIMIT=$CORE_GOMEMLIMIT
 WorkingDirectory=$ROOT
 Restart=on-failure
 RestartSec=5
@@ -1994,9 +2004,12 @@ _ping_cleanup() {
     _pid=""; _cfg=""; BG_PID=""
 }
 
-ping_proxy() {   # $1 = get|head
-    have curl || { err "curl is required for proxy HTTP latency tests"; return 1; }
-    _m="$1"; _e="$(current_engine)"
+# Start a throwaway core that exposes the active outbound on a free loopback
+# SOCKS port, under the service account and the safe validator's limits. Sets
+# _port, _proxy_scheme, _pid and _cfg; the caller stops it with _ping_cleanup.
+# $1 = safeexec time budget (seconds), $2 = resident-memory limit (MB)
+_probe_start() {
+    _probe_budget="$1"; _probe_mem="$2"; _e="$(current_engine)"
     _proxy_scheme="socks5h"
     _port="$(_free_port)"
     ensure_run_dir
@@ -2033,8 +2046,11 @@ ping_proxy() {   # $1 = get|head
     fi
     ensure_service_user
     chown root:"$SERVICE_GROUP" "$RUN_DIR" "$_cfg"; chmod 750 "$RUN_DIR"; chmod 640 "$_cfg"
-    _ping_budget=$((PING_TIMEOUT + 15))
-    py "$SAFEEXEC" --user "$SERVICE_USER" --timeout "$_ping_budget" --memory-mb 256 --fsize-mb 16 -- "$@" >/dev/null 2>&1 &
+    # A plain command, not the py() function: backgrounding a function forks a
+    # subshell, and killing that subshell would orphan safeexec and the core.
+    _pybin="$(py_bin)" || { err "python3 is required"; _ping_cleanup; return 1; }
+    PYTHONUTF8=1 PYTHONIOENCODING=utf-8 "$_pybin" "$SAFEEXEC" --user "$SERVICE_USER" \
+        --timeout "$_probe_budget" --memory-mb "$_probe_mem" --fsize-mb 16 -- "$@" >/dev/null 2>&1 &
     _pid=$!; BG_PID="$_pid"
     # wait (max ~4.5s) for the SOCKS listener to come up
     _i=0
@@ -2047,6 +2063,12 @@ ping_proxy() {   # $1 = get|head
         err "temporary proxy listener did not start"
         return 1
     fi
+}
+
+ping_proxy() {   # $1 = get|head
+    have curl || { err "curl is required for proxy HTTP latency tests"; return 1; }
+    _m="$1"
+    _probe_start "$((PING_TIMEOUT + 15))" 256 || return 1
     if [ "$_m" = "head" ]; then _label="via proxy (HEAD)"; set -- -I; else _label="via proxy (GET)"; set -- -X GET; fi
     # LC_ALL=C so curl prints time_total with a '.' decimal regardless of locale
     _out="$(LC_ALL=C curl -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time "$PING_TIMEOUT" \
@@ -2105,15 +2127,20 @@ ping_icmp() {
     if [ -n "$_ms" ]; then c_grn "ICMP ${_h}: ${_ms} ms"; else c_red "ICMP ${_h}: no reply (host may block ICMP)"; fi
 }
 
+# pool mode keeps its config in $POOL_DIR (no single link file) and AWG keeps a
+# selected profile; a plain link keeps $OUTBOUND_LINK. Any of them is testable.
+_require_outbound() {
+    if [ -f "$OUTBOUND_LINK" ] || [ "$(current_engine)" = "xraypool" ] \
+        || [ "$(current_engine)" = "awg" ]; then
+        return 0
+    fi
+    c_ylw "No proxy/VPN imported yet. Add a link, subscription, JSON profile, or AmneziaWG profile first."
+    return 1
+}
+
 cmd_ping() {
     load_settings
-    # pool mode keeps its config in $POOL_DIR (no single link file); a plain
-    # link keeps $OUTBOUND_LINK. Either is pingable.
-    if [ ! -f "$OUTBOUND_LINK" ] && [ "$(current_engine)" != "xraypool" ] \
-        && [ "$(current_engine)" != "awg" ]; then
-        c_ylw "No proxy/VPN imported yet. Add a link, subscription, JSON profile, or AmneziaWG profile first."
-        return 1
-    fi
+    _require_outbound || return 1
     _mode="${1:-$PING_MODE}"
     case "$_mode" in
         get)  ping_proxy get ;;
@@ -2122,6 +2149,164 @@ cmd_ping() {
         icmp) ping_icmp ;;
         *) fatal "unknown ping protocol '$_mode' (get|head|tcp|icmp)" ;;
     esac
+}
+
+# --------------------------------------------------------------------------
+# Throughput benchmark: the WAN alone, then the active outbound alone through a
+# throwaway SOCKS core (no WireGuard). A speed test through the UniFi VPN client
+# compared with both shows which hop limits the tunnel.
+# --------------------------------------------------------------------------
+# Cloudflare's anycast speed endpoint serves at most 99 MB per request.
+BENCH_URL="https://speed.cloudflare.com/__down?bytes=99000000"
+BENCH_STREAMS=4
+
+# $1 = seconds, $2 = URL, $3 = optional proxy URL, $4 = optional PID whose
+# descendant core (its own session after safeexec's setsid) is CPU-sampled.
+# Prints "<Mbit/s> <gateway CPU busy %> <core CPU % of one core>".
+_bench_run() {
+    py - "$1" "$2" "${3:-}" "${4:-0}" "$BENCH_STREAMS" <<'PYEOF'
+import os, subprocess, sys, threading, time
+
+seconds, url, proxy = float(sys.argv[1]), sys.argv[2], sys.argv[3]
+parent, streams = int(sys.argv[4]), int(sys.argv[5])
+
+def processes():
+    table = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % entry, encoding="ascii") as stat:
+                fields = stat.read().rsplit(")", 1)[1].split()
+            # ppid, pgrp, utime + stime
+            table[int(entry)] = (int(fields[1]), int(fields[2]),
+                                 int(fields[11]) + int(fields[12]))
+        except (OSError, ValueError, IndexError):
+            pass
+    return table
+
+def core_group():
+    table, frontier = processes(), [parent] if parent else []
+    while frontier:
+        current = frontier.pop()
+        for pid, (ppid, pgrp, _ticks) in table.items():
+            if ppid == current:
+                if pgrp == pid:
+                    return pid
+                frontier.append(pid)
+    return 0
+
+def group_ticks(group):
+    if not group:
+        return 0
+    return sum(ticks for _ppid, pgrp, ticks in processes().values() if pgrp == group)
+
+def system_cpu():
+    with open("/proc/stat", encoding="ascii") as stat:
+        values = [int(x) for x in stat.readline().split()[1:]]
+    return sum(values), values[3] + (values[4] if len(values) > 4 else 0)
+
+moved = [[0, 0.0] for _ in range(streams)]      # bytes, seconds spent receiving
+
+# Measure exactly the path asked for: curl would otherwise honor proxy and
+# no-proxy settings from the environment, even over an explicit --proxy.
+env = {key: value for key, value in os.environ.items()
+       if key.lower() not in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")}
+env["LC_ALL"] = "C"
+
+def stream(slot, deadline):
+    while True:
+        left = deadline - time.monotonic()
+        if left < 1:
+            return
+        command = ["curl", "-sS", "-o", "/dev/null", "--max-time", "%.1f" % left, "-w",
+                   "%{http_code} %{size_download} %{time_total} %{time_starttransfer}"]
+        if proxy:
+            command += ["--proxy", proxy]
+        fields = subprocess.run(command + [url], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, universal_newlines=True,
+                                env=env).stdout.split()
+        if len(fields) != 4 or not fields[0].startswith("2") or int(fields[1]) <= 0:
+            return
+        moved[slot][0] += int(fields[1])
+        # Count time spent receiving, not each request's connect/TLS setup.
+        moved[slot][1] += max(float(fields[2]) - float(fields[3]), 0.001)
+
+group = core_group()
+total_before, idle_before = system_cpu()
+ticks_before = group_ticks(group)
+started = time.monotonic()
+workers = [threading.Thread(target=stream, args=(slot, started + seconds))
+           for slot in range(streams)]
+for worker in workers:
+    worker.start()
+for worker in workers:
+    worker.join()
+elapsed = max(time.monotonic() - started, 0.001)
+total_after, idle_after = system_cpu()
+all_ticks = total_after - total_before
+busy = 100.0 * (1 - (idle_after - idle_before) / all_ticks) if all_ticks else 0.0
+core = 100.0 * (group_ticks(group) - ticks_before) / os.sysconf("SC_CLK_TCK") / elapsed
+mbit = sum(size / spent for size, spent in moved if spent) * 8 / 1e6
+print("%.1f %.0f %.0f" % (mbit, busy, core))
+PYEOF
+}
+
+cmd_bench() {   # [seconds] [url]
+    need_root
+    have curl || fatal "curl is required for the benchmark"
+    _require_outbound || return 1
+    _secs="${1:-10}"; _url="${2:-$BENCH_URL}"
+    { _uint "$_secs" && [ "$_secs" -ge 5 ] && [ "$_secs" -le 60 ]; } \
+        || fatal "bench duration must be 5-60 seconds"
+    case "$_url" in http://*|https://*) : ;; *) fatal "bench URL must start with http:// or https://" ;; esac
+    case "$_url" in *[[:space:]]*|*[[:cntrl:]]*) fatal "bench URL must not contain spaces or control characters" ;; esac
+    _ncpu="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    { _uint "$_ncpu" && [ "$_ncpu" -ge 1 ]; } || _ncpu=1
+    _quota="$(sed -n 's/^CPUQuota=//p' "$SERVICE_FILE" 2>/dev/null)"
+
+    c_bold "proxy-unifi bench: ${_secs}s per test, ${BENCH_STREAMS} parallel downloads"
+    echo "target:  $_url"
+    echo "gateway: ${_ncpu} CPU cores, tunnel service CPU limit: ${_quota:-none}"
+    echo
+    printf '%-38s' "1. WAN direct (no proxy)"
+    _r="$(_bench_run "$_secs" "$_url")" || _r=""
+    read -r _wan _wan_busy _ <<EOF
+${_r:-0 0 0}
+EOF
+    if [ "$_wan" = "0.0" ] || [ "$_wan" = 0 ]; then c_red "failed (is the target reachable?)"; return 1; fi
+    echo "$(c_grn "$_wan Mbit/s")   gateway CPU ${_wan_busy}%"
+
+    printf '%-38s' "2. Proxy outbound only (no WireGuard)"
+    # The probe core gets the service's Go tuning and memory ceiling; safeexec's
+    # CPU-time limit equals its budget, so scale the budget with the core count.
+    _budget=$(( (_secs + 20) * _ncpu )); [ "$_budget" -le 300 ] || _budget=300
+    export GOGC="$CORE_GOGC" GOMEMLIMIT="$CORE_GOMEMLIMIT"
+    _r=""
+    if _probe_start "$_budget" 512; then
+        _r="$(_bench_run "$_secs" "$_url" "${_proxy_scheme}://127.0.0.1:${_port}" "$_pid")" || _r=""
+        _ping_cleanup
+    fi
+    unset GOGC GOMEMLIMIT
+    read -r _out _out_busy _core <<EOF
+${_r:-0 0 0}
+EOF
+    if [ "$_out" = "0.0" ] || [ "$_out" = 0 ]; then c_red "failed (see 'proxy ping')"; return 1; fi
+    echo "$(c_grn "$_out Mbit/s")   gateway CPU ${_out_busy}%, core CPU ${_core}% of $((_ncpu * 100))%"
+
+    echo
+    echo "Now run a speed test on a LAN device routed through the UniFi VPN client:"
+    echo "  - close to line 2: the WireGuard hop is not the limit; the outbound is."
+    echo "  - well below line 2: the gateway's WireGuard-to-proxy hop is the limit."
+    if [ "$_core" -ge $((_ncpu * 85)) ]; then
+        c_ylw "The core used nearly every CPU: the proxy protocol itself is CPU-bound here."
+    elif [ "$_out_busy" -ge 85 ]; then
+        c_ylw "The gateway's CPUs were saturated (core plus the test downloads), so line 2"
+        c_ylw "is a lower bound for the outbound."
+    elif LC_ALL=C awk -v o="$_out" -v w="$_wan" 'BEGIN { exit !(o < w * 0.6) }'; then
+        c_ylw "The core had CPU to spare, so the outbound is limited by the route, the server,"
+        c_ylw "or its transport (gRPC, for example, carries every connection over one TCP stream)."
+    fi
 }
 
 # --------------------------------------------------------------------------
@@ -2877,6 +3062,7 @@ Direct commands (quick ops / scripting):
   proxy restart      Restart the service
   proxy status       Show engine / server / listener status
   proxy ping [mode]  Test via get|head|tcp|icmp (default from settings)
+  proxy bench [s] [url]  Throughput: WAN alone vs. the outbound alone (no WireGuard)
   proxy logs [args]  Tail service logs (passes args to journalctl)
   proxy update       Update cores/assets with runtime rollback
   proxy geo-update   Update geo files with checksum + rollback
@@ -2893,7 +3079,7 @@ EOF
 cmd="${1:-}"
 if [ $# -ge 1 ]; then shift; fi
 case "$cmd" in
-    ""|status|logs|ping|-h|--help|help|_fw-lock|_fw-unlock) : ;;
+    ""|status|logs|ping|bench|-h|--help|help|_fw-lock|_fw-unlock) : ;;
     *) need_root; acquire_lock; recover_transaction ;;
 esac
 load_settings
@@ -2908,6 +3094,7 @@ case "$cmd" in
     status)       cmd_status ;;
     logs)         cmd_logs logs "$@" ;;
     ping)         cmd_ping "${1:-}" ;;
+    bench)        cmd_bench "$@" ;;
     update)       cmd_update ;;
     geo-update)   cmd_geo_update ;;
     -h|--help|help) usage ;;
