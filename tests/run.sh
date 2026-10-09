@@ -1531,9 +1531,14 @@ PersistentKeepalive = 1-5
         [sys.executable, src + "/mkawg.py", "build", "--file", work + "/client.conf",
          "--socks-port", "1", "--loglevel", "debug"]))
     # The server mirrors the client's obfuscation through the same generator.
+    # Both peers initiate (the hub must learn both addresses). With equal 1 s
+    # rekey timers their initiations can keep crossing, each side discarding
+    # its own pending handshake, for longer than the deadline; a slower server
+    # timer lets the client's next retry land unopposed.
     server = json.loads(json.dumps(client))
     server["endpoints"][0].update(
         private_key=spriv, address=["10.66.0.1/32"], header_protection_key=server_key,
+        rekey_timeout="4",
         peers=[{"address": "127.0.0.1", "port": port, "public_key": cpub,
                 "allowed_ips": ["10.66.0.2/32"], "persistent_keepalive_interval": 1}])
     for name, config in (("client", client), ("server", server)):
