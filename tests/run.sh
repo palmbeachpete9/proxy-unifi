@@ -83,6 +83,20 @@ bench_lib() {
     } > "$1/bench-lib.sh"
 }
 
+# fn_src <function>...: print those functions from the CLI, one-liners included.
+fn_src() {
+    for _fn in "$@"; do
+        awk -v name="$_fn" '
+            !inside && index($0, name "() {") == 1 {
+                print
+                if ($0 !~ /}[[:space:]]*$/) inside = 1
+                next
+            }
+            inside { print; if ($0 ~ /^}/) inside = 0 }
+        ' "$SRC/proxy-unifi"
+    done
+}
+
 # -------------------------------------------------------------------------
 # tier 1: static analysis
 # -------------------------------------------------------------------------
@@ -94,12 +108,13 @@ static_tests() {
     if have shellcheck; then
         _sc_log="$(mktemp)"
         shellcheck -s sh "$SRC/proxy-unifi" "$SRC/on_boot.sh" "$ROOT/install.sh" \
-            "$ROOT/tests/run.sh" "$ROOT/tests/lifecycle.sh" > "$_sc_log" 2>&1 &
+            "$ROOT/tests/run.sh" "$ROOT/tests/lifecycle.sh" "$ROOT/tests/ingress-lab.sh" > "$_sc_log" 2>&1 &
         _sc_pid=$!
     else printf '  skip shellcheck (not installed)\n'; fi
     if have dash; then
         _d=0
-        for f in "$SRC/proxy-unifi" "$SRC/on_boot.sh" "$ROOT/install.sh" "$ROOT/tests/lifecycle.sh"; do
+        for f in "$SRC/proxy-unifi" "$SRC/on_boot.sh" "$ROOT/install.sh" "$ROOT/tests/lifecycle.sh" \
+                 "$ROOT/tests/ingress-lab.sh"; do
             dash -n "$f" 2>/dev/null || _d=1
         done
         if [ "$_d" = 0 ]; then ok "dash -n"; else bad "dash -n"; fi
@@ -391,8 +406,9 @@ SH
     _ud="$(mktemp -d)"
     cat > "$_ud/h.sh" <<'SH'
     SBIN=/b/sing-box; ABIN=/b/amnezia-box; XRAY=/b/xray; CONFIG=/c/config.json; POOL_DIR=/c/pool
-BIN_DIR=/b; ROOT=/r; SERVICE_FILE="$WORK/unit"
+BIN_DIR=/b; ROOT=/r; SERVICE_FILE="$WORK/unit"; INGRESS_OVERLAY=/run/x/ingress.json
 current_engine() { echo "$ENG"; }
+ingress_wanted() { [ "${KERNEL:-0}" = 1 ]; }
 prepare_service_permissions() { :; }
 systemctl() { :; }
 atomic_write() { cat > "$1"; }
@@ -404,18 +420,41 @@ SH
         awk '/^write_service\(\) \{/,/^}/' "$SRC/proxy-unifi"
         echo 'write_service'
     } >> "$_ud/h.sh"
+    # Every start first removes a kernel ingress left by an Xray core.
+    _pre_down='ExecStartPre=-+/b/proxy-unifi _ingress-down'
     _fw_ok=1
     ENG=singbox  WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
-    grep -q '^ExecStartPre=+/b/proxy-unifi _fw-lock$'  "$_ud/unit" || _fw_ok=0
+    [ "$(grep '^ExecStartPre=' "$_ud/unit")" = "$_pre_down
+ExecStartPre=+/b/proxy-unifi _fw-lock" ] || _fw_ok=0
     grep -q '^ExecStopPost=-+/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
     ENG=awg      WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
     grep -q '^ExecStart=/b/amnezia-box run -c /c/config.json$' "$_ud/unit" || _fw_ok=0
-    grep -q '^ExecStartPre=+/b/proxy-unifi _fw-lock$' "$_ud/unit" || _fw_ok=0
+    [ "$(grep '^ExecStartPre=' "$_ud/unit")" = "$_pre_down
+ExecStartPre=+/b/proxy-unifi _fw-lock" ] || _fw_ok=0
     grep -q '^ExecStopPost=-+/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
     ENG=xray     WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
-    grep -q '^ExecStartPre=-+/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
+    [ "$(grep '^ExecStartPre=' "$_ud/unit")" = "$_pre_down" ] || _fw_ok=0
     grep -q '_fw-lock' "$_ud/unit" && _fw_ok=0          # xray must NOT lock a port
     [ "$_fw_ok" = 1 ] && ok "singbox/AWG WG port firewalled (unit)" || bad "singbox/AWG WG port firewalled (unit)"
+    # Kernel ingress: built before the core, loaded last, torn down after it;
+    # only then may the core bind transparent sockets.
+    _ki_ok=1
+    grep -q '^ExecStart=/b/xray run -config /c/config.json$' "$_ud/unit" || _ki_ok=0
+    grep -q '^CapabilityBoundingSet=$' "$_ud/unit" || _ki_ok=0
+    grep -q '^AmbientCapabilities=$' "$_ud/unit" || _ki_ok=0
+    ENG=xraypool WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
+    grep -q '^ExecStart=/b/xray run -confdir /c/pool$' "$_ud/unit" || _ki_ok=0
+    KERNEL=1 ENG=xray WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
+    [ "$(grep '^ExecStartPre=' "$_ud/unit")" = 'ExecStartPre=+/b/proxy-unifi _ingress-up' ] || _ki_ok=0
+    grep -q '^ExecStopPost=-+/b/proxy-unifi _ingress-down$' "$_ud/unit" || _ki_ok=0
+    grep -q '^ExecStart=/b/xray run -config /c/config.json -config /run/x/ingress.json$' "$_ud/unit" || _ki_ok=0
+    grep -q '^CapabilityBoundingSet=CAP_NET_RAW$' "$_ud/unit" || _ki_ok=0
+    grep -q '^AmbientCapabilities=CAP_NET_RAW$' "$_ud/unit" || _ki_ok=0
+    grep -q '^NoNewPrivileges=true$' "$_ud/unit" || _ki_ok=0
+    KERNEL=1 ENG=xraypool WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
+    grep -q '^ExecStart=/b/xray run -config /c/pool/01-provider.json -config /c/pool/99-overlay.json -config /run/x/ingress.json$' "$_ud/unit" || _ki_ok=0
+    [ "$_ki_ok" = 1 ] && ok "kernel WireGuard ingress wired into the unit" \
+        || bad "kernel WireGuard ingress wired into the unit"
     # The core's parallelism comes from GOMAXPROCS (no quota, default weight in
     # its own cgroup), and its Go heap stays below the unit's memory ceiling.
     _cpu_ok=1
@@ -474,6 +513,129 @@ SH
     if WORK="$_fd" sh "$_fd/fw.sh"; then ok "firewall guard owns rules and fails closed on IPv6"
     else bad "firewall guard owns rules and fails closed on IPv6"; fi
     rm -rf "$_fd"
+
+    # Kernel ingress only for Xray cores on loopback with single IPv4 tunnel
+    # addresses and the tools present.
+    _kd="$(mktemp -d)"
+    {
+        cat <<'SH'
+have() { case "$1" in ip|wg|iptables) [ "${NO_TOOLS:-0}" = 0 ] ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+current_engine() { echo "$ENG"; }
+SH
+        fn_src _ingress_ipv4 ingress_supported ingress_configured ingress_wanted
+        cat <<'SH'
+for good in 10.7.0.1/32 10.7.0.1 192.168.1.255; do _ingress_ipv4 "$good" >/dev/null || exit 1; done
+[ "$(_ingress_ipv4 10.7.0.1/32)" = 10.7.0.1 ] || exit 1
+for bad in "" 10.7.0.1/24 10.7.0 10.7.0.1.5 10.7.0.256 fd00::1 10.7.0.1,10.7.0.2 .1.2.3 1..2.3; do
+    if _ingress_ipv4 "$bad" >/dev/null; then echo "accepted '$bad'"; exit 1; fi
+done
+INGRESS=kernel; WG_LISTEN=127.0.0.1; XRAY_ADDR=10.7.0.1/32; UNIFI_ADDR=10.7.0.2/32
+for ENG in xray xraypool; do ingress_wanted || exit 1; done
+for ENG in singbox awg; do if ingress_wanted; then exit 1; fi; done
+ENG=xray
+if INGRESS=userspace ingress_wanted; then exit 1; fi
+if WG_LISTEN=0.0.0.0 ingress_wanted; then exit 1; fi
+if XRAY_ADDR=10.7.0.1/32,fd00::1/128 ingress_wanted; then exit 1; fi
+if NO_TOOLS=1 ingress_wanted; then exit 1; fi
+exit 0
+SH
+    } > "$_kd/decide.sh"
+    if sh "$_kd/decide.sh"; then ok "kernel ingress only where it applies"
+    else bad "kernel ingress only where it applies"; fi
+
+    # Health: in kernel mode the kernel holds the WireGuard port and the core
+    # must own the transparent listener; otherwise the core owns the port.
+    {
+        cat <<'SH'
+WG_PORT=51821; INGRESS_PORT=41820; INGRESS_ACTIVE="$WORK/active"; SERVICE_NAME=proxy-unifi
+have() { return 0; }
+systemctl() { printf 'ActiveState=active\nMainPID=%s\n' "$$"; }
+ss() {
+    echo 'State Recv-Q Send-Q Local Address:Port Peer Address:Port Process'
+    case "$1" in
+        -lun|-lunp) [ -z "${UDP:-}" ] || echo "UNCONN 0 0 0.0.0.0:51821 0.0.0.0:* $UDP" ;;
+        -ltn|-ltnp) [ -z "${TCP:-}" ] || echo "LISTEN 0 4096 169.254.77.1:41820 0.0.0.0:* $TCP" ;;
+    esac
+}
+SH
+        fn_src ingress_active _socket_listening socket_listening tcp_socket_listening \
+            socket_owned_by_pid service_healthy
+        cat <<'SH'
+own="users:((\"xray\",pid=$$,fd=3))"; other='users:(("xray",pid=1,fd=3))'
+UDP="$own" service_healthy || exit 1
+if UDP="$other" service_healthy; then exit 1; fi
+if UDP=" " TCP="$own" service_healthy; then exit 1; fi
+: > "$INGRESS_ACTIVE"
+UDP=" " TCP="$own" service_healthy || exit 1
+if UDP=" " TCP="$other" service_healthy; then exit 1; fi
+if TCP="$own" service_healthy; then exit 1; fi
+exit 0
+SH
+    } > "$_kd/health.sh"
+    if WORK="$_kd" sh "$_kd/health.sh"; then ok "health check follows the ingress mode"
+    else bad "health check follows the ingress mode"; fi
+    rm -f "$_kd/active"
+
+    # The guard timer leaves a starting or stopping unit to its own hooks,
+    # repairs the kernel path while the core runs, and removes it after.
+    {
+        cat <<'SH'
+SERVICE_NAME=proxy-unifi; INGRESS_ACTIVE="$WORK/active"; INGRESS_FAILS="$WORK/fails"
+log() { echo "$*" >> "$WORK/calls"; }
+systemctl() { case "$1" in show) echo "ActiveState=$STATE" ;; restart) log restart ;; esac; }
+ip() { [ "${LINKS:-1}" = 1 ]; }
+current_engine() { echo "$ENG"; }
+fw_lock() { log fw_lock; }
+fw_unlock() { log fw_unlock; }
+ingress_down() { log ingress_down; rm -f "$INGRESS_ACTIVE"; }
+service_healthy() { [ "${HEALTHY:-1}" = 1 ]; }
+_ingress_count_failure() { log count_failure; }
+_ingress_rules_ok() { log rules_ok; [ "${RULES_OK:-1}" = 1 ]; }
+_ingress_rules_add() { log rules_add; }
+SH
+        fn_src ingress_active fw_reconcile
+        cat <<'SH'
+calls() { rm -f "$WORK/calls"; fw_reconcile; { tr '\n' ' ' < "$WORK/calls"; } 2>/dev/null; }
+ENG=xray
+[ "$(STATE=activating calls)" = "" ] || exit 1
+[ "$(STATE=deactivating calls)" = "" ] || exit 1
+[ "$(STATE=active calls)" = "fw_unlock " ] || exit 1
+: > "$INGRESS_ACTIVE"
+[ "$(STATE=activating calls)" = "" ] || exit 1
+echo 2 > "$INGRESS_FAILS"
+[ "$(STATE=active HEALTHY=0 calls)" = "fw_lock rules_ok " ] || exit 1
+[ -f "$INGRESS_FAILS" ] || exit 1      # not healthy: the failures still count
+[ "$(STATE=active calls)" = "fw_lock rules_ok " ] || exit 1
+[ ! -e "$INGRESS_FAILS" ] || exit 1    # seen healthy: the count starts over
+[ "$(STATE=active RULES_OK=0 calls)" = "fw_lock rules_ok rules_add " ] || exit 1
+[ "$(STATE=active LINKS=0 calls)" = "fw_lock count_failure restart " ] || exit 1
+[ "$(STATE=failed calls)" = "ingress_down fw_unlock " ] || exit 1
+ENG=singbox
+[ "$(STATE=active calls)" = "fw_lock " ] || exit 1
+[ "$(STATE=inactive calls)" = "fw_unlock " ] || exit 1
+SH
+    } > "$_kd/reconcile.sh"
+    if WORK="$_kd" sh "$_kd/reconcile.sh"; then ok "guard reconciles by unit state"
+    else bad "guard reconciles by unit state"; fi
+
+    # bench line 3 finds the UniFi client by the peer key it dials.
+    {
+        cat <<'SH'
+WG_DIR="$WORK"
+have() { return 0; }
+SH
+        fn_src unifi_client_if
+        cat <<'SH'
+echo 'OURKEY=' > "$WORK/wg_public.key"
+wg() { printf 'wgsrv1\tROAD=\nwgclt1\tOTHER=\nwgclt2\tOURKEY=\n'; }
+[ "$(unifi_client_if)" = wgclt2 ] || exit 1
+wg() { printf 'wgclt1\tOTHER=\n'; }
+[ -z "$(unifi_client_if)" ] || exit 1
+SH
+    } > "$_kd/client.sh"
+    if WORK="$_kd" sh "$_kd/client.sh"; then ok "bench finds the UniFi client interface"
+    else bad "bench finds the UniFi client interface"; fi
+    rm -rf "$_kd"
 
     if [ -n "$_sc_log" ]; then
         if wait "$_sc_pid"; then ok "shellcheck"
@@ -1657,6 +1819,37 @@ EOF
        && "$XR" run -test -confdir "$_d/pool" >/dev/null 2>&1 \
        && ! grep -q '0\.0\.0\.0' "$_d/pool/01-provider.json"
     then ok "xray balancer pool (-confdir)"; else bad "xray balancer pool (-confdir)"; fi
+    # Kernel ingress: the overlay replaces the WireGuard inbound by tag in a
+    # link config and in a pool, and the userspace (empty) overlay keeps it.
+    {
+        echo 'py() { python3 "$@"; }'
+        echo 'INGRESS_HOST_IP=169.254.77.1; INGRESS_PORT=41820'
+        fn_src ingress_overlay_for
+    } > "$_d/overlay.sh"
+    echo '{}' > "$_d/empty.json"
+    # shellcheck disable=SC2016 # $1-$5 expand inside the child shell.
+    if gx "vless://$UUID@h:443?security=tls&type=grpc&sni=a" \
+       && sh -c '. "$1"; ingress_overlay_for "$2" > "$3" && ingress_overlay_for "$4" > "$5"' sh \
+           "$_d/overlay.sh" "$_d/c.json" "$_d/kernel.json" "$_d/pool/99-overlay.json" "$_d/pool-kernel.json" \
+       && "$XR" run -dump -config "$_d/c.json" -config "$_d/kernel.json" > "$_d/link.dump" 2>/dev/null \
+       && "$XR" run -dump -config "$_d/pool/01-provider.json" -config "$_d/pool/99-overlay.json" \
+           -config "$_d/pool-kernel.json" > "$_d/pool.dump" 2>/dev/null \
+       && "$XR" run -dump -config "$_d/c.json" -config "$_d/empty.json" > "$_d/empty.dump" 2>/dev/null \
+       && python3 - "$_d" <<'PY'
+import json, os, sys
+def inbounds(name):
+    return json.load(open(os.path.join(sys.argv[1], name)))["inbounds"]
+for name, tag in (("link.dump", "wg-in"), ("pool.dump", "socks")):
+    only, = inbounds(name)
+    assert (only["tag"], only["protocol"]) == (tag, "dokodemo-door"), only
+    assert (only["listen"], only["port"]) == ("169.254.77.1", 41820), only
+    assert only["streamSettings"]["sockopt"]["tproxy"] == "tproxy", only
+    assert only["sniffing"]["enabled"] is True, only
+only, = inbounds("empty.dump")
+assert (only["tag"], only["protocol"]) == ("wg-in", "wireguard"), only
+PY
+    then ok "xray loads the kernel ingress overlay (link and pool)"
+    else bad "xray loads the kernel ingress overlay (link and pool)"; fi
     rm -rf "$_d"
 
     # proxy bench: throughput and the core's CPU through a real SOCKS core that
@@ -1718,6 +1911,32 @@ SH
     if sh -x "$ROOT/tests/lifecycle.sh" "$XR" >"$_d.lifecycle" 2>&1; then ok "sandboxed CLI lifecycle + rollback"
     else bad "sandboxed CLI lifecycle + rollback"; tail -n 20 "$_d.lifecycle"; fi
     rm -f "$_d.lifecycle"
+
+    # Kernel WireGuard ingress end to end changes the host's network, so it
+    # runs only as root, or with sudo where PROXY_UNIFI_LAB=1 allows it (CI).
+    if [ "$(id -u)" = 0 ]; then
+        _lab="$(sh "$ROOT/tests/ingress-lab.sh" "$XR" 2>&1)"; _lab_rc=$?
+    elif [ "${PROXY_UNIFI_LAB:-}" = 1 ] && sudo -n true 2>/dev/null; then
+        _lab="$(sudo -n sh "$ROOT/tests/ingress-lab.sh" "$XR" 2>&1)"; _lab_rc=$?
+    else
+        _lab="INFO needs root (or PROXY_UNIFI_LAB=1 with sudo)"; _lab_rc=77
+    fi
+    if [ "$_lab_rc" = 77 ]; then
+        printf '  skip kernel ingress lab (%s)\n' "$(printf '%s\n' "$_lab" | sed -n 's/^INFO //p' | tail -1)"
+    else
+        _lab_fail=0
+        while IFS= read -r _line; do
+            case "$_line" in
+                "PASS "*) ok "ingress lab: ${_line#PASS }" ;;
+                "FAIL "*) bad "ingress lab: ${_line#FAIL }"; _lab_fail=1 ;;
+                "INFO "*) printf '  info %s\n' "${_line#INFO }" ;;
+                *) printf '       %s\n' "$_line" ;;
+            esac
+        done <<EOF
+$_lab
+EOF
+        [ "$_lab_rc" = 0 ] || [ "$_lab_fail" = 1 ] || bad "ingress lab exited with status $_lab_rc"
+    fi
 }
 
 # -------------------------------------------------------------------------
