@@ -2256,13 +2256,16 @@ cmd_bench() {   # [seconds] [url]
     need_root
     have curl || fatal "curl is required for the benchmark"
     _require_outbound || return 1
-    _secs="${1:-10}"; _url="${2:-$BENCH_URL}"
-    { _uint "$_secs" && [ "$_secs" -ge 5 ] && [ "$_secs" -le 60 ]; } \
-        || fatal "bench duration must be 5-60 seconds"
-    case "$_url" in http://*|https://*) : ;; *) fatal "bench URL must start with http:// or https://" ;; esac
-    case "$_url" in *[[:space:]]*|*[[:cntrl:]]*) fatal "bench URL must not contain spaces or control characters" ;; esac
     _ncpu="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
     { _uint "$_ncpu" && [ "$_ncpu" -ge 1 ]; } || _ncpu=1
+    # safeexec allows the probe core at most 300 CPU-seconds, which a core
+    # busy on every CPU spends ncpu times faster than wall time.
+    _max=$((300 / _ncpu - 10)); [ "$_max" -le 60 ] || _max=60; [ "$_max" -ge 5 ] || _max=5
+    _secs="${1:-10}"; _url="${2:-$BENCH_URL}"
+    { _uint "$_secs" && [ "$_secs" -ge 5 ] && [ "$_secs" -le "$_max" ]; } \
+        || fatal "bench duration must be 5-$_max seconds on this gateway"
+    case "$_url" in http://*|https://*) : ;; *) fatal "bench URL must start with http:// or https://" ;; esac
+    case "$_url" in *[[:space:]]*|*[[:cntrl:]]*) fatal "bench URL must not contain spaces or control characters" ;; esac
     _quota="$(sed -n 's/^CPUQuota=//p' "$SERVICE_FILE" 2>/dev/null)"
 
     c_bold "proxy-unifi bench: ${_secs}s per test, ${BENCH_STREAMS} parallel downloads"
