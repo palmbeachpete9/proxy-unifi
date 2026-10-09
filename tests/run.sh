@@ -396,9 +396,11 @@ current_engine() { echo "$ENG"; }
 prepare_service_permissions() { :; }
 systemctl() { :; }
 atomic_write() { cat > "$1"; }
+cpu_count() { echo "${NCPU:-4}"; }
 SH
     {
         sed -n '/^CORE_GO[A-Z]*=/p' "$SRC/proxy-unifi"
+        sed -n '/^core_gomaxprocs() {/,/^}/p' "$SRC/proxy-unifi"
         awk '/^write_service\(\) \{/,/^}/' "$SRC/proxy-unifi"
         echo 'write_service'
     } >> "$_ud/h.sh"
@@ -414,16 +416,25 @@ SH
     grep -q '^ExecStartPre=-+/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
     grep -q '_fw-lock' "$_ud/unit" && _fw_ok=0          # xray must NOT lock a port
     [ "$_fw_ok" = 1 ] && ok "singbox/AWG WG port firewalled (unit)" || bad "singbox/AWG WG port firewalled (unit)"
-    # The core may use every CPU (a hard quota also caps Go's GOMAXPROCS), and
-    # its GC tuning stays below the unit's memory ceiling.
+    # The core's parallelism comes from GOMAXPROCS (no quota, default weight in
+    # its own cgroup), and its Go heap stays below the unit's memory ceiling.
     _cpu_ok=1
     grep -q '^CPUQuota=' "$_ud/unit" && _cpu_ok=0
-    grep -q '^CPUWeight=50$' "$_ud/unit" || _cpu_ok=0
+    grep -q '^CPUWeight=' "$_ud/unit" && _cpu_ok=0
+    grep -q '^Environment=GOGC=' "$_ud/unit" && _cpu_ok=0
+    grep -q '^CPUAccounting=yes$' "$_ud/unit" || _cpu_ok=0
+    grep -q '^Environment=GOMAXPROCS=3$' "$_ud/unit" || _cpu_ok=0
     grep -q '^MemoryMax=512M$' "$_ud/unit" || _cpu_ok=0
-    grep -q '^Environment=GOGC=200$' "$_ud/unit" || _cpu_ok=0
     grep -q '^Environment=GOMEMLIMIT=384MiB$' "$_ud/unit" || _cpu_ok=0
-    [ "$_cpu_ok" = 1 ] && ok "service unit has no CPU cap and tuned Go GC" \
-        || bad "service unit has no CPU cap and tuned Go GC"
+    # shellcheck disable=SC2016 # $NCPU and $c expand in the generated script
+    {
+        echo 'cpu_count() { echo "$NCPU"; }'
+        sed -n '/^core_gomaxprocs() {/,/^}/p' "$SRC/proxy-unifi"
+        echo 'for c in 1:1 2:2 3:2 4:3 8:7; do [ "$(NCPU=${c%:*} core_gomaxprocs)" = "${c#*:}" ] || exit 1; done'
+    } > "$_ud/procs.sh"
+    sh "$_ud/procs.sh" || _cpu_ok=0
+    [ "$_cpu_ok" = 1 ] && ok "service unit sizes Go threads to leave a CPU free" \
+        || bad "service unit sizes Go threads to leave a CPU free"
     rm -rf "$_ud"
 
     # Exercise firewall ownership and IPv6 fail-closed behavior against a stateful
