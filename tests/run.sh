@@ -1682,6 +1682,7 @@ err() { echo "$*" >&2; }
 current_engine() { echo xray; }
 ensure_run_dir() { :; }
 ensure_service_user() { SERVICE_USER="$(id -un)"; SERVICE_GROUP="$(id -gn)"; }
+chown() { :; }   # the CLI hands the run dir to root; CI does not run as root
 SH
         sed -n '/^py_bin() {/,/^}/p; /^_free_port() {/,/^}/p; /^_ping_cleanup() {/,/^}/p' "$SRC/proxy-unifi"
         sed -n '/^_socket_listening() {/,/^tcp_socket_listening()/p; /^_probe_start() {/,/^}/p' "$SRC/proxy-unifi"
