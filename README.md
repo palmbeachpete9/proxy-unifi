@@ -65,6 +65,34 @@ everything through the selected proxy or AWG outbound. Proxy-link modes need no
 remote WireGuard server; AWG mode connects to the remote AmneziaWG peer in the
 selected profile.
 
+## Kernel WireGuard ingress (Xray)
+
+For xray-core links and JSON profiles, the gateway's kernel terminates the UniFi
+VPN Client's WireGuard by default; Xray no longer does it. Xray's own WireGuard
+decrypts in userspace, one packet at a time: on a UCG-Ultra that held the tunnel
+near 35 Mbit/s while the proxy outbound alone reached ~350 Mbit/s. On the same
+gateway, the kernel path measured ~180 Mbit/s at half the CPU.
+
+The kernel WireGuard device uses the same port, keys and MTU, so nothing changes
+in the UniFi VPN Client. It lives in a private network namespace; decrypted
+traffic leaves through a veth pair, and TPROXY hands every TCP and UDP connection
+to Xray, which routes it exactly as before (same inbound tag and sniffing).
+
+- **Fallback:** if any setup step fails, or the core fails three times in a row
+  on this path, the service runs Xray's own WireGuard instead. `proxy status`
+  shows the path in use and why.
+- **Switch:** `proxy` → WireGuard settings → Ingress (`kernel` or `userspace`).
+- **Firewall rewrites:** if the UniFi controller rewrites the firewall or routing
+  rules, the guard timer restores them within 30 seconds.
+- **UDP replies from ports the gateway listens on:** Xray answers transparent UDP
+  from the remote address and port, which fails for ports the gateway itself holds
+  (UniFi's STUN on 3478, for example). Those replies are lost; `proxy status`
+  lists the ports. TCP is unaffected.
+- **Privilege:** only in this mode, the core gets one capability, `CAP_NET_RAW`,
+  which transparent sockets require.
+- **Measure:** the third line of `proxy bench` tests the full tunnel through the
+  gateway's own VPN Client.
+
 ## Compatibility
 
 This package is compatible with UniFi OS 4.x or newer and requires the gateway's
@@ -207,7 +235,7 @@ Run `proxy` for the interactive menu, or use the direct commands:
 | `proxy` | Main menu |
 | `proxy status` | Engine, configured server, and listener status |
 | `proxy ping [...]` | Test the link — `...` = `get`·`head`·`tcp`·`icmp` (default `get`) |
-| `proxy bench [s] [url]` | Throughput of the WAN alone, then of the active outbound alone (no WireGuard), with gateway and core CPU use; compare with a speed test through the VPN Client |
+| `proxy bench [s] [url]` | Throughput of the WAN alone, of the active outbound alone (no WireGuard), and of the full tunnel through the gateway's VPN Client, with gateway and core CPU use |
 | `proxy start` · `stop` · `restart` | Service controls |
 | `proxy logs [args]` | Service logs (passed to `journalctl`) |
 | `proxy help` | Show help |
@@ -215,7 +243,7 @@ Run `proxy` for the interactive menu, or use the direct commands:
 | `proxy geo-update` | Updates the independent routing geo database |
 
 The menu covers: single links, subscriptions, AmneziaWG profiles, Xray JSON profiles, UniFi WireGuard config,
-regenerate keys, change port/MTU/DNS, ping test + protocol, enable/disable
+regenerate keys, change port/MTU/DNS/ingress, ping test + protocol, enable/disable
 autostart, update cores, update geo files, and uninstall.
 
 ## Notes

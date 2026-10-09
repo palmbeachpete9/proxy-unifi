@@ -26,7 +26,9 @@ cp "$XRAY_SRC" "$T/root/bin/xray"
 chmod 0755 "$T/root/bin"/*
 
 # Rewrite only fixed installation paths in the throwaway CLI and inject
-# non-root test identity helpers immediately before dispatch. Service polling
+# non-root test identity helpers immediately before dispatch (and the tools
+# kernel WireGuard ingress needs, so its unit rendering does not depend on this
+# host; the mocked systemd never runs the unit's hooks). Service polling
 # runs against the mocked systemctl, so its stability window (8 consecutive
 # healthy checks) keeps its logic but not its 2-second real-time cost.
 sed \
@@ -39,11 +41,13 @@ sed \
     -e "s|^GUARD_TIMER_FILE=.*|GUARD_TIMER_FILE=\"$T/proxy-unifi-guard.timer\"|" \
     -e "s|^ONBOOT_DST=.*|ONBOOT_DST=\"$T/on_boot.sh\"|" \
     -e "s|^PROXY_LINK=\"/usr/bin/proxy\"|PROXY_LINK=\"$T/proxy\"|" \
+    -e "s|^INGRESS_RUN=.*|INGRESS_RUN=\"$T/run\"|" \
     "$REPO/src/proxy-unifi" > "$T/root/bin/proxy-base"
 awk -v user="$(id -un)" -v group="$(id -gn)" '
     /^# Dispatch$/ && !done {
         print "ensure_service_user() { SERVICE_USER=\"" user "\"; SERVICE_GROUP=\"" group "\"; }"
         print "need_root() { :; }"
+        print "ingress_supported() { return 0; }"
         done=1
     }
     { print }
@@ -211,6 +215,12 @@ printf '1\n%s\n\n0\n' "$LINK" | menu_input >/dev/null
 [ ! -e "$T/root/.lock" ] || exit 1
 CONFIG_HASH="$(hash_file "$T/root/etc/config.json")"
 LINK_HASH="$(hash_file "$T/root/etc/link.txt")"
+# Xray runs behind kernel WireGuard by default: the unit builds the path before
+# the core starts and the core loads its overlay last.
+grep -q '^ExecStartPre=+.*/proxy-unifi _ingress-up$' "$T/proxy-unifi.service"
+grep -q '^ExecStopPost=-+.*/proxy-unifi _ingress-down$' "$T/proxy-unifi.service"
+grep -q "^ExecStart=.*/xray run -config .*/config.json -config $T/run/ingress.json\$" "$T/proxy-unifi.service"
+grep -q '^AmbientCapabilities=CAP_NET_RAW$' "$T/proxy-unifi.service"
 
 # A parser failure after txn_begin must immediately restore the prior generation.
 printf '1\n%s\n\n0\n' "${LINK%#test}&unknownSemantic=x#bad" | menu_input >/dev/null 2>&1
@@ -224,6 +234,21 @@ run_cli stop >/dev/null
 printf '8\n1\n51822\n\n0\n' | menu_input >/dev/null
 if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
 grep -q '"port": 51822' "$T/root/etc/config.json"
+
+# The ingress setting switches the unit between both paths and rejects others.
+printf '8\n4\nuserspace\n\n0\n' | menu_input >/dev/null
+grep -q '^INGRESS="userspace"$' "$T/root/etc/settings.env"
+grep -q '^ExecStart=.*/xray run -config [^ ]*/config.json$' "$T/proxy-unifi.service"
+grep -q '^ExecStartPre=-+.*/proxy-unifi _ingress-down$' "$T/proxy-unifi.service"
+grep -q '^AmbientCapabilities=$' "$T/proxy-unifi.service"
+run_cli status | grep -q '^ingress:   userspace (Xray WireGuard, as configured)$'
+printf '8\n4\nfast\n\n0\n' | menu_input > "$T/ingress.out" 2>&1
+grep -q 'ingress must be kernel|userspace' "$T/ingress.out"
+grep -q '^INGRESS="userspace"$' "$T/root/etc/settings.env"
+printf '8\n4\nkernel\n\n0\n' | menu_input >/dev/null
+grep -q '^INGRESS="kernel"$' "$T/root/etc/settings.env"
+grep -q '^ExecStartPre=+.*/proxy-unifi _ingress-up$' "$T/proxy-unifi.service"
+if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
 
 # Standards-compliant SS2022 switches to the existing sing-box core, preserves
 # the UniFi-facing WG identity, and rolls back atomically on an invalid key.
@@ -275,6 +300,8 @@ cat > "$T/profile.json" <<'EOF'
 EOF
 printf '4\n%s\n\n0\n' "$T/profile.json" | menu_input >/dev/null
 [ "$(cat "$T/root/etc/engine")" = xraypool ]
+grep -q "^ExecStart=.*/xray run -config .*/pool/01-provider.json -config .*/pool/99-overlay.json -config $T/run/ingress.json\$" \
+    "$T/proxy-unifi.service"
 OLD_KEY="$(cat "$T/root/etc/wg/wg_private.key")"
 OLD_OVERLAY="$(hash_file "$T/root/etc/pool/99-overlay.json")"
 printf '7\ny\n\n0\n' | menu_input >/dev/null
