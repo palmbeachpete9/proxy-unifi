@@ -26,8 +26,11 @@ cp "$XRAY_SRC" "$T/root/bin/xray"
 chmod 0755 "$T/root/bin"/*
 
 # Rewrite only fixed installation paths in the throwaway CLI and inject
-# non-root test identity helpers immediately before dispatch.
+# non-root test identity helpers immediately before dispatch. Service polling
+# runs against the mocked systemctl, so its stability window (8 consecutive
+# healthy checks) keeps its logic but not its 2-second real-time cost.
 sed \
+    -e "s|sleep 0\.25 2>/dev/null|sleep 0.01 2>/dev/null|" \
     -e "s|^ROOT=\"/data/proxy-unifi\"|ROOT=\"$T/root\"|" \
     -e "s|^SERVICE_FILE=.*|SERVICE_FILE=\"$T/proxy-unifi.service\"|" \
     -e "s|^REFRESH_SERVICE_FILE=.*|REFRESH_SERVICE_FILE=\"$T/proxy-unifi-refresh.service\"|" \
