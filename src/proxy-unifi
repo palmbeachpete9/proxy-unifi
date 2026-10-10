@@ -94,6 +94,7 @@ INGRESS_TABLE="7707"
 INGRESS_PREF="10"
 INGRESS_TP_CHAIN="PROXY_UNIFI_TP"
 INGRESS_IN_CHAIN="PROXY_UNIFI_IN"
+HOST_MOUNT_NS="/proc/1/ns/mnt"                  # the mount namespace named netns live in
 
 # defaults (overridable via settings.env)
 WG_LISTEN="127.0.0.1"
@@ -1357,11 +1358,13 @@ disable_guard_timer() {
     systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
+_unit_state() {
+    systemctl show -p ActiveState "$SERVICE_NAME" 2>/dev/null | sed -n 's/^ActiveState=//p'
+}
+
 fw_reconcile() {
-    _fr_state="$(systemctl show -p ActiveState "$SERVICE_NAME" 2>/dev/null | sed -n 's/^ActiveState=//p')"
+    _fr_state="$(_unit_state)"
     case "$_fr_state" in
-        # The unit's own start/stop hooks are changing the rules right now.
-        activating|deactivating|reloading|refreshing) return 0 ;;
         active)
             if ingress_active; then
                 fw_lock || return 1
@@ -1380,10 +1383,15 @@ fw_reconcile() {
             else
                 fw_unlock
             fi ;;
-        *)
+        inactive|failed)
+            # Read again: a start systemd began on its own takes no CLI lock.
+            [ "$(_unit_state)" = "$_fr_state" ] || return 0
             # A core killed without its stop hook leaves the kernel path behind.
             ingress_active && ingress_down
             fw_unlock ;;
+        # Starting or stopping (the unit's own hooks are at work), or unknown
+        # (systemd did not answer): change nothing.
+        *) return 0 ;;
     esac
 }
 
@@ -1434,6 +1442,18 @@ ingress_wanted() {
 }
 
 ingress_active() { [ -f "$INGRESS_ACTIVE" ]; }
+
+# systemd can run even a "+" hook in a mount namespace of its own when the
+# unit sets PrivateTmp= or ProtectSystem=, and nothing mounted there reaches
+# the host. The bind mount that keeps a named network namespace alive would vanish
+# when the hook exits, and the kernel would delete the namespace with its
+# links. The ingress hooks therefore re-run themselves in the host's mount
+# namespace (see the dispatch). Prints host, private, or unknown.
+_mount_ns_state() {
+    _ms_host="$(readlink "$HOST_MOUNT_NS" 2>/dev/null)" || { echo unknown; return 0; }
+    if [ "$(readlink /proc/self/ns/mnt 2>/dev/null)" = "$_ms_host" ]; then echo host
+    else echo private; fi
+}
 
 # A core that keeps failing on the kernel path must not keep the tunnel down:
 # after three failures in a row that were never seen healthy (or one failed
@@ -1575,6 +1595,9 @@ _ingress_wg_link() {
 }
 
 _ingress_setup() {
+    if [ "$(_mount_ns_state)" = private ]; then
+        _ingress_failed="the hook cannot reach the host's mount namespace (nsenter is needed)"; return 1
+    fi
     if ! _is_xa="$(_ingress_ipv4 "$XRAY_ADDR")" || ! _is_ua="$(_ingress_ipv4 "$UNIFI_ADDR")"; then
         _ingress_failed="tunnel addresses must be single IPv4 addresses"; return 1
     fi
@@ -1583,6 +1606,9 @@ _ingress_setup() {
     fi
     # The kernel's socket binds every address: admit only loopback before it exists.
     fw_lock >/dev/null 2>&1 || { _ingress_failed="could not install the WireGuard port guard"; return 1; }
+    # The root-namespace rules come first, so no packet from the veth is ever
+    # forwarded past the proxy (they name links that do not exist yet).
+    _ingress_rules_add || return 1
     _ingress_step ip netns add "$INGRESS_NS" || return 1
     _ingress_wg_link || return 1
     _ingress_step ip link add "$INGRESS_VETH" type veth peer name "$INGRESS_VETH_NS" \
@@ -1610,15 +1636,20 @@ _ingress_setup() {
     _ingress_step ip -n "$INGRESS_NS" route add default dev "$INGRESS_WG" table 100 || return 1
     _ingress_step ip -n "$INGRESS_NS" rule add pref 100 iif "$INGRESS_VETH_NS" lookup 100 || return 1
     _ingress_step ip netns exec "$INGRESS_NS" iptables -t nat -A POSTROUTING \
-        -o "$INGRESS_VETH_NS" -j SNAT --to-source "$INGRESS_NS_IP" || return 1
-    _ingress_rules_add
+        -o "$INGRESS_VETH_NS" -j SNAT --to-source "$INGRESS_NS_IP"
 }
 
 # Root-namespace rules: TPROXY every TCP/UDP packet from the veth to Xray, admit
-# the veth and nothing else to Xray's listener, never forward from the veth (no
-# tunnel traffic may bypass the proxy), and deliver the veth's traffic locally.
+# from the veth only what TPROXY handed to Xray's transparent sockets (where the
+# kernel has the socket match; otherwise the veth as a whole), keep Xray's
+# listener off every other interface, never forward from the veth (no tunnel
+# traffic may bypass the proxy), and deliver the veth's traffic locally.
 _ingress_rules_ok() {
     _ir_tp="-j TPROXY --on-ip $INGRESS_HOST_IP --on-port $INGRESS_PORT"
+    if iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -m socket --transparent -j ACCEPT 2>/dev/null; then
+        iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p tcp -j DROP 2>/dev/null \
+            && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p udp -j DROP 2>/dev/null || return 1
+    fi
     # shellcheck disable=SC2086 # _ir_tp is a fixed list of words
     iptables -t mangle -C PREROUTING -i "$INGRESS_VETH" -j "$INGRESS_TP_CHAIN" 2>/dev/null \
         && iptables -t mangle -C "$INGRESS_TP_CHAIN" -p tcp $_ir_tp 2>/dev/null \
@@ -1645,6 +1676,14 @@ _ingress_rules_add() {
             -j "$INGRESS_TP_CHAIN" || return 1
     iptables -N "$INGRESS_IN_CHAIN" 2>/dev/null \
         || _ingress_step iptables -F "$INGRESS_IN_CHAIN" || return 1
+    # Should the TPROXY rule ever be lost, the veth's TCP and UDP would reach
+    # every service the gateway runs on a wildcard address (everything from the
+    # veth is delivered locally); with the socket match, only connections on
+    # Xray's transparent sockets get in, and ICMP (errors included) still does.
+    if iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -m socket --transparent -j ACCEPT 2>/dev/null; then
+        _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p tcp -j DROP || return 1
+        _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p udp -j DROP || return 1
+    fi
     _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -j ACCEPT || return 1
     _ingress_step iptables -A "$INGRESS_IN_CHAIN" -p tcp --dport "$INGRESS_PORT" -j DROP || return 1
     _ingress_step iptables -A "$INGRESS_IN_CHAIN" -p udp --dport "$INGRESS_PORT" -j DROP || return 1
@@ -1676,17 +1715,18 @@ _ingress_rules_del() {
     return 0
 }
 
-# Idempotent: removes every part of the kernel path that exists. Deleting the
-# WireGuard device first closes its UDP socket before this returns (a namespace
-# is torn down asynchronously), so the port is free for the next start.
+# Idempotent: removes every part of the kernel path that exists. The links go
+# first, so no packet leaves the veth once its rules are gone, and deleting the
+# WireGuard device closes its UDP socket before this returns (a namespace is
+# torn down asynchronously), so the port is free for the next start.
 ingress_down() {
-    _ingress_rules_del
     if have ip; then
+        ip link del "$INGRESS_VETH" 2>/dev/null || true
         ip -n "$INGRESS_NS" link del "$INGRESS_WG" 2>/dev/null || true
         ip link del "$INGRESS_WG" 2>/dev/null || true
-        ip link del "$INGRESS_VETH" 2>/dev/null || true
         ip netns del "$INGRESS_NS" 2>/dev/null || true
     fi
+    _ingress_rules_del
     rm -f "$INGRESS_ACTIVE" "$INGRESS_OVERLAY"
     return 0
 }
@@ -3697,7 +3737,14 @@ case "$cmd" in
     sub-refresh-auto) _AUTO_REFRESH=1 sub_refresh ;;
     _fw-lock)        fw_lock ;;
     _fw-unlock)      fw_unlock ;;
-    _ingress-up)     need_root; ingress_up ;;
-    _ingress-down)   need_root; ingress_note_exit; ingress_down; fw_unlock ;;
+    _ingress-up|_ingress-down)
+        need_root
+        # Outside the host's mount namespace (systemd's sandbox), run again in it.
+        if [ "$(_mount_ns_state)" = private ] && [ -z "${_PU_HOST_MOUNTS:-}" ] && have nsenter \
+            && nsenter --mount="$HOST_MOUNT_NS" -- true 2>/dev/null; then
+            _PU_HOST_MOUNTS=1 exec nsenter --mount="$HOST_MOUNT_NS" -- "$0" "$cmd"
+        fi
+        if [ "$cmd" = _ingress-up ]; then ingress_up
+        else ingress_note_exit; ingress_down; fw_unlock; fi ;;
     *) err "unknown command: $cmd"; echo; usage; exit 1 ;;
 esac

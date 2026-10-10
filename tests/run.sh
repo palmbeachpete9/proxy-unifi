@@ -736,7 +736,7 @@ _ingress_count_failure() { log count_failure; }
 _ingress_rules_ok() { log rules_ok; [ "${RULES_OK:-1}" = 1 ]; }
 _ingress_rules_add() { log rules_add; }
 SH
-        fn_src ingress_active fw_reconcile
+        fn_src ingress_active _unit_state fw_reconcile
         cat <<'SH'
 calls() { rm -f "$WORK/calls"; fw_reconcile; { tr '\n' ' ' < "$WORK/calls"; } 2>/dev/null; }
 ENG=xray
@@ -752,6 +752,8 @@ echo 2 > "$INGRESS_FAILS"
 [ ! -e "$INGRESS_FAILS" ] || exit 1    # seen healthy: the count starts over
 [ "$(STATE=active RULES_OK=0 calls)" = "fw_lock rules_ok rules_add " ] || exit 1
 [ "$(STATE=active LINKS=0 calls)" = "fw_lock count_failure restart " ] || exit 1
+[ "$(STATE= calls)" = "" ] || exit 1   # systemd did not answer: change nothing
+[ -f "$INGRESS_ACTIVE" ] || exit 1
 [ "$(STATE=failed calls)" = "ingress_down fw_unlock " ] || exit 1
 ENG=singbox
 [ "$(STATE=active calls)" = "fw_lock " ] || exit 1

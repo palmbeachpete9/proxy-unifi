@@ -74,6 +74,7 @@ sed \
     -e "s|^INGRESS_PREF=.*|INGRESS_PREF=\"11\"|" \
     -e "s|^INGRESS_TP_CHAIN=.*|INGRESS_TP_CHAIN=\"PU_LAB_TP\"|" \
     -e "s|^INGRESS_IN_CHAIN=.*|INGRESS_IN_CHAIN=\"PU_LAB_IN\"|" \
+    -e "s|^HOST_MOUNT_NS=.*|HOST_MOUNT_NS=\"/proc/$$/ns/mnt\"|" \
     -e "s|^FW_CHAIN=.*|FW_CHAIN=\"PU_LAB_WG\"|" \
     "$REPO/src/proxy-unifi" > "$T/cli"
 # Without kernel WireGuard, a veth pair into the client namespace is the tunnel.
@@ -112,6 +113,9 @@ esac
 SH
 chmod 755 "$T/mock/systemctl"
 cli() { PATH="$T/mock:$PATH" "$T/root/bin/proxy-unifi" "$@"; }
+# systemd runs the unit's hooks in a mount namespace of their own (PrivateTmp=,
+# ProtectSystem=); mounts made there never reach the host.
+hook() { unshare --mount --propagation slave env PATH="$T/mock:$PATH" "$T/root/bin/proxy-unifi" "$@"; }
 
 free_udp_port() {
     python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
@@ -185,8 +189,19 @@ def echo(name, host, reuse):
     while True:
         data, peer = s.recvfrom(2048)
         s.sendto(data, peer)
+def service():
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", 0))
+    s.listen(8)
+    publish("service", s.getsockname()[1])
+    while True:
+        conn, _ = s.accept()
+        conn.sendall(b"gateway-service")
+        conn.close()
 for args in (("echo", "127.0.0.1", False), ("clash", "0.0.0.0", False), ("shared", "0.0.0.0", True)):
     threading.Thread(target=echo, args=args, daemon=True).start()
+threading.Thread(target=service, daemon=True).start()
 server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Bulk)
 publish("bulk", server.server_address[1])
 server.serve_forever()
@@ -194,12 +209,13 @@ PY
 python3 "$T/servers.py" "$T/state" >/dev/null 2>&1 &
 PIDS="$PIDS $!"
 _i=0
-while [ ! -s "$T/state/bulk" ] || [ ! -s "$T/state/shared" ]; do
+while [ ! -s "$T/state/bulk" ] || [ ! -s "$T/state/shared" ] || [ ! -s "$T/state/service" ]; do
     _i=$((_i + 1)); [ "$_i" -lt 100 ] || { fail "lab servers start"; exit 1; }
     sleep 0.05
 done
 BULK="$(cat "$T/state/bulk")"; ECHO="$(cat "$T/state/echo")"
 CLASH="$(cat "$T/state/clash")"; SHARED="$(cat "$T/state/shared")"
+SERVICE="$(cat "$T/state/service")"
 
 start_core() {  # <overlay>: the core runs unprivileged, with CAP_NET_RAW only
     if command -v setpriv >/dev/null 2>&1; then
@@ -233,6 +249,17 @@ client_private() {  # bytes fetched from a private target over the direct route
     ip netns exec "$CLIENT" curl -s -o /dev/null --noproxy '*' --max-time 2 \
         -w '%{size_download}' "http://10.9.9.9:$BULK/small" 2>/dev/null || true
 }
+client_service() {  # "open" if a gateway service answers on the gateway's own address
+    ip netns exec "$CLIENT" python3 - "$HOST_IP" "$SERVICE" <<'PY'
+import socket, sys
+try:
+    s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+    s.settimeout(2)
+    print("open" if s.recv(64) else "closed")
+except OSError:
+    print("closed")
+PY
+}
 client_udp() {  # <port>: "ok" when the echo comes back through the tunnel
     ip netns exec "$CLIENT" python3 - "$TARGET" "$1" <<'PY'
 import socket, sys
@@ -257,11 +284,13 @@ ip netns del "$CLIENT" 2>/dev/null || true
 ip netns add "$CLIENT"
 ip -n "$CLIENT" link set lo up
 
-# 1. Kernel path up.
-cli _ingress-up > "$T/up.log" 2>&1 && _up=0 || _up=$?
+# 1. Kernel path up, from a hook in its own mount namespace as under systemd.
+hook _ingress-up > "$T/up.log" 2>&1 && _up=0 || _up=$?
 sed 's/^/INFO   /' "$T/up.log"
 check "ingress-up succeeds" [ "$_up" = 0 ]
 check "kernel path marked active" [ -f "$T/run/kernel-ingress" ]
+check "the path outlives a hook in its own mount namespace" \
+    sh -c "ip link show $VETH >/dev/null 2>&1 && ip -n $NS link show $WGDEV >/dev/null 2>&1"
 check "overlay replaces the WireGuard inbound by tag" python3 - "$T/run/ingress.json" "$HOST_IP" "$PORT" <<'PY'
 import json, sys
 inbound, = json.load(open(sys.argv[1]))["inbounds"]
@@ -313,8 +342,15 @@ check "status names the clashing UDP port" grep -q "^udp note: .*\\b$CLASH/" "$T
 if grep -q "^udp note: .*\\b$SHARED/" "$T/status.out"; then fail "status skips a shared UDP port"
 else pass "status skips a shared UDP port"; fi
 
-# 2. The guard timer restores rules a firewall reload removed.
+# 2. The guard timer restores rules a firewall reload removed. Without the
+# TPROXY rule alone, tunnel traffic (which then bypasses Xray) must still not
+# reach the gateway's own services.
 iptables -t mangle -D PREROUTING -i "$VETH" -j PU_LAB_TP
+if iptables -C PU_LAB_IN -i "$VETH" -m socket --transparent -j ACCEPT 2>/dev/null; then
+    check "without the TPROXY rule, gateway services stay closed" [ "$(client_service)" = closed ]
+else
+    info "no socket match here: the veth is admitted as a whole"
+fi
 iptables -D INPUT -j PU_LAB_IN
 ip rule del pref 11 iif "$VETH" lookup 7708
 check "traffic stops without the rules" [ "$(client_tcp | cut -d' ' -f1)" = 0 ]
@@ -350,6 +386,15 @@ check "fallback leaves no kernel path" sh -c "
     && ! iptables -t mangle -S | grep -q PU_LAB_TP && ! iptables -S | grep -q PU_LAB_WG"
 
 rm -f "$T/run/kernel-ingress.failures"
+cli _ingress-down >/dev/null 2>&1
+
+# 4b. A hook that cannot reach the host's mount namespace refuses the path.
+printf '#!/bin/sh\nexit 1\n' > "$T/mock/nsenter"; chmod 755 "$T/mock/nsenter"
+hook _ingress-up > "$T/fallback.log" 2>&1 || true
+rm -f "$T/mock/nsenter"
+check "no kernel path without the host's mount namespace" sh -c "
+    [ \"\$(cat '$T/run/ingress.json')\" = '{}' ] && grep -q nsenter '$T/run/kernel-ingress.error' \
+    && ! ip netns list | cut -d' ' -f1 | grep -qx $NS"
 cli _ingress-down >/dev/null 2>&1
 
 # 5. A core that keeps failing on the kernel path gets Xray's WireGuard.
