@@ -94,6 +94,9 @@ INGRESS_TABLE="7707"
 INGRESS_PREF="10"
 INGRESS_TP_CHAIN="PROXY_UNIFI_TP"
 INGRESS_IN_CHAIN="PROXY_UNIFI_IN"
+INGRESS_LAN_CHAIN="PROXY_UNIFI_LAN"             # LAN traffic UniFi routes to our client
+INGRESS_LAN_MARK="0x40000000"                   # outside UniFi's 0x3fff0000/0x20000000 and Tailscale's 0xff0000
+INGRESS_LAN_PREF="11"
 HOST_MOUNT_NS="/proc/1/ns/mnt"                  # the mount namespace named netns live in
 
 # defaults (overridable via settings.env)
@@ -1639,6 +1642,82 @@ _ingress_setup() {
         -o "$INGRESS_VETH_NS" -j SNAT --to-source "$INGRESS_NS_IP"
 }
 
+# LAN fast path. UniFi's Policy Table marks the LAN traffic it routes into our
+# VPN client (UBIOS_PREROUTING_PBR) and an ip rule sends that mark to the
+# client's table. TPROXY the same packets straight to Xray at the end of
+# PREROUTING, after UniFi has marked them, so they skip both WireGuard
+# passes, the namespace and the veth. Traffic the gateway itself sends through
+# the client (and anything while these rules are missing) still takes the
+# WireGuard path. Prints "<client interface> <fwmark[/mask]>", or fails when
+# no Policy Table route points at the client.
+_ingress_lan_mark() {
+    _lm_if="$(unifi_client_if)"; [ -n "$_lm_if" ] || return 1
+    _lm_tbl="$(ip route show table all 2>/dev/null | awk -v dev="$_lm_if" '
+        $1 == "default" && $2 == "dev" && $3 == dev {
+            for (i = 4; i < NF; i++) if ($i == "table") { print $(i + 1); exit }
+        }')"
+    [ -n "$_lm_tbl" ] || return 1
+    _lm_mark="$(ip rule show 2>/dev/null | awk -v tbl="$_lm_tbl" '
+        $NF == tbl && $(NF - 1) == "lookup" {
+            for (i = 1; i < NF; i++) if ($i == "fwmark") { print $(i + 1); exit }
+        }')"
+    case "$_lm_mark" in 0x[0-9a-f]*) : ;; *) return 1 ;; esac
+    case "$_lm_mark" in *[!0-9a-fx/]*) return 1 ;; esac
+    printf '%s %s\n' "$_lm_if" "$_lm_mark"
+}
+
+# _ingress_lan_args <interface> <fwmark> tcp|udp: the TPROXY rule's arguments.
+# The gateway's own addresses keep their normal (local) delivery.
+_ingress_lan_args() {
+    echo "! -i $1 -p $3 -m mark --mark $2 -m addrtype ! --dst-type LOCAL" \
+        "-j TPROXY --on-ip $INGRESS_HOST_IP --on-port $INGRESS_PORT" \
+        "--tproxy-mark $INGRESS_LAN_MARK/$INGRESS_LAN_MARK"
+}
+
+# No Policy Table route to our client means nothing to divert: that is fine.
+_ingress_lan_ok() {
+    _lo="$(_ingress_lan_mark)" || return 0
+    # shellcheck disable=SC2086 # interface and mark are single words
+    set -- $_lo
+    # shellcheck disable=SC2046 # _ingress_lan_args prints a fixed list of words
+    iptables -t mangle -C "$INGRESS_LAN_CHAIN" $(_ingress_lan_args "$1" "$2" tcp) 2>/dev/null \
+        && iptables -t mangle -C "$INGRESS_LAN_CHAIN" $(_ingress_lan_args "$1" "$2" udp) 2>/dev/null \
+        && [ "$(iptables -t mangle -S PREROUTING 2>/dev/null | tail -n 1)" = "-A PREROUTING -j $INGRESS_LAN_CHAIN" ] \
+        && iptables -C "$INGRESS_IN_CHAIN" -m mark --mark "$INGRESS_LAN_MARK/$INGRESS_LAN_MARK" -j ACCEPT 2>/dev/null \
+        && ip rule show 2>/dev/null | grep -q "^$INGRESS_LAN_PREF:.* fwmark $INGRESS_LAN_MARK/$INGRESS_LAN_MARK lookup $INGRESS_TABLE"
+}
+
+_ingress_lan_add() {
+    _la="$(_ingress_lan_mark)" || return 0
+    # shellcheck disable=SC2086
+    set -- $_la
+    iptables -t mangle -N "$INGRESS_LAN_CHAIN" 2>/dev/null \
+        || _ingress_step iptables -t mangle -F "$INGRESS_LAN_CHAIN" || return 1
+    # shellcheck disable=SC2046
+    _ingress_step iptables -t mangle -A "$INGRESS_LAN_CHAIN" $(_ingress_lan_args "$1" "$2" tcp) || return 1
+    # shellcheck disable=SC2046
+    _ingress_step iptables -t mangle -A "$INGRESS_LAN_CHAIN" $(_ingress_lan_args "$1" "$2" udp) || return 1
+    # Last in PREROUTING: UniFi's chains must have marked the packet first.
+    while iptables -t mangle -D PREROUTING -j "$INGRESS_LAN_CHAIN" 2>/dev/null; do :; done
+    _ingress_step iptables -t mangle -A PREROUTING -j "$INGRESS_LAN_CHAIN" || return 1
+    # Diverted packets are INPUT, not FORWARD: admit them before UniFi's
+    # gateway-input policy, which would otherwise judge them as LAN-to-gateway.
+    iptables -C "$INGRESS_IN_CHAIN" -m mark --mark "$INGRESS_LAN_MARK/$INGRESS_LAN_MARK" -j ACCEPT 2>/dev/null \
+        || _ingress_step iptables -I "$INGRESS_IN_CHAIN" 1 \
+            -m mark --mark "$INGRESS_LAN_MARK/$INGRESS_LAN_MARK" -j ACCEPT || return 1
+    ip rule show 2>/dev/null | grep -q "^$INGRESS_LAN_PREF:.* fwmark $INGRESS_LAN_MARK/$INGRESS_LAN_MARK lookup $INGRESS_TABLE" \
+        || _ingress_step ip rule add pref "$INGRESS_LAN_PREF" \
+            fwmark "$INGRESS_LAN_MARK/$INGRESS_LAN_MARK" lookup "$INGRESS_TABLE"
+}
+
+_ingress_lan_del() {
+    while iptables -t mangle -D PREROUTING -j "$INGRESS_LAN_CHAIN" 2>/dev/null; do :; done
+    iptables -t mangle -F "$INGRESS_LAN_CHAIN" 2>/dev/null || true
+    iptables -t mangle -X "$INGRESS_LAN_CHAIN" 2>/dev/null || true
+    while ip rule del pref "$INGRESS_LAN_PREF" fwmark "$INGRESS_LAN_MARK/$INGRESS_LAN_MARK" \
+        lookup "$INGRESS_TABLE" 2>/dev/null; do :; done
+}
+
 # Root-namespace rules: TPROXY every TCP/UDP packet from the veth to Xray, admit
 # from the veth only what TPROXY handed to Xray's transparent sockets (where the
 # kernel has the socket match; otherwise the veth as a whole), keep Xray's
@@ -1660,7 +1739,8 @@ _ingress_rules_ok() {
         && iptables -C "$INGRESS_IN_CHAIN" -p udp --dport "$INGRESS_PORT" -j DROP 2>/dev/null \
         && iptables -C FORWARD -i "$INGRESS_VETH" -j DROP 2>/dev/null \
         && ip rule show 2>/dev/null | grep -q "^$INGRESS_PREF:.* iif $INGRESS_VETH .*lookup $INGRESS_TABLE" \
-        && ip route show table "$INGRESS_TABLE" 2>/dev/null | grep -q '^local default dev lo'
+        && ip route show table "$INGRESS_TABLE" 2>/dev/null | grep -q '^local default dev lo' \
+        && _ingress_lan_ok
 }
 
 _ingress_rules_add() {
@@ -1695,11 +1775,13 @@ _ingress_rules_add() {
     ip rule show 2>/dev/null | grep -q "^$INGRESS_PREF:.* iif $INGRESS_VETH .*lookup $INGRESS_TABLE" \
         || _ingress_step ip rule add pref "$INGRESS_PREF" iif "$INGRESS_VETH" \
             lookup "$INGRESS_TABLE" || return 1
+    _ingress_lan_add || return 1
     _ingress_rules_ok || { _ingress_failed="the root-namespace rules did not verify"; return 1; }
 }
 
 _ingress_rules_del() {
     if have iptables; then
+        _ingress_lan_del
         while iptables -t mangle -D PREROUTING -i "$INGRESS_VETH" -j "$INGRESS_TP_CHAIN" 2>/dev/null; do :; done
         iptables -t mangle -F "$INGRESS_TP_CHAIN" 2>/dev/null || true
         iptables -t mangle -X "$INGRESS_TP_CHAIN" 2>/dev/null || true
@@ -2163,6 +2245,9 @@ cmd_status() {
         if ingress_active; then
             _st_hs="$(ingress_handshake_age)" || _st_hs=""
             echo "ingress:   kernel WireGuard -> Xray transparent proxy${_st_hs:+ (last handshake $_st_hs)}"
+            if _st_lan="$(_ingress_lan_mark)"; then
+                echo "lan path:  Policy Table traffic to ${_st_lan%% *} goes to Xray before WireGuard (fwmark ${_st_lan#* })"
+            fi
             if [ "$(id -u)" = 0 ]; then
                 _st_udp="$(ingress_udp_conflicts)" || _st_udp=""
                 [ -z "$_st_udp" ] || echo "udp note:  replies from remote ports $_st_udp cannot reach tunnel clients"
@@ -2914,6 +2999,10 @@ EOF
             ingress_active || c_ylw "Kernel WireGuard ingress is not active ('proxy status' says why)."
         fi
         echo "(Line 3 also decrypts the test downloads on the gateway; LAN devices may get a bit more.)"
+        if ingress_active && _ingress_lan_mark >/dev/null; then
+            echo "Line 3 is the gateway's own WireGuard path. LAN devices on a Policy Table route"
+            echo "skip WireGuard (lan path in 'proxy status'): expect them near line 2."
+        fi
     else
         echo "Now run a speed test on a LAN device routed through the UniFi VPN client:"
         echo "  - close to line 2: the WireGuard hop is not the limit; the outbound is."

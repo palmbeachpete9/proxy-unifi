@@ -18,7 +18,11 @@ for _tool in ip iptables ss curl python3; do
 done
 XRAY_SRC="$1"
 REPO="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
-NS=pu-lab; CLIENT=pu-lab-client
+NS=pu-lab; CLIENT=pu-lab-client; LAN=pu-lab-lan
+# A UniFi Policy Table route: LAN traffic marked like UBIOS_PREROUTING_PBR, an
+# ip rule sending that mark to the VPN client's table, and a client interface
+# that drops everything, so LAN traffic only arrives if the fast path took it.
+UDEV=pu-lab-u; UTABLE=7790; UMARK=0x21670000/0x3fff0000; URULE=0x21660000/0x3ffe0000
 VETH=pu-lab-v0; WGDEV=pu-lab-wg; CDEV=pu-lab-c
 HOST_IP=169.254.78.1; PORT=41829; TARGET=198.51.100.7
 FAILED=0
@@ -52,6 +56,11 @@ cleanup() {
     [ -x "$T/root/bin/proxy-unifi" ] && PATH="$T/mock:$PATH" "$T/root/bin/proxy-unifi" _ingress-down >/dev/null 2>&1
     ip netns del "$CLIENT" 2>/dev/null || true
     ip link del "$CDEV" 2>/dev/null || true
+    ip netns del "$LAN" 2>/dev/null || true
+    ip link del pu-lab-l0 2>/dev/null || true
+    ip link del "$UDEV" 2>/dev/null || true
+    while ip rule del pref 32504 fwmark "$URULE" lookup "$UTABLE" 2>/dev/null; do :; done
+    while iptables -t mangle -D PREROUTING -i pu-lab-l0 -j MARK --set-xmark "$UMARK" 2>/dev/null; do :; done
     wait 2>/dev/null || true
     [ -n "${LAB_KEEP:-}" ] || rm -rf "$T"
 }
@@ -74,13 +83,16 @@ sed \
     -e "s|^INGRESS_PREF=.*|INGRESS_PREF=\"11\"|" \
     -e "s|^INGRESS_TP_CHAIN=.*|INGRESS_TP_CHAIN=\"PU_LAB_TP\"|" \
     -e "s|^INGRESS_IN_CHAIN=.*|INGRESS_IN_CHAIN=\"PU_LAB_IN\"|" \
+    -e "s|^INGRESS_LAN_CHAIN=.*|INGRESS_LAN_CHAIN=\"PU_LAB_LAN\"|" \
+    -e "s|^INGRESS_LAN_PREF=.*|INGRESS_LAN_PREF=\"12\"|" \
     -e "s|^HOST_MOUNT_NS=.*|HOST_MOUNT_NS=\"/proc/$$/ns/mnt\"|" \
     -e "s|^FW_CHAIN=.*|FW_CHAIN=\"PU_LAB_WG\"|" \
     "$REPO/src/proxy-unifi" > "$T/cli"
 # Without kernel WireGuard, a veth pair into the client namespace is the tunnel.
 # LAB_FAIL makes the tunnel step fail, to exercise the fallback.
-awk -v mode="$MODE" -v client="$CLIENT" -v cdev="$CDEV" '
+awk -v mode="$MODE" -v client="$CLIENT" -v cdev="$CDEV" -v udev="$UDEV" '
     /^# Dispatch$/ && !done {
+        print "unifi_client_if() { echo " udev "; }"
         print "_lab_wg_link=\"$(command -v _ingress_wg_link)\""
         print "_ingress_wg_link() {"
         print "    [ -z \"${LAB_FAIL:-}\" ] || { _ingress_failed=\"lab: injected failure\"; return 1; }"
@@ -241,16 +253,16 @@ wait_listen() {  # <ss flags> <address:port>
         sleep 0.05
     done
 }
-client_tcp() {  # bytes fetched through the tunnel within 3 s
-    ip netns exec "$CLIENT" curl -s -o /dev/null --noproxy '*' --max-time 3 \
+client_tcp() {  # [namespace]: bytes fetched through the tunnel within 3 s
+    ip netns exec "${1:-$CLIENT}" curl -s -o /dev/null --noproxy '*' --max-time 3 \
         -w '%{size_download} %{speed_download}' "http://$TARGET:$BULK/" 2>/dev/null || true
 }
 client_private() {  # bytes fetched from a private target over the direct route
     ip netns exec "$CLIENT" curl -s -o /dev/null --noproxy '*' --max-time 2 \
         -w '%{size_download}' "http://10.9.9.9:$BULK/small" 2>/dev/null || true
 }
-client_service() {  # "open" if a gateway service answers on the gateway's own address
-    ip netns exec "$CLIENT" python3 - "$HOST_IP" "$SERVICE" <<'PY'
+client_service() {  # [namespace address]: "open" if a gateway service answers there
+    ip netns exec "${1:-$CLIENT}" python3 - "${2:-$HOST_IP}" "$SERVICE" <<'PY'
 import socket, sys
 try:
     s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
@@ -260,8 +272,8 @@ except OSError:
     print("closed")
 PY
 }
-client_udp() {  # <port>: "ok" when the echo comes back through the tunnel
-    ip netns exec "$CLIENT" python3 - "$TARGET" "$1" <<'PY'
+client_udp() {  # <port> [namespace]: "ok" when the echo comes back through the tunnel
+    ip netns exec "${2:-$CLIENT}" python3 - "$TARGET" "$1" <<'PY'
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(1)
@@ -283,6 +295,20 @@ cli _ingress-down >/dev/null 2>&1 || true   # leftovers of an interrupted run
 ip netns del "$CLIENT" 2>/dev/null || true
 ip netns add "$CLIENT"
 ip -n "$CLIENT" link set lo up
+ip netns del "$LAN" 2>/dev/null || true
+ip netns add "$LAN"
+ip -n "$LAN" link set lo up
+ip link add pu-lab-l0 type veth peer name pu-lab-l1 netns "$LAN"
+ip addr add 10.99.0.1/30 dev pu-lab-l0
+ip link set pu-lab-l0 up
+ip -n "$LAN" addr add 10.99.0.2/30 dev pu-lab-l1
+ip -n "$LAN" link set pu-lab-l1 up
+ip -n "$LAN" route add default via 10.99.0.1
+ip link add "$UDEV" type dummy
+ip link set "$UDEV" up
+ip route add default dev "$UDEV" table "$UTABLE"
+ip rule add pref 32504 fwmark "$URULE" lookup "$UTABLE"
+iptables -t mangle -A PREROUTING -i pu-lab-l0 -j MARK --set-xmark "$UMARK"
 
 # 1. Kernel path up, from a hook in its own mount namespace as under systemd.
 hook _ingress-up > "$T/up.log" 2>&1 && _up=0 || _up=$?
@@ -335,7 +361,16 @@ if [ "$MODE" = wireguard ]; then
     check "UniFi-side handshake" sh -c "ip netns exec $NS wg show $WGDEV latest-handshakes | awk '{ exit !(\$2 > 0) }'"
 fi
 
+check "LAN fast path is last in PREROUTING" \
+    sh -c "iptables -t mangle -S PREROUTING | tail -n 1 | grep -qx -- '-A PREROUTING -j PU_LAB_LAN'"
+_tcp="$(client_tcp "$LAN")"
+check "LAN TCP on a Policy Table route reaches Xray before WireGuard" [ "${_tcp%% *}" -gt 0 ] 2>/dev/null
+info "LAN fast path: $(printf '%s\n' "$_tcp" | mbit) Mbit/s in this lab"
+check "LAN UDP on a Policy Table route" [ "$(client_udp "$ECHO" "$LAN")" = ok ]
+check "the gateway's own address is not diverted" [ "$(client_service "$LAN" 10.99.0.1)" = open ]
+
 cli status > "$T/status.out" 2>&1 || true
+check "status reports the LAN fast path" grep -q "^lan path:  Policy Table traffic to $UDEV goes to Xray" "$T/status.out"
 check "status reports the kernel path" grep -q '^ingress:   kernel WireGuard' "$T/status.out"
 check "status reports the guarded port" grep -q "^wg listen: 0.0.0.0:$WG_PORT (loopback only" "$T/status.out"
 check "status names the clashing UDP port" grep -q "^udp note: .*\\b$CLASH/" "$T/status.out"
@@ -354,9 +389,15 @@ fi
 iptables -D INPUT -j PU_LAB_IN
 ip rule del pref 11 iif "$VETH" lookup 7708
 check "traffic stops without the rules" [ "$(client_tcp | cut -d' ' -f1)" = 0 ]
+# A firewall reload that re-appends UniFi's marking after our chain.
+iptables -t mangle -D PREROUTING -i pu-lab-l0 -j MARK --set-xmark "$UMARK"
+iptables -t mangle -A PREROUTING -i pu-lab-l0 -j MARK --set-xmark "$UMARK"
+check "LAN traffic stops when UniFi marks after the fast path" [ "$(client_tcp "$LAN" | cut -d' ' -f1)" = 0 ]
 cli _fw-reconcile > "$T/reconcile.log" 2>&1 || true
 _tcp="$(client_tcp)"
 check "reconcile restores the kernel path" [ "${_tcp%% *}" -gt 0 ] 2>/dev/null
+_tcp="$(client_tcp "$LAN")"
+check "reconcile moves the LAN fast path back after UniFi's marking" [ "${_tcp%% *}" -gt 0 ] 2>/dev/null
 LAB_STATE=activating cli _fw-reconcile >/dev/null 2>&1 || true
 check "reconcile leaves a starting core alone" [ -f "$T/run/kernel-ingress" ]
 
@@ -367,7 +408,7 @@ check "a failed core is counted" [ "$(cat "$T/run/kernel-ingress.failures" 2>/de
 check "teardown removes the namespace and links" \
     sh -c "! ip netns list | cut -d' ' -f1 | grep -qx $NS && ! ip link show $VETH >/dev/null 2>&1"
 check "teardown removes rules, route and guard" sh -c "
-    ! iptables -t mangle -S | grep -q PU_LAB_TP && ! iptables -S | grep -q 'PU_LAB_IN\|PU_LAB_WG\|$VETH' \
+    ! iptables -t mangle -S | grep -q 'PU_LAB_TP\|PU_LAB_LAN' && ! iptables -S | grep -q 'PU_LAB_IN\|PU_LAB_WG\|$VETH' \
     && ! ip rule show | grep -q 'lookup 7708' && [ -z \"\$(ip route show table 7708 2>/dev/null)\" ]"
 check "teardown removes the marker and overlay" sh -c "[ ! -e '$T/run/kernel-ingress' ] && [ ! -e '$T/run/ingress.json' ]"
 if [ "$MODE" = wireguard ]; then

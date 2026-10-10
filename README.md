@@ -93,6 +93,13 @@ to Xray, which routes it exactly as before (same inbound tag and sniffing).
   which transparent sockets require.
 - **Private addresses:** as with Xray's WireGuard inbound, direct (freedom) routes
   refuse private and loopback targets for tunnel clients.
+- **LAN fast path:** traffic that a Policy Table route sends to this VPN Client
+  is handed to Xray as soon as UniFi marks it, before it is encrypted, so it skips
+  both WireGuard passes. The WireGuard tunnel stays up for the gateway's own
+  traffic and as the fallback. Diverted traffic reaches Xray as input to the
+  gateway instead of being forwarded, so UniFi's forwarding firewall rules and
+  per-client VPN statistics do not see it; Xray sees the LAN device's address.
+  `proxy status` shows the path as `lan path`.
 - **Measure:** the third line of `proxy bench` tests the full tunnel through the
   gateway's own VPN Client.
 - **Installing an older version:** versions without this mode cannot remove it,
