@@ -668,6 +668,7 @@ SH
     {
         cat <<'SH'
 ETC_DIR="$WORK"; SERVICE_GROUP="$(id -gn)"; XRAY=/x
+chown() { :; }   # the CLI hands the overlay to root; CI does not run as root
 ingress_configured() { return 0; }
 ingress_overlay_for() { [ "${OVERLAY:-1}" = 1 ] || { echo "no tagged inbound" >&2; return 1; }; echo '{}'; }
 validate_as_service() { [ "${LOADS:-1}" = 1 ]; }
