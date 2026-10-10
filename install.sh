@@ -17,6 +17,7 @@ ROOT="/data/proxy-unifi"
 BIN_DIR="$ROOT/bin"
 ONBOOT_DIR="/data/on_boot.d"
 ONBOOT_DST="$ONBOOT_DIR/15-proxy-unifi.sh"
+KERNEL_INGRESS_MARKER="/run/proxy-unifi/kernel-ingress"   # the CLI's INGRESS_ACTIVE
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 grn() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -87,6 +88,17 @@ restore_promotion() {
     return "$_restore_rc"
 }
 
+# A rollback restores the previous scripts, which may not know the kernel
+# WireGuard path this version's service builds; left behind, it keeps holding
+# the WireGuard port and the restored core could not start. Stop the service
+# while this version's scripts are still in place (its stop hook removes the
+# path) and remove whatever remains; the restored service state starts it again.
+teardown_kernel_ingress() {
+    [ -f "$KERNEL_INGRESS_MARKER" ] || return 0
+    systemctl stop proxy-unifi.service >/dev/null 2>&1 || true
+    "$BIN_DIR/proxy-unifi" _ingress-down >/dev/null 2>&1 || true
+}
+
 release_install_lock() {
     if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ]; then
         rm -rf "$LOCK_DIR" 2>/dev/null || true
@@ -98,6 +110,9 @@ cleanup() {
     trap - EXIT INT TERM HUP
     [ -z "$ACTIVE_PID" ] || { kill "$ACTIVE_PID" 2>/dev/null || true; wait "$ACTIVE_PID" 2>/dev/null || true; }
     _keep_workdir=0
+    if [ -f "$PROMOTION_MARKER" ] || [ -f "$SERVICE_STATE_MARKER" ]; then
+        teardown_kernel_ingress
+    fi
     if ! restore_promotion; then
         red "Automatic script rollback was incomplete; recovery backup kept at $WORKDIR"
         _keep_workdir=1
