@@ -78,9 +78,10 @@ in the UniFi VPN Client. It lives in a private network namespace; decrypted
 traffic leaves through a veth pair, and TPROXY hands every TCP and UDP connection
 to Xray, which routes it exactly as before (same inbound tag and sniffing).
 
-- **Fallback:** if any setup step fails, or the core fails three times in a row
-  on this path, the service runs Xray's own WireGuard instead. `proxy status`
-  shows the path in use and why.
+- **Fallback:** if any setup step fails, or the core does not come up on this
+  path (a failed health check after a restart, or three failures in a row), the
+  service runs Xray's own WireGuard instead. `proxy status` shows the path in use
+  and why; `proxy restart` tries the kernel path again.
 - **Switch:** `proxy` → WireGuard settings → Ingress (`kernel` or `userspace`).
 - **Firewall rewrites:** if the UniFi controller rewrites the firewall or routing
   rules, the guard timer restores them within 30 seconds.
@@ -94,6 +95,9 @@ to Xray, which routes it exactly as before (same inbound tag and sniffing).
   refuse private and loopback targets for tunnel clients.
 - **Measure:** the third line of `proxy bench` tests the full tunnel through the
   gateway's own VPN Client.
+- **Installing an older version:** versions without this mode cannot remove it,
+  and it would keep the WireGuard port. Run `systemctl stop proxy-unifi` first
+  (or reboot after installing).
 
 ## Compatibility
 

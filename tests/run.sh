@@ -345,6 +345,46 @@ SH
         || bad "installer rollback restores scripts, cores, and assets"
     rm -rf "$_id"
 
+    # Before restoring older scripts, a rollback removes the kernel WireGuard
+    # path with the new ones (older scripts may not know it); a successful
+    # install leaves the running path alone.
+    _id="$(mktemp -d)"
+    mkdir -p "$_id/bin"
+    printf '#!/bin/sh\necho "cli $*" >> "%s/log"\n' "$_id" > "$_id/bin/proxy-unifi"
+    chmod 755 "$_id/bin/proxy-unifi"
+    {
+        cat <<SH
+KERNEL_INGRESS_MARKER='$_id/kernel'; PROMOTION_MARKER='$_id/promotion'
+SERVICE_STATE_MARKER='$_id/state'; BIN_DIR='$_id/bin'; LOG_FILE='$_id/log'
+SH
+        cat <<'SH'
+ACTIVE_PID=""
+log() { echo "$*" >> "$LOG_FILE"; }
+systemctl() { log "systemctl $*"; }
+restore_promotion() { log restore_promotion; }
+restore_service_state() { log restore_service_state; }
+release_install_lock() { :; }
+red() { :; }
+SH
+        awk '/^teardown_kernel_ingress\(\) \{/,/^}/; /^cleanup\(\) \{/,/^}/' "$ROOT/install.sh"
+        # shellcheck disable=SC2016 # expanded by the generated script
+        echo 'WORKDIR="$(mktemp -d)"; cleanup 1'
+    } > "$_id/cleanup.sh"
+    _rollback() {  # <markers...>: run the installer's cleanup, print its calls
+        rm -f "$_id/log" "$_id/kernel" "$_id/promotion" "$_id/state"
+        for _m in "$@"; do : > "$_id/$_m"; done
+        sh "$_id/cleanup.sh" 2>/dev/null
+        tr '\n' ';' < "$_id/log"
+    }
+    _teardown_ok=1
+    [ "$(_rollback kernel promotion state)" = "systemctl stop proxy-unifi.service;cli _ingress-down;restore_promotion;restore_service_state;" ] \
+        || _teardown_ok=0
+    [ "$(_rollback promotion state)" = "restore_promotion;restore_service_state;" ] || _teardown_ok=0
+    [ "$(_rollback kernel)" = "restore_promotion;restore_service_state;" ] || _teardown_ok=0
+    [ "$_teardown_ok" = 1 ] && ok "installer rollback removes the kernel path first" \
+        || bad "installer rollback removes the kernel path first"
+    rm -rf "$_id"
+
     _bd="$(mktemp -d)"
     mkdir -p "$_bd/archive-root/src" "$_bd/work"
     for _f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py on_boot.sh; do
@@ -622,6 +662,61 @@ SH
     if WORK="$_kd" sh "$_kd/health.sh"; then ok "health check follows the ingress mode"
     else bad "health check follows the ingress mode"; fi
     rm -f "$_kd/active"
+
+    # A profile the kernel path cannot take is still imported (with a warning);
+    # the service then runs it on Xray's WireGuard.
+    {
+        cat <<'SH'
+ETC_DIR="$WORK"; SERVICE_GROUP="$(id -gn)"; XRAY=/x
+ingress_configured() { return 0; }
+ingress_overlay_for() { [ "${OVERLAY:-1}" = 1 ] || { echo "no tagged inbound" >&2; return 1; }; echo '{}'; }
+validate_as_service() { [ "${LOADS:-1}" = 1 ]; }
+fatal() { echo "fatal $*"; exit 9; }
+c_ylw() { echo "$*"; }
+SH
+        fn_src validate_ingress_overlay
+        cat <<'SH'
+[ -z "$(validate_ingress_overlay a.json b.json)" ] || exit 1
+_out="$(OVERLAY=0 validate_ingress_overlay a.json)" || exit 1
+case "$_out" in *"(no tagged inbound)"*"Xray's WireGuard"*) : ;; *) exit 1 ;; esac
+_out="$(LOADS=0 validate_ingress_overlay a.json)" || exit 1
+case "$_out" in *"(xray rejected the kernel-mode overlay)"*) : ;; *) exit 1 ;; esac
+for _left in "$WORK"/.ingress.*; do [ ! -e "$_left" ] || exit 1; done   # no temp overlay left
+SH
+    } > "$_kd/validate.sh"
+    if WORK="$_kd" sh "$_kd/validate.sh"; then ok "an unsuitable profile is imported with a warning"
+    else bad "an unsuitable profile is imported with a warning"; fi
+
+    # A core that fails its health check on the kernel path is restarted once on
+    # Xray's WireGuard; if that fails too, the next start tries the kernel again.
+    {
+        cat <<'SH'
+CONFIG="$WORK/config.json"; POOL_DIR="$WORK/pool"; SERVICE_NAME=proxy-unifi
+INGRESS_RUN="$WORK/run"; INGRESS_FAILS="$WORK/run/failures"
+log() { echo "$*" >> "$WORK/calls"; }
+systemctl() { log "$1"; }
+sleep() { :; }
+c_ylw() { log warn; }
+ingress_wanted() { [ "${WANTED:-1}" = 1 ]; }
+service_healthy() {
+    if [ -e "$INGRESS_FAILS" ]; then [ "${USERSPACE:-1}" = 1 ]; else [ "${KERNEL:-1}" = 1 ]; fi
+}
+SH
+        fn_src ingress_retry restart_service _restart_healthy
+        cat <<'SH'
+: > "$CONFIG"; mkdir -p "$INGRESS_RUN"
+calls() { rm -f "$WORK/calls"; restart_service; printf 'rc=%s ' "$?"; tr '\n' ' ' < "$WORK/calls"; }
+[ "$(calls)" = "rc=0 restart " ] || exit 1
+[ ! -e "$INGRESS_FAILS" ] || exit 1
+[ "$(KERNEL=0 calls)" = "rc=0 restart restart warn " ] || exit 1
+[ "$(cat "$INGRESS_FAILS")" = 3 ] || exit 1
+[ "$(KERNEL=0 USERSPACE=0 calls)" = "rc=1 restart restart " ] || exit 1
+[ ! -e "$INGRESS_FAILS" ] || exit 1
+[ "$(WANTED=0 KERNEL=0 calls)" = "rc=1 restart " ] || exit 1
+SH
+    } > "$_kd/restart.sh"
+    if WORK="$_kd" sh "$_kd/restart.sh"; then ok "a kernel path that fails its health check falls back"
+    else bad "a kernel path that fails its health check falls back"; fi
 
     # The guard timer leaves a starting or stopping unit to its own hooks,
     # repairs the kernel path while the core runs, and removes it after.

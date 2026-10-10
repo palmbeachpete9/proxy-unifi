@@ -1436,8 +1436,9 @@ ingress_wanted() {
 ingress_active() { [ -f "$INGRESS_ACTIVE" ]; }
 
 # A core that keeps failing on the kernel path must not keep the tunnel down:
-# after three failures in a row that were never seen healthy, ingress_up uses
-# Xray's own WireGuard until a reboot, a start by hand, or a new configuration.
+# after three failures in a row that were never seen healthy (or one failed
+# health check after a restart, see restart_service), ingress_up uses Xray's
+# own WireGuard until a reboot, a start by hand, or a new configuration.
 _ingress_count_failure() {
     _cf="$(cat "$INGRESS_FAILS" 2>/dev/null)" || _cf=0
     _uint "$_cf" || _cf=0
@@ -1517,25 +1518,28 @@ print()
 PYEOF
 }
 
-# validate_ingress_overlay <config.json>...: reject a profile whose kernel-mode
-# overlay Xray would not load, before it is installed (only when kernel mode is
-# configured). The configs are given in the order Xray loads them.
+# validate_ingress_overlay <config.json>...: before a profile is installed,
+# check that Xray loads its kernel-mode overlay (only when kernel mode is
+# configured; the configs in the order Xray loads them). A profile that cannot
+# use the kernel path still works on Xray's WireGuard, which the service falls
+# back to, so this warns instead of refusing an import or a subscription refresh.
 validate_ingress_overlay() {
     ingress_configured || return 0
     _vo="$(mktemp "$ETC_DIR/.ingress.XXXXXX")" || fatal "could not create temp file"
-    _vo_ok=0
-    if ingress_overlay_for "$@" > "$_vo" 2>/dev/null \
-        && chown root:"$SERVICE_GROUP" "$_vo" && chmod 640 "$_vo"; then
+    _vo_why=""
+    if ! _vo_err="$(ingress_overlay_for "$@" 2>&1 >"$_vo")"; then
+        _vo_why="${_vo_err:-no overlay}"
+    elif ! { chown root:"$SERVICE_GROUP" "$_vo" && chmod 640 "$_vo"; }; then
+        _vo_why="could not check the overlay"
+    else
         for _vo_cfg in "$@"; do set -- "$@" -config "$_vo_cfg"; shift; done
         validate_as_service "$XRAY" run -test -format json "$@" -config "$_vo" >/dev/null 2>&1 \
-            && _vo_ok=1
-    fi
-    if [ "$_vo_ok" = 1 ]; then
-        rm -f "$_vo"
-        return 0
+            || _vo_why="xray rejected the kernel-mode overlay"
     fi
     rm -f "$_vo"
-    fatal "xray rejected the kernel WireGuard overlay for this profile (WireGuard settings -> Ingress: userspace avoids it)"
+    [ -n "$_vo_why" ] || return 0
+    c_ylw "warning: this profile cannot use kernel WireGuard ingress ($_vo_why);"
+    c_ylw "the service runs it on Xray's WireGuard instead."
 }
 
 # ingress_overlay kernel|userspace: write the overlay the core loads last. The
@@ -1700,7 +1704,7 @@ ingress_up() {
     _ingress_failed=""
     _iu_fails="$(cat "$INGRESS_FAILS" 2>/dev/null)" || _iu_fails=0
     if _uint "$_iu_fails" && [ "$_iu_fails" -ge 3 ]; then
-        _ingress_failed="the core failed $_iu_fails times in a row on the kernel path ('proxy restart' tries again)"
+        _ingress_failed="the core did not come up on the kernel path ('proxy restart' tries again)"
     elif _ingress_setup && ingress_overlay kernel && : > "$INGRESS_ACTIVE"; then
         echo "proxy-unifi: kernel WireGuard ingress up ($INGRESS_WG in netns $INGRESS_NS -> Xray $INGRESS_HOST_IP:$INGRESS_PORT)"
         _iu_ports="$(ingress_udp_conflicts)" || _iu_ports=""
@@ -2216,6 +2220,21 @@ service_healthy() {
 restart_service() {
     [ -f "$CONFIG" ] || [ -f "$POOL_DIR/99-overlay.json" ] || return 0   # nothing to run yet
     ingress_retry
+    _restart_healthy && return 0
+    # A core that cannot come up on the kernel path still serves the tunnel
+    # through its own WireGuard: mark the path as failed (ingress_up then falls
+    # back) and try once more.
+    ingress_wanted && [ -d "$INGRESS_RUN" ] || return 1
+    echo 3 > "$INGRESS_FAILS" 2>/dev/null || return 1
+    if _restart_healthy; then
+        c_ylw "Kernel WireGuard ingress did not come up; Xray's WireGuard serves the tunnel ('proxy status')."
+        return 0
+    fi
+    ingress_retry   # it was not the kernel path: a restored configuration tries it again
+    return 1
+}
+
+_restart_healthy() {
     systemctl restart "$SERVICE_NAME" 2>/dev/null || systemctl start "$SERVICE_NAME" 2>/dev/null || return 1
     _i=0
     _stable=0
@@ -2650,20 +2669,19 @@ cmd_ping() {
 }
 
 # --------------------------------------------------------------------------
-# Throughput benchmark: the WAN alone, then the active outbound alone through a
-# throwaway SOCKS core (no WireGuard). A speed test through the UniFi VPN client
-# compared with both shows which hop limits the tunnel.
+# Throughput benchmark: the WAN alone, the active outbound alone through a
+# throwaway SOCKS core (no WireGuard), and the full tunnel through the gateway's
+# own UniFi VPN client. Comparing them shows which hop limits the tunnel.
 # --------------------------------------------------------------------------
 # Cloudflare's anycast speed endpoint serves at most 99 MB per request.
 BENCH_URL="https://speed.cloudflare.com/__down?bytes=99000000"
 BENCH_STREAMS=4
 
-# $1 = seconds, $2 = URL, $3 = optional proxy URL, $4 = optional PID whose
-# descendant core (its own session after safeexec's setsid) is CPU-sampled.
-# Prints "<Mbit/s> <gateway CPU busy %> <core CPU % of one core>".
-# _bench_run <seconds> <url> [proxy] [probe pid] [interface] [core pid]: print
-# "Mbit/s gateway-CPU% core-CPU%". The core is the process group under the probe
-# pid, or the given core pid's group.
+# _bench_run <seconds> <url> [proxy URL] [probe pid] [interface] [core pid]
+# downloads through the proxy or interface, if given, and prints "<Mbit/s>
+# <gateway CPU busy %> <core CPU % of one core>". The sampled core is the
+# process group of the probe pid's descendant (its own session after
+# safeexec's setsid), or the process group of the given core pid.
 _bench_run() {
     py - "$1" "$2" "${3:-}" "${4:-0}" "$BENCH_STREAMS" "${5:-}" "${6:-0}" <<'PYEOF'
 import os, subprocess, sys, threading, time

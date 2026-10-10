@@ -357,7 +357,7 @@ echo 3 > "$T/run/kernel-ingress.failures"
 cli _ingress-up > "$T/fallback.log" 2>&1 || true
 check "repeated core failures fall back" sh -c "
     [ \"\$(cat '$T/run/ingress.json')\" = '{}' ] && [ ! -e '$T/run/kernel-ingress' ] \
-    && grep -q 'failed 3 times' '$T/run/kernel-ingress.error' && ! ip netns list | cut -d' ' -f1 | grep -qx $NS"
+    && grep -q 'did not come up' '$T/run/kernel-ingress.error' && ! ip netns list | cut -d' ' -f1 | grep -qx $NS"
 SERVICE_RESULT=exit-code cli _ingress-down >/dev/null 2>&1
 check "a userspace core failure is not counted" [ "$(cat "$T/run/kernel-ingress.failures")" = 3 ]
 rm -f "$T/run/kernel-ingress.failures"
