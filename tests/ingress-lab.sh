@@ -66,6 +66,8 @@ cleanup() {
     while iptables -t nat -D PREROUTING -i pu-lab-l0 -p tcp --dport 5300 -j DNAT \
         --to-destination "10.99.0.1:${SERVICE:-0}" 2>/dev/null; do :; done
     while iptables -D FORWARD -i pu-lab-l0 -j PU_LAB_FW 2>/dev/null; do :; done
+    while iptables -D FORWARD -i pu-lab-o0 -o pu-lab-l0 -m conntrack --ctstate ESTABLISHED,RELATED \
+        -j ACCEPT 2>/dev/null; do :; done
     iptables -F PU_LAB_FW 2>/dev/null || true; iptables -X PU_LAB_FW 2>/dev/null || true
     [ -z "${_forward_was:-}" ] || echo "$_forward_was" > /proc/sys/net/ipv4/ip_forward
     wait 2>/dev/null || true
@@ -347,6 +349,7 @@ iptables -t nat -A PREROUTING -i pu-lab-l0 -p tcp --dport 5300 -j DNAT --to-dest
 iptables -N PU_LAB_FW 2>/dev/null || iptables -F PU_LAB_FW
 iptables -A PU_LAB_FW -j ACCEPT
 iptables -I FORWARD -i pu-lab-l0 -j PU_LAB_FW
+iptables -I FORWARD -i pu-lab-o0 -o pu-lab-l0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 serve_in "$OTHER" 10.98.0.2 5301 other-net
 serve_in "$LAN" 10.99.0.2 5302 lan-host
 
@@ -412,7 +415,20 @@ else pass "status skips a shared UDP port"; fi
 check "LAN route in the VPN client's table" \
     sh -c "ip route show table $UTABLE | grep -q '^default via 169.254.78.2 dev $VETH .*metric 1'"
 _lan="$(client_tcp "$LAN")"
-check "LAN TCP on a Policy Table route reaches Xray without WireGuard" [ "${_lan%% *}" -gt 0 ] 2>/dev/null
+if [ "${_lan%% *}" -gt 0 ] 2>/dev/null; then pass "LAN TCP on a Policy Table route reaches Xray without WireGuard"
+else
+    fail "LAN TCP on a Policy Table route reaches Xray without WireGuard"
+    { ip rule show; ip route show table "$UTABLE"; cat /proc/sys/net/ipv4/conf/all/rp_filter \
+        "/proc/sys/net/ipv4/conf/$VETH/rp_filter" /proc/sys/net/ipv4/ip_forward
+      iptables -L FORWARD -v -n | head -12; iptables -t mangle -L PU_LAB_TP -v -n
+      iptables -t mangle -L POSTROUTING -v -n | grep -i tcpmss; iptables -L PU_LAB_IN -v -n
+      ip netns exec "$NS" iptables -t mangle -L PREROUTING -v -n
+      ip netns exec "$NS" iptables -t nat -L POSTROUTING -v -n; ip -n "$NS" rule show
+      ip -n "$NS" route show table 101; ip netns exec "$NS" sysctl net.ipv4.ip_forward
+      ip netns exec "$NS" nstat -az 2>/dev/null | awk '$2 > 0 && /Ip|Tcp/'
+      conntrack -L 2>/dev/null | grep 10.99.0.2 | head -5
+    } 2>&1 | sed 's/^/INFO lan-route: /'
+fi
 info "LAN route: $(printf '%s\n' "$_lan" | mbit) Mbit/s in this lab"
 check "LAN UDP on a Policy Table route" [ "$(client_udp "$ECHO" "$LAN")" = ok ]
 check "UniFi's DNAT still applies first" [ "$(read_from "$LAN" "$TARGET" 5300)" = gateway-service ]
@@ -425,7 +441,7 @@ iptables -R PU_LAB_FW 1 -j ACCEPT
 check "the LAN host answers the gateway" [ "$(read_from - 10.99.0.2 5302)" = lan-host ]
 # A packet from the namespace that escaped its SNAT must not open a connection
 # into the LAN: only replies may be forwarded from the veth.
-_drops() { iptables -L FORWARD -v -x -n | awk -v dev="$VETH" '$3 == "DROP" && $6 == dev { print $1; exit }'; }
+_drops() { iptables -L FORWARD -v -x -n | awk -v dev="$VETH" '$3 == "DROP" && $0 ~ " " dev " " && $0 !~ /mark/ { print $1; exit }'; }
 _before="$(_drops)"
 ip netns exec "$NS" iptables -t nat -I POSTROUTING -s 10.7.0.1 -j RETURN
 check "the veth cannot open connections into the LAN" [ "$(read_from "$NS" 10.99.0.2 5302 10.7.0.1)" = closed ]
