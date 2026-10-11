@@ -418,7 +418,11 @@ _lan="$(client_tcp "$LAN")"
 if [ "${_lan%% *}" -gt 0 ] 2>/dev/null; then pass "LAN TCP on a Policy Table route reaches Xray without WireGuard"
 else
     fail "LAN TCP on a Policy Table route reaches Xray without WireGuard"
-    { ip rule show; ip route show table "$UTABLE"; cat /proc/sys/net/ipv4/conf/all/rp_filter \
+    { ip route get "$TARGET" from 10.99.0.2 iif pu-lab-l0 mark 0x21670000
+      iptables -t mangle -L PREROUTING -v -n | head -8
+      nstat -az 2>/dev/null | awk '$2 > 0 && /IpIn|IpOut|IpForw|IpExtInNoRoutes/'
+      cat /proc/sys/net/ipv4/conf/pu-lab-l0/forwarding /proc/sys/net/ipv4/conf/pu-lab-l0/rp_filter
+      ip rule show; ip route show table "$UTABLE"; cat /proc/sys/net/ipv4/conf/all/rp_filter \
         "/proc/sys/net/ipv4/conf/$VETH/rp_filter" /proc/sys/net/ipv4/ip_forward
       iptables -L FORWARD -v -n | head -12; iptables -t mangle -L PU_LAB_TP -v -n
       iptables -t mangle -L POSTROUTING -v -n | grep -i tcpmss; iptables -L PU_LAB_IN -v -n
