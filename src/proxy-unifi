@@ -94,8 +94,10 @@ INGRESS_TABLE="7707"
 INGRESS_PREF="10"
 INGRESS_TP_CHAIN="PROXY_UNIFI_TP"
 INGRESS_IN_CHAIN="PROXY_UNIFI_IN"
-INGRESS_RT_MARK="0x40000000"                    # LAN route replies; outside UniFi's and Tailscale's mark bits
-INGRESS_RT_PREF="9"
+INGRESS_LR="pu-lr0"                             # LAN route veth, root end (LAN_ROUTE=on)
+INGRESS_LR_NS="pu-lr1"
+INGRESS_LR_HOST_IP="169.254.77.5"
+INGRESS_LR_NS_IP="169.254.77.6"
 INGRESS_RT_METRIC="1"                           # wins over UniFi's own route in its client table
 HOST_MOUNT_NS="/proc/1/ns/mnt"                  # the mount namespace named netns live in
 
@@ -1643,32 +1645,40 @@ _ingress_setup() {
     _ingress_step ip -n "$INGRESS_NS" rule add pref 100 iif "$INGRESS_VETH_NS" lookup 100 || return 1
     _ingress_step ip netns exec "$INGRESS_NS" iptables -t nat -A POSTROUTING \
         -o "$INGRESS_VETH_NS" -j SNAT --to-source "$INGRESS_NS_IP" || return 1
-    [ "$LAN_ROUTE" = on ] || return 0
-    # LAN route mode: connections that enter from the veth (LAN traffic UniFi
-    # routed here) leave through the veth again, both ways: out to Xray
-    # (SNATed like tunnel traffic) and their replies back to the gateway.
+    [ "$LAN_ROUTE" = on ] && [ -z "$(_ingress_rt_blocker)" ] || return 0
+    # LAN route mode: a second veth pair carries the LAN traffic UniFi routes
+    # here. The namespace sends it on through the first pair to Xray (SNATed
+    # like tunnel traffic) and returns the replies through the second pair.
+    _ingress_step ip link add "$INGRESS_LR" type veth peer name "$INGRESS_LR_NS" \
+        netns "$INGRESS_NS" || return 1
+    _ingress_step ip addr add "$INGRESS_LR_HOST_IP/30" dev "$INGRESS_LR" || return 1
+    # The tunnel MTU here too: the gateway, not the namespace, then answers
+    # oversized LAN packets, and the MSS clamp below fits the first pair.
+    _ingress_step ip link set "$INGRESS_LR" mtu "$WG_MTU" up || return 1
+    _ingress_step ip -n "$INGRESS_NS" addr add "$INGRESS_LR_NS_IP/30" dev "$INGRESS_LR_NS" || return 1
+    _ingress_step ip -n "$INGRESS_NS" link set "$INGRESS_LR_NS" mtu "$WG_MTU" up || return 1
     # shellcheck disable=SC2016 # expanded by the namespaced shell
     _ingress_step ip netns exec "$INGRESS_NS" sh -c '
-        for c in all "$1"; do echo 0 > "/proc/sys/net/ipv4/conf/$c/send_redirects" || exit 1; done
+        echo 0 > "/proc/sys/net/ipv4/conf/$1/rp_filter" &&
         iptables -t mangle -A PREROUTING -i "$1" -m conntrack --ctstate NEW \
             -j CONNMARK --set-xmark 0x1/0x1 &&
-        iptables -t mangle -A PREROUTING -i "$1" -m connmark --mark 0x1/0x1 \
-            -j MARK --set-xmark 0x1/0x1' sh "$INGRESS_VETH_NS" || return 1
-    _ingress_step ip -n "$INGRESS_NS" route add default via "$INGRESS_HOST_IP" \
-        dev "$INGRESS_VETH_NS" table 101 || return 1
+        iptables -t mangle -A PREROUTING -i "$2" -m connmark --mark 0x1/0x1 \
+            -j MARK --set-xmark 0x1/0x1' sh "$INGRESS_LR_NS" "$INGRESS_VETH_NS" || return 1
+    _ingress_step ip -n "$INGRESS_NS" route add default via "$INGRESS_LR_HOST_IP" \
+        dev "$INGRESS_LR_NS" table 101 || return 1
     _ingress_step ip -n "$INGRESS_NS" rule add pref 90 fwmark 0x1/0x1 lookup 101 || return 1
     _ingress_rt_route
 }
 
 # LAN route mode (LAN_ROUTE=on). UniFi's Policy Table sends LAN traffic to the
-# VPN client's table; a lower-metric default route there sends it into our veth
-# instead of WireGuard. UniFi's whole pipeline still runs first: its marking,
-# NAT (DNS interception, hotspot), the main and Tailscale tables, and the
-# FORWARD firewall (which sees the veth, not wgclt, as the egress interface).
-# The namespace sends the traffic back through the veth to Xray's TPROXY path,
-# and the replies return the same way. From the veth, the gateway only forwards
-# replies of connections it forwarded there itself. The gateway's own traffic
-# through the client keeps the WireGuard path.
+# VPN client's table; a lower-metric default route there sends it into our
+# second veth pair instead of WireGuard. UniFi's whole pipeline still runs
+# first: its marking, NAT (DNS interception, hotspot), the main and Tailscale
+# tables, and the FORWARD firewall (which sees pu-lr0, not wgclt, as the egress
+# interface). The namespace passes the traffic to Xray's TPROXY path through
+# the first pair and returns the replies through the second, where the gateway
+# forwards only replies of connections it forwarded there itself. The gateway's
+# own traffic through the client keeps the WireGuard path.
 
 # The UniFi VPN client's routing table (the one whose default route uses it).
 _ingress_rt_table() {
@@ -1680,47 +1690,40 @@ _ingress_rt_table() {
         END { exit !found }'
 }
 
-# Why the mode cannot run here, if it cannot: replies arrive from the veth with
-# remote sources, which strict reverse-path filtering would drop.
+# Why the mode cannot run here, if it cannot: replies arrive with remote
+# sources on pu-lr0, which strict reverse-path filtering would drop.
 _ingress_rt_blocker() {
     [ "$(cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null)" != 1 ] \
         || echo "net.ipv4.conf.all.rp_filter is strict (1)"
 }
 
-# Route the client's table into the veth (needs the veth to exist).
+# Route the client's table into the pair (once it exists).
 _ingress_rt_route() {
     [ "$LAN_ROUTE" = on ] && [ -z "$(_ingress_rt_blocker)" ] || return 0
-    ip link show "$INGRESS_VETH" >/dev/null 2>&1 || return 0
-    _ingress_step sh -c "echo 0 > /proc/sys/net/ipv4/conf/$INGRESS_VETH/rp_filter" || return 1
+    ip link show "$INGRESS_LR" >/dev/null 2>&1 || return 0
+    _ingress_step sh -c "echo 0 > /proc/sys/net/ipv4/conf/$INGRESS_LR/rp_filter" || return 1
     _rr_tbl="$(_ingress_rt_table)" || return 0
-    _ingress_step ip route replace default via "$INGRESS_NS_IP" dev "$INGRESS_VETH" \
+    _ingress_step ip route replace default via "$INGRESS_LR_NS_IP" dev "$INGRESS_LR" \
         table "$_rr_tbl" metric "$INGRESS_RT_METRIC"
 }
 
 _ingress_rt_ok() {
     [ "$LAN_ROUTE" = on ] && [ -z "$(_ingress_rt_blocker)" ] || return 0
-    # Replies (sources other than the namespace) are marked and skip TPROXY.
-    iptables -t mangle -S "$INGRESS_TP_CHAIN" 2>/dev/null | sed -n 2p | grep -q -- "-j MARK" \
-        && iptables -t mangle -C "$INGRESS_TP_CHAIN" ! -s "$INGRESS_NS_IP" \
-            -j MARK --set-xmark "$INGRESS_RT_MARK/$INGRESS_RT_MARK" 2>/dev/null \
-        && iptables -t mangle -C "$INGRESS_TP_CHAIN" -m mark --mark "$INGRESS_RT_MARK/$INGRESS_RT_MARK" \
-            -j RETURN 2>/dev/null \
-        && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -m mark --mark "$INGRESS_RT_MARK/$INGRESS_RT_MARK" \
-            -j DROP 2>/dev/null \
-        && iptables -S FORWARD 2>/dev/null | grep -m 1 -- "-i $INGRESS_VETH " | grep -q -- "-j ACCEPT" \
-        && iptables -C FORWARD -i "$INGRESS_VETH" -m mark --mark "$INGRESS_RT_MARK/$INGRESS_RT_MARK" \
-            -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j ACCEPT 2>/dev/null \
-        && iptables -t mangle -C POSTROUTING -o "$INGRESS_VETH" ! -d "$INGRESS_NS_IP" -p tcp \
+    iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_LR" -j DROP 2>/dev/null \
+        && iptables -S FORWARD 2>/dev/null | grep -m 1 -- "-i $INGRESS_LR " | grep -q -- "-j ACCEPT" \
+        && iptables -C FORWARD -i "$INGRESS_LR" -m conntrack --ctstate ESTABLISHED,RELATED \
+            --ctdir REPLY -j ACCEPT 2>/dev/null \
+        && iptables -C FORWARD -i "$INGRESS_LR" -j DROP 2>/dev/null \
+        && iptables -t mangle -C POSTROUTING -o "$INGRESS_LR" -p tcp \
             --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
-        && ip rule show 2>/dev/null | grep -q "^$INGRESS_RT_PREF:.* iif $INGRESS_VETH .*lookup main" \
         || return 1
-    ip link show "$INGRESS_VETH" >/dev/null 2>&1 || return 0
+    ip link show "$INGRESS_LR" >/dev/null 2>&1 || return 0
     _ro_tbl="$(_ingress_rt_table)" || return 0
     ip route show table "$_ro_tbl" 2>/dev/null \
-        | grep -q "^default via $INGRESS_NS_IP dev $INGRESS_VETH .*metric $INGRESS_RT_METRIC\\( \\|\$\\)"
+        | grep -q "^default via $INGRESS_LR_NS_IP dev $INGRESS_LR .*metric $INGRESS_RT_METRIC\\( \\|\$\\)"
 }
 
-# Root-namespace rules of the mode; called after the TPROXY chain is rebuilt.
+# Root-namespace rules of the mode; they name pu-lr0 before it exists.
 _ingress_rt_add() {
     _ingress_rt_del
     if [ "$LAN_ROUTE" = on ] && _ra_why="$(_ingress_rt_blocker)" && [ -n "$_ra_why" ]; then
@@ -1729,34 +1732,25 @@ _ingress_rt_add() {
     fi
     rm -f "$INGRESS_RUN/lan-route.error"
     [ "$LAN_ROUTE" = on ] || return 0
-    _ra_mark="$INGRESS_RT_MARK/$INGRESS_RT_MARK"
-    _ingress_step iptables -t mangle -I "$INGRESS_TP_CHAIN" 1 \
-        -m mark --mark "$_ra_mark" -j RETURN || return 1
-    _ingress_step iptables -t mangle -I "$INGRESS_TP_CHAIN" 1 ! -s "$INGRESS_NS_IP" \
-        -j MARK --set-xmark "$_ra_mark" || return 1
-    # Replies are only ever forwarded, never delivered to the gateway itself.
-    _ingress_step iptables -I "$INGRESS_IN_CHAIN" 1 -i "$INGRESS_VETH" -m mark --mark "$_ra_mark" \
-        -j DROP || return 1
-    # Only replies, of connections the gateway forwarded into the veth.
-    _ingress_step iptables -I FORWARD 1 -i "$INGRESS_VETH" -m mark --mark "$_ra_mark" \
-        -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j ACCEPT || return 1
+    # Nothing from the pair is for the gateway itself.
+    _ingress_step iptables -I "$INGRESS_IN_CHAIN" 1 -i "$INGRESS_LR" -j DROP || return 1
+    # Only replies, of connections the gateway forwarded into the pair.
+    _ingress_step iptables -I FORWARD 1 -i "$INGRESS_LR" -j DROP || return 1
+    _ingress_step iptables -I FORWARD 1 -i "$INGRESS_LR" -m conntrack --ctstate ESTABLISHED,RELATED \
+        --ctdir REPLY -j ACCEPT || return 1
     # Clamp like UniFi does for wgclt; the counter shows what its firewall let through.
-    _ingress_step iptables -t mangle -A POSTROUTING -o "$INGRESS_VETH" ! -d "$INGRESS_NS_IP" -p tcp \
+    _ingress_step iptables -t mangle -A POSTROUTING -o "$INGRESS_LR" -p tcp \
         --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || return 1
-    _ingress_step ip rule add pref "$INGRESS_RT_PREF" iif "$INGRESS_VETH" fwmark "$_ra_mark" \
-        lookup main || return 1
     _ingress_rt_route
 }
 
-# Idempotent; the route goes with the veth.
+# Idempotent; the route goes with the pair.
 _ingress_rt_del() {
-    _rd_mark="$INGRESS_RT_MARK/$INGRESS_RT_MARK"
-    while iptables -D FORWARD -i "$INGRESS_VETH" -m mark --mark "$_rd_mark" \
-        -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j ACCEPT 2>/dev/null; do :; done
-    while iptables -t mangle -D POSTROUTING -o "$INGRESS_VETH" ! -d "$INGRESS_NS_IP" -p tcp \
+    while iptables -D FORWARD -i "$INGRESS_LR" -m conntrack --ctstate ESTABLISHED,RELATED \
+        --ctdir REPLY -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -i "$INGRESS_LR" -j DROP 2>/dev/null; do :; done
+    while iptables -t mangle -D POSTROUTING -o "$INGRESS_LR" -p tcp \
         --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
-    while ip rule del pref "$INGRESS_RT_PREF" iif "$INGRESS_VETH" fwmark "$_rd_mark" \
-        lookup main 2>/dev/null; do :; done
     return 0
 }
 
@@ -1766,7 +1760,7 @@ ingress_rt_status() {
     [ ! -s "$INGRESS_RUN/lan-route.error" ] || { echo "blocked: $(cat "$INGRESS_RUN/lan-route.error")"; return 0; }
     _rs_tbl="$(_ingress_rt_table)" || { echo "on, waiting for a Policy Table route to the VPN client"; return 0; }
     _rs_syn="$(iptables -t mangle -L POSTROUTING -v -x -n 2>/dev/null \
-        | awk -v dev="$INGRESS_VETH" '$0 ~ /TCPMSS/ && $0 ~ dev { print $1; exit }')"
+        | awk -v dev="$INGRESS_LR" '$0 ~ /TCPMSS/ && $0 ~ " " dev " " { print $1; exit }')"
     echo "on via table $_rs_tbl (${_rs_syn:-0} TCP connections passed UniFi's firewall)"
 }
 
@@ -1856,6 +1850,7 @@ _ingress_rules_del() {
 ingress_down() {
     if have ip; then
         ip link del "$INGRESS_VETH" 2>/dev/null || true
+        ip link del "$INGRESS_LR" 2>/dev/null || true
         ip -n "$INGRESS_NS" link del "$INGRESS_WG" 2>/dev/null || true
         ip link del "$INGRESS_WG" 2>/dev/null || true
         ip netns del "$INGRESS_NS" 2>/dev/null || true
@@ -3260,7 +3255,7 @@ menu_wg_settings() {
            printf 'WireGuard ingress, kernel or userspace [%s]: ' "$INGRESS"; read -r _v || true
            if [ -n "${_v:-}" ]; then locked_call cmd_set ingress "$_v"; else c_ylw "Unchanged."; fi ;;
         5) echo "on:  Policy Table traffic to the VPN client is routed to Xray without WireGuard"
-           echo "     (kernel ingress only; UniFi's firewall sees pu-veth0 as its egress interface)."
+           echo "     (kernel ingress only; UniFi's firewall sees pu-lr0 as its egress interface)."
            echo "off: that traffic is encrypted into the WireGuard tunnel as before."
            printf 'LAN route, on or off [%s]: ' "$LAN_ROUTE"; read -r _v || true
            if [ -n "${_v:-}" ]; then locked_call cmd_set lan-route "$_v"; else c_ylw "Unchanged."; fi ;;

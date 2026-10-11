@@ -92,7 +92,10 @@ sed \
     -e "s|^INGRESS_PREF=.*|INGRESS_PREF=\"11\"|" \
     -e "s|^INGRESS_TP_CHAIN=.*|INGRESS_TP_CHAIN=\"PU_LAB_TP\"|" \
     -e "s|^INGRESS_IN_CHAIN=.*|INGRESS_IN_CHAIN=\"PU_LAB_IN\"|" \
-    -e "s|^INGRESS_RT_PREF=.*|INGRESS_RT_PREF=\"12\"|" \
+    -e "s|^INGRESS_LR=.*|INGRESS_LR=\"pu-lab-r0\"|" \
+    -e "s|^INGRESS_LR_NS=.*|INGRESS_LR_NS=\"pu-lab-r1\"|" \
+    -e "s|^INGRESS_LR_HOST_IP=.*|INGRESS_LR_HOST_IP=\"169.254.78.5\"|" \
+    -e "s|^INGRESS_LR_NS_IP=.*|INGRESS_LR_NS_IP=\"169.254.78.6\"|" \
     -e "s|^HOST_MOUNT_NS=.*|HOST_MOUNT_NS=\"/proc/$$/ns/mnt\"|" \
     -e "s|^FW_CHAIN=.*|FW_CHAIN=\"PU_LAB_WG\"|" \
     "$REPO/src/proxy-unifi" > "$T/cli"
@@ -413,7 +416,7 @@ else pass "status skips a shared UDP port"; fi
 
 # 1b. LAN route mode: UniFi's pipeline first, then Xray instead of WireGuard.
 check "LAN route in the VPN client's table" \
-    sh -c "ip route show table $UTABLE | grep -q '^default via 169.254.78.2 dev $VETH .*metric 1'"
+    sh -c "ip route show table $UTABLE | grep -q '^default via 169.254.78.6 dev pu-lab-r0 .*metric 1'"
 _lan="$(client_tcp "$LAN")"
 if [ "${_lan%% *}" -gt 0 ] 2>/dev/null; then pass "LAN TCP on a Policy Table route reaches Xray without WireGuard"
 else
@@ -429,7 +432,7 @@ else
       nstat -az 2>/dev/null | awk '$2 > 0 && /IpIn|IpOut|IpForw|IpExtInNoRoutes/'
       cat /proc/sys/net/ipv4/conf/pu-lab-l0/forwarding /proc/sys/net/ipv4/conf/pu-lab-l0/rp_filter
       ip rule show; ip route show table "$UTABLE"; cat /proc/sys/net/ipv4/conf/all/rp_filter \
-        "/proc/sys/net/ipv4/conf/$VETH/rp_filter" /proc/sys/net/ipv4/ip_forward
+        /proc/sys/net/ipv4/conf/pu-lab-r0/rp_filter /proc/sys/net/ipv4/ip_forward
       iptables -L FORWARD -v -n | head -12; iptables -t mangle -L PU_LAB_TP -v -n
       iptables -t mangle -L POSTROUTING -v -n | grep -i tcpmss; iptables -L PU_LAB_IN -v -n
       ip netns exec "$NS" iptables -t mangle -L PREROUTING -v -n
@@ -449,14 +452,14 @@ iptables -R PU_LAB_FW 1 -j DROP
 check "UniFi's FORWARD firewall still decides" [ "$(client_tcp "$LAN" | cut -d' ' -f1)" = 0 ]
 iptables -R PU_LAB_FW 1 -j ACCEPT
 check "the LAN host answers the gateway" [ "$(read_from - 10.99.0.2 5302)" = lan-host ]
-# A packet from the namespace that escaped its SNAT must not open a connection
-# into the LAN: only replies may be forwarded from the veth.
-_drops() { iptables -L FORWARD -v -x -n | awk -v dev="$VETH" '$3 == "DROP" && $0 ~ " " dev " " && $0 !~ /mark/ { print $1; exit }'; }
+# From the second pair, the gateway forwards only replies and delivers nothing.
+_drops() { iptables -L FORWARD -v -x -n | awk '$3 == "DROP" && / pu-lab-r0 / && !/ctdir/ { print $1; exit }'; }
 _before="$(_drops)"
-ip netns exec "$NS" iptables -t nat -I POSTROUTING -s 10.7.0.1 -j RETURN
-check "the veth cannot open connections into the LAN" [ "$(read_from "$NS" 10.99.0.2 5302 10.7.0.1)" = closed ]
-check "the veth's FORWARD guard dropped that attempt" [ "$(_drops)" -gt "${_before:-0}" ]
-ip netns exec "$NS" iptables -t nat -D POSTROUTING -s 10.7.0.1 -j RETURN
+ip -n "$NS" route add 10.99.0.2/32 via 169.254.78.5 dev pu-lab-r1
+check "the pair cannot open connections into the LAN" [ "$(read_from "$NS" 10.99.0.2 5302)" = closed ]
+check "the pair's FORWARD guard dropped that attempt" [ "$(_drops)" -gt "${_before:-0}" ]
+ip -n "$NS" route del 10.99.0.2/32 via 169.254.78.5 dev pu-lab-r1
+check "the pair cannot reach the gateway's own services" [ "$(read_from "$NS" 169.254.78.5 "$SERVICE")" = closed ]
 cli status > "$T/status.out" 2>&1 || true
 check "status reports LAN route mode" grep -q "^lan route: on via table $UTABLE ([1-9]" "$T/status.out"
 
@@ -472,7 +475,7 @@ fi
 iptables -D INPUT -j PU_LAB_IN
 ip rule del pref 11 iif "$VETH" lookup 7708
 check "traffic stops without the rules" [ "$(client_tcp | cut -d' ' -f1)" = 0 ]
-ip route del default via 169.254.78.2 dev "$VETH" table "$UTABLE" metric 1
+ip route del default via 169.254.78.6 dev pu-lab-r0 table "$UTABLE" metric 1
 check "LAN traffic stops without the LAN route" [ "$(client_tcp "$LAN" | cut -d' ' -f1)" = 0 ]
 cli _fw-reconcile > "$T/reconcile.log" 2>&1 || true
 _tcp="$(client_tcp)"
@@ -490,8 +493,9 @@ check "teardown removes the namespace and links" \
     sh -c "! ip netns list | cut -d' ' -f1 | grep -qx $NS && ! ip link show $VETH >/dev/null 2>&1"
 check "teardown removes rules, route and guard" sh -c "
     ! iptables -t mangle -S | grep -q PU_LAB_TP && ! iptables -S | grep -q 'PU_LAB_IN\|PU_LAB_WG\|$VETH' \
-    && ! ip rule show | grep -q 'lookup 7708\|^12:' && [ -z \"\$(ip route show table 7708 2>/dev/null)\" ] \
-    && ! iptables -t mangle -S POSTROUTING | grep -q $VETH && ! ip route show table $UTABLE | grep -q $VETH"
+    && ! ip rule show | grep -q 'lookup 7708' && [ -z \"\$(ip route show table 7708 2>/dev/null)\" ] \
+    && ! ip link show pu-lab-r0 >/dev/null 2>&1 && ! iptables -S | grep -q pu-lab-r0 \
+    && ! iptables -t mangle -S POSTROUTING | grep -q pu-lab-r0 && ! ip route show table $UTABLE | grep -q pu-lab-r0"
 check "teardown removes the marker and overlay" sh -c "[ ! -e '$T/run/kernel-ingress' ] && [ ! -e '$T/run/ingress.json' ]"
 if [ "$MODE" = wireguard ]; then
     check "teardown frees the WireGuard port" sh -c "! ss -lun | grep -q ':$WG_PORT '"

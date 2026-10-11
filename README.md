@@ -95,13 +95,15 @@ to Xray, which routes it exactly as before (same inbound tag and sniffing).
   refuse private and loopback targets for tunnel clients.
 - **LAN route (optional, off by default):** `proxy set lan-route on`, or the menu
   under WireGuard settings. LAN traffic that a Policy Table route sends to this
-  VPN Client is routed into proxy-unifi's veth instead of being encrypted, and
+  VPN Client is routed into a second proxy-unifi veth pair instead of being
+  encrypted, and
   reaches Xray without both WireGuard passes. UniFi still processes it first: its
   marking, NAT (DNS interception, hotspot), its other routing tables, and its
-  FORWARD firewall. The firewall sees `pu-veth0` instead of `wgclt` as the egress
+  FORWARD firewall. The firewall sees `pu-lr0` instead of `wgclt` as the egress
   interface, so rules written for the VPN zone's interface do not match; rules by
   address or by LAN interface still do. Only replies to connections the gateway
-  forwarded into the veth come back from it. The gateway's own traffic keeps the
+  forwarded into the pair come back from it, and nothing from it reaches the
+  gateway itself. The gateway's own traffic keeps the
   WireGuard path. `proxy status` shows `lan route` with how many TCP connections
   UniFi's firewall let through; it reports `blocked` if strict reverse-path
   filtering (`rp_filter=1`) rules the mode out.
