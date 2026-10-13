@@ -180,11 +180,16 @@ class Bulk(http.server.BaseHTTPRequestHandler):
             pass
     def log_message(self, *args):
         pass
-def echo(name, host, reuse):
+def echo(name, host, reuse, port=0):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     if reuse:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((host, 0))
+    while True:
+        try:
+            s.bind((host, port))
+            break
+        except OSError:
+            port += 1
     publish(name, s.getsockname()[1])
     while True:
         data, peer = s.recvfrom(2048)
@@ -199,7 +204,9 @@ def service():
         conn, _ = s.accept()
         conn.sendall(b"gateway-service")
         conn.close()
-for args in (("echo", "127.0.0.1", False), ("clash", "0.0.0.0", False), ("shared", "0.0.0.0", True)):
+# "fixed" sits below the ephemeral port range, like a gateway service.
+for args in (("echo", "127.0.0.1", False), ("clash", "0.0.0.0", False), ("shared", "0.0.0.0", True),
+             ("fixed", "0.0.0.0", False, 20000)):
     threading.Thread(target=echo, args=args, daemon=True).start()
 threading.Thread(target=service, daemon=True).start()
 server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Bulk)
@@ -209,12 +216,13 @@ PY
 python3 "$T/servers.py" "$T/state" >/dev/null 2>&1 &
 PIDS="$PIDS $!"
 _i=0
-while [ ! -s "$T/state/bulk" ] || [ ! -s "$T/state/shared" ] || [ ! -s "$T/state/service" ]; do
+while [ ! -s "$T/state/bulk" ] || [ ! -s "$T/state/shared" ] || [ ! -s "$T/state/service" ] \
+    || [ ! -s "$T/state/fixed" ]; do
     _i=$((_i + 1)); [ "$_i" -lt 100 ] || { fail "lab servers start"; exit 1; }
     sleep 0.05
 done
 BULK="$(cat "$T/state/bulk")"; ECHO="$(cat "$T/state/echo")"
-CLASH="$(cat "$T/state/clash")"; SHARED="$(cat "$T/state/shared")"
+CLASH="$(cat "$T/state/clash")"; SHARED="$(cat "$T/state/shared")"; FIXED="$(cat "$T/state/fixed")"
 SERVICE="$(cat "$T/state/service")"
 
 start_core() {  # <overlay>: the core runs unprivileged, with CAP_NET_RAW only
@@ -338,7 +346,10 @@ fi
 cli status > "$T/status.out" 2>&1 || true
 check "status reports the kernel path" grep -q '^ingress:   kernel WireGuard' "$T/status.out"
 check "status reports the guarded port" grep -q "^wg listen: 0.0.0.0:$WG_PORT (loopback only" "$T/status.out"
-check "status names the clashing UDP port" grep -q "^udp note: .*\\b$CLASH/" "$T/status.out"
+check "status names a clashing service port" grep -q "^udp note: .* $FIXED/python" "$T/status.out"
+check "status names programs on ephemeral ports" grep -q "^udp note: .*and ephemeral ports of .*python" "$T/status.out"
+if grep -q "^udp note: .*\\b$CLASH/" "$T/status.out"; then fail "status omits ephemeral port numbers"
+else pass "status omits ephemeral port numbers"; fi
 if grep -q "^udp note: .*\\b$SHARED/" "$T/status.out"; then fail "status skips a shared UDP port"
 else pass "status skips a shared UDP port"; fi
 
