@@ -1228,13 +1228,15 @@ write_service() {
     # (ExecStartPre) and clean up on stop. Every start first removes a kernel
     # ingress left by a previous Xray core (which also clears a stale guard);
     # an Xray core in kernel mode instead builds that path before it starts,
-    # loads the resulting overlay last, and may bind transparent sockets.
+    # loads the resulting overlay last, and may bind transparent sockets. Those
+    # include UDP reply sockets on the remote port (DNS 53, QUIC 443), which
+    # need CAP_NET_BIND_SERVICE below 1024.
     _fwpre="ExecStartPre=-+$BIN_DIR/proxy-unifi _ingress-down"; _fwpost=""
     _overlay=""; _caps=""
     if ingress_wanted; then
         _fwpre="ExecStartPre=+$BIN_DIR/proxy-unifi _ingress-up"
         _fwpost="ExecStopPost=-+$BIN_DIR/proxy-unifi _ingress-down"
-        _overlay=" -config $INGRESS_OVERLAY"; _caps="CAP_NET_RAW"
+        _overlay=" -config $INGRESS_OVERLAY"; _caps="CAP_NET_RAW CAP_NET_BIND_SERVICE"
     fi
     case "$(current_engine)" in
         awg)

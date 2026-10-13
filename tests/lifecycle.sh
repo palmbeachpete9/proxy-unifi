@@ -224,7 +224,7 @@ LINK_HASH="$(hash_file "$T/root/etc/link.txt")"
 grep -q '^ExecStartPre=+.*/proxy-unifi _ingress-up$' "$T/proxy-unifi.service"
 grep -q '^ExecStopPost=-+.*/proxy-unifi _ingress-down$' "$T/proxy-unifi.service"
 grep -q "^ExecStart=.*/xray run -config .*/config.json -config $T/run/ingress.json\$" "$T/proxy-unifi.service"
-grep -q '^AmbientCapabilities=CAP_NET_RAW$' "$T/proxy-unifi.service"
+grep -q '^AmbientCapabilities=CAP_NET_RAW CAP_NET_BIND_SERVICE$' "$T/proxy-unifi.service"
 
 # A parser failure after txn_begin must immediately restore the prior generation.
 printf '1\n%s\n\n0\n' "${LINK%#test}&unknownSemantic=x#bad" | menu_input >/dev/null 2>&1
