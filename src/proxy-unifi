@@ -1933,7 +1933,18 @@ for port, inode in sorted(ports):
             busy.setdefault(port, owners.get(inode) or "kernel")
     finally:
         probe.close()
-print(" ".join("%d/%s" % item for item in sorted(busy.items())))
+# Ports in the ephemeral range belong to short-lived client sockets (dnsmasq's
+# upstream queries) and change all the time: name only their programs.
+try:
+    with open("/proc/sys/net/ipv4/ip_local_port_range") as span:
+        low, high = map(int, span.read().split())
+except (OSError, ValueError):
+    low, high = 32768, 60999
+fixed = ["%d/%s" % item for item in sorted(busy.items()) if not low <= item[0] <= high]
+ephemeral = sorted({owner for port, owner in busy.items() if low <= port <= high})
+if ephemeral:
+    fixed.append("and ephemeral ports of " + ", ".join(ephemeral))
+print(" ".join(fixed))
 PYEOF
 }
 
