@@ -250,6 +250,19 @@ grep -q '^INGRESS="kernel"$' "$T/root/etc/settings.env"
 grep -q '^ExecStartPre=+.*/proxy-unifi _ingress-up$' "$T/proxy-unifi.service"
 if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
 
+# LAN route mode is a persisted on/off setting, from the menu and the CLI, also
+# while the service runs.
+run_cli start >/dev/null
+printf '8\n5\non\n\n0\n' | menu_input >/dev/null
+grep -q '^LAN_ROUTE="on"$' "$T/root/etc/settings.env"
+run_cli status | grep -q '^lan route: on, inactive until kernel WireGuard ingress runs$'
+if run_cli set lan-route maybe >/dev/null 2>&1; then exit 1; fi
+grep -q '^LAN_ROUTE="on"$' "$T/root/etc/settings.env"
+run_cli set lan-route off >/dev/null
+grep -q '^LAN_ROUTE="off"$' "$T/root/etc/settings.env"
+if run_cli status | grep -q '^lan route:'; then exit 1; fi
+run_cli stop >/dev/null
+
 # Standards-compliant SS2022 switches to the existing sing-box core, preserves
 # the UniFi-facing WG identity, and rolls back atomically on an invalid key.
 SS_WG_PRIVATE_HASH="$(hash_file "$T/root/etc/wg/wg_private.key")"

@@ -2308,6 +2308,7 @@ cmd_status() {
         else
             echo "ingress:   kernel WireGuard (once the service runs)"
         fi
+        ingress_active || [ "$LAN_ROUTE" = off ] || echo "lan route: on, inactive until kernel WireGuard ingress runs"
     fi
     if have ss; then
         if socket_listening "$WG_PORT"; then c_grn "udp/${WG_PORT}: listening"; else c_ylw "udp/${WG_PORT}: not listening"; fi
@@ -3832,6 +3833,7 @@ Direct commands (quick ops / scripting):
   proxy logs [args]  Tail service logs (passes args to journalctl)
   proxy update       Update cores/assets with runtime rollback
   proxy geo-update   Update geo files with checksum + rollback
+  proxy set KEY VAL  Change a setting: port|mtu|dns|keepalive|loglevel|ingress|lan-route|ping
   proxy help         This help
 
 Everything else lives in the menu (run 'proxy').
@@ -3863,6 +3865,7 @@ case "$cmd" in
     bench)        cmd_bench "$@" ;;
     update)       cmd_update ;;
     geo-update)   cmd_geo_update ;;
+    set)          cmd_set "${1:-}" "${2:-}" ;;
     -h|--help|help) usage ;;
     # internal hooks (used only by install.sh, the boot hook, and the systemd
     # unit's ExecStartPre/ExecStopPost; not user-facing). _fw-lock is deliberately
