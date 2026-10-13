@@ -1778,6 +1778,8 @@ ingress_rt_status() {
     [ "$LAN_ROUTE" = on ] || { echo off; return 0; }
     [ ! -s "$INGRESS_RUN/lan-route.error" ] || { echo "blocked: $(cat "$INGRESS_RUN/lan-route.error")"; return 0; }
     _rs_tbl="$(_ingress_rt_table)" || { echo "on, waiting for a Policy Table route to the VPN client"; return 0; }
+    ip route show table "$_rs_tbl" 2>/dev/null | grep -q "^default via $INGRESS_LR_NS_IP dev $INGRESS_LR " \
+        || { echo "on, route into table $_rs_tbl missing (the guard timer restores it within 30 s)"; return 0; }
     _rs_syn="$(iptables -t mangle -L POSTROUTING -v -x -n 2>/dev/null \
         | awk -v dev="$INGRESS_LR" '$0 ~ /TCPMSS/ && $0 ~ " " dev " " { print $1; exit }')"
     echo "on via table $_rs_tbl (${_rs_syn:-0} TCP connections passed UniFi's firewall)"
