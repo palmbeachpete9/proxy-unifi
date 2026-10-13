@@ -341,9 +341,11 @@ ensure_run_dir() {
 
 acquire_lock() {
     [ "$LOCK_HELD" = 1 ] && return 0
-    # POSIX shells keep $$ unchanged in (...) subshells. Ask a short-lived child
-    # for its PPID so a menu action records its real process id in the lock.
-    LOCK_OWNER="$(sh -c 'printf "%s\n" "$PPID"' 2>/dev/null || true)"
+    # POSIX shells keep $$ unchanged in (...) subshells, so a menu action reads
+    # its real process id from /proc. A $(...) child would record its own,
+    # already exited, process id and every other caller would take the lock.
+    LOCK_OWNER=""
+    { read -r LOCK_OWNER _ < /proc/self/stat; } 2>/dev/null || true
     case "$LOCK_OWNER" in ""|*[!0-9]*) LOCK_OWNER="$$" ;; esac
     mkdir -p "$ROOT" || fatal "could not create $ROOT"
     _tries=0

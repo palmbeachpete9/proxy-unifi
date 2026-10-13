@@ -65,6 +65,10 @@ for arg in "$@"; do case "$arg" in --*) : ;; *) unit="$arg" ;; esac; done
 case "$unit" in /*) echo "mock systemctl: '$unit' is a path, not a unit name" >&2; exit 1 ;; esac
 key="$(printf '%s' "$unit" | tr '/.' '__')"
 start_service() {
+    # The CLI holds its lock here: a dead owner would let any other caller take it.
+    if [ -d "$D/../root/.lock" ] && ! kill -0 "$(cat "$D/../root/.lock/pid")" 2>/dev/null; then
+        : > "$D/stale-lock"
+    fi
     if [ -s "$D/pid" ]; then kill "$(cat "$D/pid")" 2>/dev/null || true; fi
     sleep 300 & echo $! > "$D/pid"; : > "$D/active_$key"
 }
@@ -457,4 +461,5 @@ if run_cli bench 5 'ftp://example.com/x' > "$T/bench.out" 2>&1; then exit 1; fi
 grep -q 'bench URL must start with http:// or https://' "$T/bench.out"
 run_cli help | grep -q '^  proxy bench '
 
+[ ! -e "$STATE/stale-lock" ] || { echo "lock recorded a dead owner" >&2; exit 1; }
 echo lifecycle-ok
