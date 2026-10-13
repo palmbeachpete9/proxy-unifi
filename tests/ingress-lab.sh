@@ -474,6 +474,25 @@ check "the pair cannot open connections into the LAN" [ "$(read_from "$NS" 10.99
 check "the pair's FORWARD guard dropped that attempt" [ "$(_drops)" -gt "${_before:-0}" ]
 ip -n "$NS" route del 10.99.0.2/32 via 169.254.78.5 dev pu-lab-r1
 check "the pair cannot reach the gateway's own services" [ "$(read_from "$NS" 169.254.78.5 "$SERVICE")" = closed ]
+# UniFi's DNS forwarder for the client sends the gateway's own queries with the
+# client's mark; their replies come back through the pair.
+_own="$(python3 - "$TARGET" "$ECHO" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, 36, 0x21670000)  # SO_MARK
+s.settimeout(1)
+for _ in range(3):
+    s.sendto(b"own", (sys.argv[1], int(sys.argv[2])))
+    try:
+        if s.recv(16) == b"own":
+            print("ok"); break
+    except socket.timeout:
+        pass
+else:
+    print("timeout")
+PY
+)"
+check "the gateway's own traffic through the client gets its replies" [ "$_own" = ok ]
 cli status > "$T/status.out" 2>&1 || true
 check "status reports LAN route mode" grep -q "^lan route: on via table $UTABLE ([1-9]" "$T/status.out"
 

@@ -1681,8 +1681,9 @@ _ingress_setup() {
 # tables, and the FORWARD firewall (which sees pu-lr0, not wgclt, as the egress
 # interface). The namespace passes the traffic to Xray's TPROXY path through
 # the first pair and returns the replies through the second, where the gateway
-# forwards only replies of connections it forwarded there itself. The gateway's
-# own traffic through the client keeps the WireGuard path.
+# forwards only replies of connections it forwarded there itself. Traffic the
+# gateway sends through the client itself (UniFi's DNS forwarder for it) takes
+# the pair too; of that, only replies come back in.
 
 # The UniFi VPN client's routing table (the one whose default route uses it).
 _ingress_rt_table() {
@@ -1713,7 +1714,9 @@ _ingress_rt_route() {
 
 _ingress_rt_ok() {
     [ "$LAN_ROUTE" = on ] && [ -z "$(_ingress_rt_blocker)" ] || return 0
-    iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_LR" -j DROP 2>/dev/null \
+    iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_LR" -m conntrack --ctstate ESTABLISHED,RELATED \
+            --ctdir REPLY -j ACCEPT 2>/dev/null \
+        && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_LR" -j DROP 2>/dev/null \
         && iptables -S FORWARD 2>/dev/null | grep -m 1 -- "-i $INGRESS_LR " | grep -q -- "-j ACCEPT" \
         && iptables -C FORWARD -i "$INGRESS_LR" -m conntrack --ctstate ESTABLISHED,RELATED \
             --ctdir REPLY -j ACCEPT 2>/dev/null \
@@ -1736,8 +1739,11 @@ _ingress_rt_add() {
     fi
     rm -f "$INGRESS_RUN/lan-route.error"
     [ "$LAN_ROUTE" = on ] || return 0
-    # Nothing from the pair is for the gateway itself.
+    # For the gateway itself, only replies of its own connections through the
+    # pair (UniFi's DNS forwarder for the client sends there too).
     _ingress_step iptables -I "$INGRESS_IN_CHAIN" 1 -i "$INGRESS_LR" -j DROP || return 1
+    _ingress_step iptables -I "$INGRESS_IN_CHAIN" 1 -i "$INGRESS_LR" -m conntrack \
+        --ctstate ESTABLISHED,RELATED --ctdir REPLY -j ACCEPT || return 1
     # Only replies, of connections the gateway forwarded into the pair.
     _ingress_step iptables -I FORWARD 1 -i "$INGRESS_LR" -j DROP || return 1
     _ingress_step iptables -I FORWARD 1 -i "$INGRESS_LR" -m conntrack --ctstate ESTABLISHED,RELATED \

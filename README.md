@@ -102,9 +102,9 @@ to Xray, which routes it exactly as before (same inbound tag and sniffing).
   FORWARD firewall. The firewall sees `pu-lr0` instead of `wgclt` as the egress
   interface, so rules written for the VPN zone's interface do not match; rules by
   address or by LAN interface still do. Only replies to connections the gateway
-  forwarded into the pair come back from it, and nothing from it reaches the
-  gateway itself. The gateway's own traffic keeps the
-  WireGuard path. `proxy status` shows `lan route` with how many TCP connections
+  forwarded into the pair come back from it. Traffic the gateway itself sends
+  through the VPN client (such as UniFi's DNS forwarder for it) takes the pair
+  too, and only its replies reach the gateway. `proxy status` shows `lan route` with how many TCP connections
   UniFi's firewall let through; it reports `blocked` if strict reverse-path
   filtering (`rp_filter=1`) rules the mode out.
 - **Measure:** the third line of `proxy bench` tests the full tunnel through the
