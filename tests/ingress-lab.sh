@@ -437,7 +437,7 @@ _lan="$(client_tcp "$LAN")"
 _tx1="$(_tx)"
 # Like WireGuard's, the pair's packets reach the LAN driver finished: no
 # TSO/GSO packets beyond the tunnel MTU (the average includes the Ethernet header).
-_avg="$(printf '%s %s\n' "$_tx0" "$_tx1" | awk '{ p = $4 - $2; print p > 0 ? int(($3 - $1) / p) : 0 }')"
+_avg="$(printf '%s %s\n' "$_tx0" "$_tx1" | awk '{ p = $4 - $2; print (p > 0 ? int(($3 - $1) / p) : 0) }')"
 info "LAN route: $_avg bytes per packet towards the LAN"
 check "LAN route packets reach the LAN at most MTU-sized" sh -c "[ $_avg -gt 0 ] && [ $_avg -le 1354 ]"
 if [ "${_lan%% *}" -gt 0 ] 2>/dev/null; then pass "LAN TCP on a Policy Table route reaches Xray without WireGuard"
