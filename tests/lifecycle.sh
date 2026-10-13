@@ -61,6 +61,10 @@ for arg in "$@"; do case "$arg" in --*) : ;; *) unit="$arg" ;; esac; done
 case "$unit" in /*) echo "mock systemctl: '$unit' is a path, not a unit name" >&2; exit 1 ;; esac
 key="$(printf '%s' "$unit" | tr '/.' '__')"
 start_service() {
+    # The CLI holds its lock here: a dead owner would let any other caller take it.
+    if [ -d "$D/../root/.lock" ] && ! kill -0 "$(cat "$D/../root/.lock/pid")" 2>/dev/null; then
+        : > "$D/stale-lock"
+    fi
     if [ -s "$D/pid" ]; then kill "$(cat "$D/pid")" 2>/dev/null || true; fi
     sleep 300 & echo $! > "$D/pid"; : > "$D/active_$key"
 }
@@ -423,4 +427,5 @@ printf '3\n6\n1\ny\n\n0\n' | menu_input >/dev/null
 [ ! -e "$T/root/.transactions/active" ] || exit 1
 [ ! -e "$T/root/.lock" ] || exit 1
 
+[ ! -e "$STATE/stale-lock" ] || { echo "lock recorded a dead owner" >&2; exit 1; }
 echo lifecycle-ok
