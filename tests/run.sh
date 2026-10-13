@@ -488,8 +488,8 @@ ExecStartPre=+/b/proxy-unifi _fw-lock" ] || _fw_ok=0
     [ "$(grep '^ExecStartPre=' "$_ud/unit")" = 'ExecStartPre=+/b/proxy-unifi _ingress-up' ] || _ki_ok=0
     grep -q '^ExecStopPost=-+/b/proxy-unifi _ingress-down$' "$_ud/unit" || _ki_ok=0
     grep -q '^ExecStart=/b/xray run -config /c/config.json -config /run/x/ingress.json$' "$_ud/unit" || _ki_ok=0
-    grep -q '^CapabilityBoundingSet=CAP_NET_RAW$' "$_ud/unit" || _ki_ok=0
-    grep -q '^AmbientCapabilities=CAP_NET_RAW$' "$_ud/unit" || _ki_ok=0
+    grep -q '^CapabilityBoundingSet=CAP_NET_RAW CAP_NET_BIND_SERVICE$' "$_ud/unit" || _ki_ok=0
+    grep -q '^AmbientCapabilities=CAP_NET_RAW CAP_NET_BIND_SERVICE$' "$_ud/unit" || _ki_ok=0
     grep -q '^NoNewPrivileges=true$' "$_ud/unit" || _ki_ok=0
     KERNEL=1 ENG=xraypool WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
     grep -q '^ExecStart=/b/xray run -config /c/pool/01-provider.json -config /c/pool/99-overlay.json -config /run/x/ingress.json$' "$_ud/unit" || _ki_ok=0

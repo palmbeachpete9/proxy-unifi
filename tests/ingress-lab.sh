@@ -204,9 +204,10 @@ def service():
         conn, _ = s.accept()
         conn.sendall(b"gateway-service")
         conn.close()
-# "fixed" sits below the ephemeral port range, like a gateway service.
+# "fixed" sits below the ephemeral port range, like a gateway service; "low"
+# on a privileged port, like DNS.
 for args in (("echo", "127.0.0.1", False), ("clash", "0.0.0.0", False), ("shared", "0.0.0.0", True),
-             ("fixed", "0.0.0.0", False, 20000)):
+             ("fixed", "0.0.0.0", False, 20000), ("low", "127.0.0.1", False, 853)):
     threading.Thread(target=echo, args=args, daemon=True).start()
 threading.Thread(target=service, daemon=True).start()
 server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Bulk)
@@ -217,18 +218,19 @@ python3 "$T/servers.py" "$T/state" >/dev/null 2>&1 &
 PIDS="$PIDS $!"
 _i=0
 while [ ! -s "$T/state/bulk" ] || [ ! -s "$T/state/shared" ] || [ ! -s "$T/state/service" ] \
-    || [ ! -s "$T/state/fixed" ]; do
+    || [ ! -s "$T/state/fixed" ] || [ ! -s "$T/state/low" ]; do
     _i=$((_i + 1)); [ "$_i" -lt 100 ] || { fail "lab servers start"; exit 1; }
     sleep 0.05
 done
 BULK="$(cat "$T/state/bulk")"; ECHO="$(cat "$T/state/echo")"
-CLASH="$(cat "$T/state/clash")"; SHARED="$(cat "$T/state/shared")"; FIXED="$(cat "$T/state/fixed")"
+CLASH="$(cat "$T/state/clash")"; SHARED="$(cat "$T/state/shared")"; FIXED="$(cat "$T/state/fixed")"; LOW="$(cat "$T/state/low")"
 SERVICE="$(cat "$T/state/service")"
 
-start_core() {  # <overlay>: the core runs unprivileged, with CAP_NET_RAW only
+start_core() {  # <overlay>: the core runs unprivileged, with the unit's capabilities only
     if command -v setpriv >/dev/null 2>&1; then
         XRAY_LOCATION_ASSET="$T/root/bin" setpriv --reuid=65534 --regid=65534 --clear-groups \
-            --inh-caps=-all,+net_raw --ambient-caps=-all,+net_raw --bounding-set=-all,+net_raw \
+            --inh-caps=-all,+net_raw,+net_bind_service --ambient-caps=-all,+net_raw,+net_bind_service \
+            --bounding-set=-all,+net_raw,+net_bind_service \
             "$T/root/bin/xray" run -config "$T/root/etc/config.json" -config "$1" > "$T/core.log" 2>&1 &
     else
         info "setpriv missing: the core runs as root"
@@ -335,6 +337,7 @@ _tcp="$(client_tcp)"
 check "TCP through the kernel path" [ "${_tcp%% *}" -gt 0 ] 2>/dev/null
 info "kernel path: $(printf '%s\n' "$_tcp" | mbit) Mbit/s in this lab"
 check "UDP through the kernel path" [ "$(client_udp "$ECHO")" = ok ]
+check "UDP to a privileged port (DNS-like) through the kernel path" [ "$(client_udp "$LOW")" = ok ]
 check "direct routes still refuse private targets" [ "$(client_private)" = 0 ]
 check "the core logged the refusal" grep -q 'blocked target: tcp:127.0.0.1' "$T/core.log"
 check "UDP reply on a port the host shares (SO_REUSEADDR)" [ "$(client_udp "$SHARED")" = ok ]
