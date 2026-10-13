@@ -1661,6 +1661,15 @@ _ingress_setup() {
     _ingress_step ip link set "$INGRESS_LR" mtu "$WG_MTU" up || return 1
     _ingress_step ip -n "$INGRESS_NS" addr add "$INGRESS_LR_NS_IP/30" dev "$INGRESS_LR_NS" || return 1
     _ingress_step ip -n "$INGRESS_NS" link set "$INGRESS_LR_NS" mtu "$WG_MTU" up || return 1
+    # Only finished packets leave the pair, MTU-sized and checksummed, as they
+    # do from UniFi's WireGuard client. Otherwise Xray's TSO/GSO packets reach
+    # the LAN driver for segmentation and checksumming, which it never does on
+    # the WireGuard path. ponytail: best effort without ethtool; the lab checks sizes.
+    if have ethtool; then
+        ethtool -K "$INGRESS_LR" tx off tso off gso off gro off >/dev/null 2>&1 || true
+        ip netns exec "$INGRESS_NS" ethtool -K "$INGRESS_LR_NS" tx off tso off gso off gro off \
+            >/dev/null 2>&1 || true
+    fi
     # shellcheck disable=SC2016 # expanded by the namespaced shell
     _ingress_step ip netns exec "$INGRESS_NS" sh -c '
         echo 0 > "/proc/sys/net/ipv4/conf/$1/rp_filter" &&
