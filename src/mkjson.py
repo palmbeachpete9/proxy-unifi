@@ -548,6 +548,13 @@ def cmd_socksconfig(args):
     primary_tag = _primary_tag(ib)
     sniffing = ib.get("sniffing") if isinstance(ib, dict) else None
     out = sanitize_provider(cfg)
+    # A fresh core has no observatory results for its first seconds to minutes,
+    # so leastPing/leastLoad would send the probe to the fallback (often a
+    # blackhole). ponytail: probe a random member; a dead one fails the probe.
+    routing = out.get("routing")
+    if isinstance(routing, dict) and isinstance(routing.get("balancers"), list):
+        out["routing"] = dict(routing, balancers=[dict(b, strategy={"type": "random"})
+                                                  for b in routing["balancers"]])
     inbound = {"tag": primary_tag, "listen": "127.0.0.1", "port": args.socks_port,
                "protocol": "socks", "settings": {"udp": True}}
     if isinstance(sniffing, dict):

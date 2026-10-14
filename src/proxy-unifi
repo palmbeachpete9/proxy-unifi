@@ -2786,17 +2786,32 @@ _probe_start() {
 ping_proxy() {   # $1 = get|head
     have curl || { err "curl is required for proxy HTTP latency tests"; return 1; }
     _m="$1"
-    _probe_start "$((PING_TIMEOUT + 15))" 256 || return 1
     if [ "$_m" = "head" ]; then _label="via proxy (HEAD)"; set -- -I; else _label="via proxy (GET)"; set -- -X GET; fi
+    _wgif="$(unifi_client_if)"
+    if [ -n "$_wgif" ] && service_healthy; then
+        # The live path: the gateway's UniFi VPN client into the running core,
+        # whose balancer already knows which nodes answer.
+        _via="live tunnel $_wgif"
+        set -- "$@" -4 --noproxy '*' --interface "$_wgif"
+    else
+        _via="test core"
+        _probe_start "$((PING_TIMEOUT + 15))" 256 || return 1
+        set -- "$@" --proxy "${_proxy_scheme}://127.0.0.1:${_port}"
+    fi
     # LC_ALL=C so curl prints time_total with a '.' decimal regardless of locale
-    _out="$(LC_ALL=C curl -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time "$PING_TIMEOUT" \
-             "$@" --proxy "${_proxy_scheme}://127.0.0.1:${_port}" "$PING_URL" 2>/dev/null)" || _out=""
+    _out="$(LC_ALL=C curl -sS -o /dev/null -w '%{http_code} %{time_total}\n' --max-time "$PING_TIMEOUT" \
+             "$@" "$PING_URL" 2>&1)" && _rc=0 || _rc=$?
     _ping_cleanup
-    if [ -z "$_out" ]; then c_red "${_label}: timeout (>${PING_TIMEOUT}s)"; return 1; fi
+    if [ "$_rc" = 28 ]; then c_red "${_label}: timeout (>${PING_TIMEOUT}s, ${_via})"; return 1; fi
+    if [ "$_rc" != 0 ]; then
+        _why="$(printf '%s\n' "$_out" | sed -n 's/^curl: ([0-9]*) //p' | head -n 1)"
+        c_red "${_label}: failed (${_via}): ${_why:-curl exit $_rc}"; return 1
+    fi
+    _out="$(printf '%s\n' "$_out" | tail -n 1)"
     _code="${_out%% *}"; _ms="$(_ms_from_seconds "${_out##* }")"
     case "$_code" in
-        204|200) c_grn "${_label}: ${_ms} ms  (HTTP ${_code})" ;;
-        *)       c_ylw "${_label}: ${_ms} ms  (HTTP ${_code})" ;;
+        204|200) c_grn "${_label}: ${_ms} ms  (HTTP ${_code}, ${_via})" ;;
+        *)       c_ylw "${_label}: ${_ms} ms  (HTTP ${_code}, ${_via})" ;;
     esac
 }
 
@@ -2824,10 +2839,14 @@ start = time.time()
 try:
     socket.create_connection((host, port), timeout=timeout).close()
     print("%.0f" % ((time.time() - start) * 1000))
-except Exception:
+except socket.timeout:
+    print("timeout (>%gs)" % timeout)
+    sys.exit(1)
+except Exception as error:
+    print("failed: %s" % error)
     sys.exit(1)
 PYEOF
-)" || { c_red "TCP ${_h}:${_p}: timeout (>${PING_TIMEOUT}s)"; return 1; }
+)" || { c_red "TCP ${_h}:${_p}: ${_ms:-failed}"; return 1; }
     c_grn "TCP ${_h}:${_p}: ${_ms} ms"
 }
 
@@ -2839,8 +2858,10 @@ ping_icmp() {
     # '--' so a server host starting with '-' can't be read as a ping option
     ensure_service_user
     _out="$(py "$SAFEEXEC" --user "$SERVICE_USER" --timeout "$((PING_TIMEOUT + 5))" \
-        --memory-mb 128 --fsize-mb 1 -- ping -c 1 -W "$PING_TIMEOUT" -- "$_h" 2>/dev/null)" \
-        || { c_red "ICMP ${_h}: timeout (>${PING_TIMEOUT}s)"; return 1; }
+        --memory-mb 128 --fsize-mb 1 -- ping -c 1 -W "$PING_TIMEOUT" -- "$_h" 2>&1)" && _rc=0 || _rc=$?
+    # ping exits 1 when no reply came, 2 on other errors (such as an unknown host)
+    if [ "$_rc" = 1 ]; then c_red "ICMP ${_h}: timeout (>${PING_TIMEOUT}s)"; return 1; fi
+    if [ "$_rc" != 0 ]; then c_red "ICMP ${_h}: failed: $(printf '%s\n' "$_out" | tail -n 1)"; return 1; fi
     _ms="$(printf '%s\n' "$_out" | sed -n '/time=/{s/.*time=\([0-9.]*\).*/\1/p;q;}')"
     if [ -n "$_ms" ]; then c_grn "ICMP ${_h}: ${_ms} ms"; else c_red "ICMP ${_h}: no reply (host may block ICMP)"; fi
 }
