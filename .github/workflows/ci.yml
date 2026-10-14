@@ -2,8 +2,8 @@ name: ci
 
 # Every push runs the quick checks: static, parsers, and the real cores. The
 # slow ones (the sandboxed CLI lifecycle, and the kernel ingress lab where the
-# branch has one) are deferred to pull requests, a nightly run of both branches,
-# and "Run workflow" on demand. Documentation-only changes run nothing.
+# branch has one) are deferred to pull requests, a weekly run of both branches
+# (Mondays 03:00 UTC), and "Run workflow" on demand. Documentation-only changes run nothing.
 on:
   push:
     branches: [main, experimental]
@@ -11,13 +11,13 @@ on:
   pull_request:
     paths-ignore: ["**.md", "docs/**", "LICENSE"]
   schedule:
-    - cron: "0 3 * * *"
+    - cron: "0 3 * * 1"
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# A newer push replaces an older push's run, but never a full run (nightly,
+# A newer push replaces an older push's run, but never a full run (weekly,
 # pull request, or on demand) of the same branch.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
