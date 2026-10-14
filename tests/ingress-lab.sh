@@ -440,30 +440,7 @@ _tx1="$(_tx)"
 _avg="$(printf '%s %s\n' "$_tx0" "$_tx1" | awk '{ p = $4 - $2; print (p > 0 ? int(($3 - $1) / p) : 0) }')"
 info "LAN route: $_avg bytes per packet towards the LAN"
 check "LAN route packets reach the LAN at most MTU-sized" sh -c "[ $_avg -gt 0 ] && [ $_avg -le 1354 ]"
-if [ "${_lan%% *}" -gt 0 ] 2>/dev/null; then pass "LAN TCP on a Policy Table route reaches Xray without WireGuard"
-else
-    fail "LAN TCP on a Policy Table route reaches Xray without WireGuard"
-    { set +e
-      ip route get "$TARGET" from 10.99.0.2 iif pu-lab-l0 mark 0x21670000
-      ip route get "$TARGET" from 10.99.0.2 iif pu-lab-l0
-      ip route get "$TARGET" mark 0x21670000
-      ip route show table all | grep -v '^local\|^broadcast\|^multicast\|^fe80\|^ff00' | head -20
-      ip -d link show pu-lab-l0; ip -d link show "$VETH" | head -3
-      sysctl net.ipv4.conf.pu-lab-l0 2>/dev/null | grep -E 'forwarding|rp_filter|route_localnet|accept_local|src_valid'
-      iptables -t mangle -L PREROUTING -v -n | head -8
-      nstat -az 2>/dev/null | awk '$2 > 0 && /IpIn|IpOut|IpForw|IpExtInNoRoutes/'
-      cat /proc/sys/net/ipv4/conf/pu-lab-l0/forwarding /proc/sys/net/ipv4/conf/pu-lab-l0/rp_filter
-      ip rule show; ip route show table "$UTABLE"; cat /proc/sys/net/ipv4/conf/all/rp_filter \
-        /proc/sys/net/ipv4/conf/pu-lab-r0/rp_filter /proc/sys/net/ipv4/ip_forward
-      iptables -L FORWARD -v -n | head -12; iptables -t mangle -L PU_LAB_TP -v -n
-      iptables -t mangle -L POSTROUTING -v -n | grep -i tcpmss; iptables -L PU_LAB_IN -v -n
-      ip netns exec "$NS" iptables -t mangle -L PREROUTING -v -n
-      ip netns exec "$NS" iptables -t nat -L POSTROUTING -v -n; ip -n "$NS" rule show
-      ip -n "$NS" route show table 101; ip netns exec "$NS" sysctl net.ipv4.ip_forward
-      ip netns exec "$NS" nstat -az 2>/dev/null | awk '$2 > 0 && /Ip|Tcp/'
-      conntrack -L 2>/dev/null | grep 10.99.0.2 | head -5
-    } 2>&1 | sed 's/^/INFO lan-route: /'
-fi
+check "LAN TCP on a Policy Table route reaches Xray without WireGuard" [ "${_lan%% *}" -gt 0 ]
 info "LAN route: $(printf '%s\n' "$_lan" | mbit) Mbit/s in this lab"
 check "LAN UDP on a Policy Table route" [ "$(client_udp "$ECHO" "$LAN")" = ok ]
 check "UniFi's DNAT still applies first" [ "$(read_from "$LAN" "$TARGET" 5300)" = gateway-service ]
