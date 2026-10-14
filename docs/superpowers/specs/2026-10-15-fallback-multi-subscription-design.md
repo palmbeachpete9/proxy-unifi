@@ -47,8 +47,8 @@ $SUB_DIR/                      (700)
   subscription gets the highest existing id + 1, and removing one never
   renumbers the others. Menus and the CLI show and accept this id.
 - At most 20 subscriptions.
-- The name defaults to the provider's title header when it sends one, else the
-  URL's host. Names are sanitized like every other provider string before
+- The name defaults to the provider's `profile-title` header when it sends
+  one (plain or `base64:`-encoded), else the URL's host. Names are sanitized like every other provider string before
   display, and limited to 36 display characters.
 - `SUB_USER_AGENT` in settings becomes the default for subscriptions without
   `ua`.
@@ -66,11 +66,15 @@ changes. The active node and tunnel are untouched.
 - The refresh timer runs `sub-refresh-auto`, which refreshes every
   subscription in id order. A failing subscription records `fail` in its
   `status`, keeps its old catalog, and does not stop the others.
+- Downloads run without the CLI lock (today the whole refresh holds it, up to
+  30 s per provider). The lock is taken only to install each new catalog and
+  re-match, so a slow provider never delays the watchdog or the menu.
 - After a subscription's catalog is replaced:
   - if the active selection belongs to it, it is re-matched exactly as today
     (`mksub match`), including re-applying a changed node;
   - every fallback pool entry from it is re-matched the same way; an entry
     with no match is marked `missing`, one that matches again is un-marked.
+  - Re-applying a changed active node here does not turn fallback off.
 - The timer unit's condition becomes "any `$SUB_DIR/*/url.txt` exists".
 - One global refresh interval (`SUB_REFRESH_HOURS`, unchanged).
 
@@ -271,22 +275,39 @@ that leaves fewer than 2, turns fallback off and says so.
 while `FALLBACK=on` and disabled otherwise; changing `FB_INTERVAL` rewrites it.
 Uninstall removes both units; an update keeps the pool, settings and timer.
 
+The service sets `LogLevelMax=notice`, so the journal does not get a
+"started/finished" pair every interval; switches and "no pool node online"
+are logged at notice level and stay visible.
+
 A run does nothing when:
 
 - fallback is off or the pool has fewer than 2 usable entries;
-- the main service is not active (the user stopped it, or systemd is
-  restarting it);
-- the CLI lock is held by someone else: the run skips instead of waiting.
+- the main service is stopped (`inactive`: the user stopped it). A service
+  that is failing or restarting is still watched; without a healthy core the
+  test core decides (see "A check");
+- the CLI lock is held by someone else: the run tries it once and skips
+  instead of waiting.
 
 ### State
 
-`$ROOT/fallback.state` (600, JSON), rewritten atomically by each run:
+`/run/proxy-unifi/fallback.state` (600, JSON, in RAM like the kernel ingress
+state), rewritten atomically by each run, so the gateway's flash is not
+written every interval:
 
 - per node id: consecutive fails, consecutive successes, last result time,
   last latency in ms, last error text;
-- the last switch: time, from-position, to-position, reason.
+- the rotation position for return checks (see "A run");
+- whether the live tunnel check is failing while the node answers.
 
-A missing or malformed state file starts from empty counters.
+The last switch (time, from-position, to-position, reason) is written to
+`$ROOT/fallback.last` only when a switch happens, so it survives a reboot.
+A missing or malformed state file starts from empty counters after a reboot
+or corruption.
+
+The decisions (update counters, pick a switch target) are a pure function in
+a new `mkfallback.py`: state plus check results in, new state plus at most
+one action out. The shell runs the checks and applies the action. This keeps
+the logic testable without a network or a gateway.
 
 ### A check
 
@@ -298,7 +319,11 @@ is a failure, with curl's error recorded.
   same path as `proxy ping`) when the service is healthy and that interface
   exists. If that fails, the node is checked once more through a test core;
   only when both fail does the check count as failed. Without the interface,
-  the test core alone decides.
+  or while the core is not healthy, the test core alone decides.
+  When the live check fails but the node answers through the test core, the
+  problem is between UniFi and the core (not the node), so nothing switches;
+  the state records it and the fallback menu and `proxy status` show "tunnel
+  check failing, node answers" so it is not silent.
 - Any other node: through a test core built from that node's catalog entry
   (the `proxy ping` test core, generalized to take a node instead of the
   active configuration).
@@ -313,9 +338,17 @@ is a failure, with curl's error recorded.
    the other entries in priority order (skipping missing ones) and switch to
    the first that passes one check. If none passes, stay, record "no pool node
    online", and keep checking on later runs.
-4. Else, if `FB_RETURN=on` and the active node is not priority 1, check every
-   higher-priority entry. When one reaches `FB_UP` successes in a row, switch
-   to the highest-priority entry that has.
+4. Else, if `FB_RETURN=on` and the active node is not priority 1, check ONE
+   higher-priority entry, rotating through them from the highest. Each entry
+   keeps its own streak of good checks. Switch to an entry once its streak
+   reaches `FB_UP`, unless a higher-priority entry has a streak of at least 1
+   (it is recovering too); then wait for that one, so a provider-wide outage
+   that ends does not cause two switches in a row.
+
+Cost bound: in steady state a run is one request through the live tunnel.
+Return checks add at most one test core per run. Only an outage (step 3) or
+turning fallback on checks several entries in one run. A return to an entry
+`k` places above the active one takes about `FB_UP` x `k` runs.
 
 A switch applies the node through the same validated path as choosing it by
 hand (build, `-test` with the real core, apply, record `selected`), with the
@@ -331,7 +364,9 @@ Then it saves `FALLBACK=on`, enables the timer, and runs one watchdog run
 immediately (step 1 applies the highest-priority online node). If no entry
 passes, it still turns on, keeps the current node, and says so.
 
-"Test all pool nodes now" is the same check without the switch.
+"Test all pool nodes now" is the same check without the switch; it updates
+each entry's last result and latency but not the streak counters. It needs
+no lock.
 
 ## Error handling and security
 
@@ -348,6 +383,12 @@ passes, it still turns on, keeps the current node, and says so.
 
 ## Testing
 
+Unit tests (parser tier) of `mkfallback.py`'s decision function with
+scripted results: offline after `FB_DOWN` failures, first passing candidate
+chosen, staying when all fail, return only after `FB_UP`, waiting for a
+recovering higher entry, rotation, `FB_RETURN=off`, live-fails-node-answers
+not switching, and a malformed state starting clean.
+
 Sandboxed lifecycle tests (mock systemctl, as today):
 
 - migration of the single-subscription layout into `1/`, with the selection
@@ -358,10 +399,11 @@ Sandboxed lifecycle tests (mock systemctl, as today):
   and un-marked;
 - the wizard driven by piped menu input, including reordering and
   cancellation;
-- watchdog runs with scripted check results: a switch after `FB_DOWN`
-  failures, staying put when every entry fails, a return only after `FB_UP`
-  successes, no return with `FB_RETURN=off`, a skipped run while the lock is
-  held, and fallback turning off on a manual select.
+- the shell wiring of the watchdog with a stubbed check: a switch after
+  `FB_DOWN` failures applies the node and records the last switch, a run is
+  skipped while the lock is held, nothing runs while the service is stopped,
+  and fallback turns off on a manual select but not on a refresh re-apply;
+- a refresh does not hold the lock while downloading.
 
 Real-core test: a test core built for a pool node that is not active answers
 a check.
