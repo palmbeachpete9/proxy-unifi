@@ -3802,11 +3802,17 @@ sub_status() {
     if [ ! -s "$SUB_URL_FILE" ]; then echo "subscription: (none)"; return; fi
     echo "subscription: configured"
     if [ -f "$SUB_CATALOG" ]; then
-        py - "$SUB_CATALOG" <<'PYEOF' 2>/dev/null || true
-import json,sys
-c=json.load(open(sys.argv[1]))
-m=c.get("meta",{})
-print("nodes:        %s (%s supported)" % (m.get("count","?"), m.get("supported","?")))
+        py - "$BIN_DIR" "$SUB_CATALOG" <<'PYEOF' 2>/dev/null || true
+import sys
+sys.path.insert(0, sys.argv[1])
+import mksub
+try:
+    c = mksub._load(sys.argv[2])  # current verdicts, not those saved with the catalog
+except SystemExit:
+    print("nodes:        (saved by an older version; refresh from the subscription menu)")
+    sys.exit(0)
+m = c.get("meta", {})
+print("nodes:        %d (%d supported)" % (len(c["nodes"]), sum(n["recognized"] for n in c["nodes"])))
 if "interval_hours" in m: print("provider hint: refresh every %sh" % m["interval_hours"])
 if "userinfo" in m: print("userinfo:     %s" % m["userinfo"])
 PYEOF
