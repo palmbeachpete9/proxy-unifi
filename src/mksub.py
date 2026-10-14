@@ -1000,8 +1000,8 @@ def _load(path):
     if not isinstance(cat, dict) or not isinstance(cat.get("nodes"), list):
         die("catalog is malformed")
     if cat.get("schema") != SCHEMA_VERSION:
-        die("subscription catalog is from an older version; run a refresh "
-            "(menu -> Import or replace -> subscription -> Refresh)")
+        die("subscription catalog is from an older version; refresh it "
+            "(menu 2 -> 6. Refresh all now)")
     seen_n = set()
     seen_id = set()
     for nd in cat["nodes"]:
@@ -1101,7 +1101,7 @@ def _atomic_write_text(path, text):
                 os.unlink(temporary)
             except OSError:
                 pass
-        die("could not write selection output: %s" % e)
+        die("could not write %s: %s" % (os.path.basename(path), e))
 
 
 def _write_selection_meta(nd, path):
@@ -1211,35 +1211,42 @@ def cmd_match(args):
     sys.stdout.write("%s\t%s\t%s\n" % (nd["n"], nd["id"], score))
 
 
+def _read_small(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read(512).strip()
+    except (OSError, UnicodeError):
+        return ""
+
+
+def sub_name(subs_dir, sub, width=LABEL_MAX):
+    """A subscription's display name (sanitized), from <subs_dir>/<sub>/name."""
+    return clean(_read_small(os.path.join(subs_dir, str(sub), "name")), width) or "sub %s" % sub
+
+
+def when(epoch):
+    """HH:MM today, else 'DD Mon HH:MM' (local time)."""
+    import time
+    moment = time.localtime(epoch)
+    return time.strftime("%H:%M" if moment[:3] == time.localtime()[:3] else "%d %b %H:%M", moment)
+
+
 def cmd_subs(args):
     """One line per subscription folder: id<TAB>display line (sanitized)."""
-    import time
     try:
         names = os.listdir(args.dir)
     except OSError:
         return
     ids = sorted(int(d) for d in names if d.isdigit() and 1 <= int(d) <= 999
                  and os.path.isfile(os.path.join(args.dir, d, "url.txt")))
-
-    def read(sid, name):
-        try:
-            with open(os.path.join(args.dir, str(sid), name), "r", encoding="utf-8") as fh:
-                return fh.read(512).strip()
-        except (OSError, UnicodeError):
-            return ""
-
-    def when(epoch):
-        moment = time.localtime(epoch)
-        return time.strftime("%H:%M" if moment[:3] == time.localtime()[:3] else "%d %b %H:%M", moment)
-
     for sid in ids:
-        name = clean(read(sid, "name"), LABEL_MAX) or "(unnamed)"
+        name = sub_name(args.dir, sid)
         try:
             nodes = len(_load(os.path.join(args.dir, str(sid), "catalog.json"))["nodes"])
             count = "%d node%s" % (nodes, "" if nodes == 1 else "s")
         except SystemExit:
             count = "not fetched"
-        status = read(sid, "status").split(" ", 2)
+        status = _read_small(os.path.join(args.dir, str(sid), "status")).split(" ", 2)
         state = ""
         if len(status) > 1 and status[1].isdigit():
             if status[0] == "ok":

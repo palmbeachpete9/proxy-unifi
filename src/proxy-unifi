@@ -157,12 +157,9 @@ load_settings() {
         case "$_value" in \"*\") _value="${_value#\"}"; _value="${_value%\"}" ;; esac
         case "$_key" in
             WG_LISTEN) case "$_value" in ""|*[!0-9A-Fa-f:.]*) : ;; *) WG_LISTEN="$_value" ;; esac ;;
-            WG_PORT)
-                if _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 65535 ]; then WG_PORT="$_value"; fi ;;
-            WG_MTU)
-                if _uint "$_value" && [ "$_value" -ge 576 ] && [ "$_value" -le 9000 ]; then WG_MTU="$_value"; fi ;;
-            WG_KEEPALIVE)
-                if _uint "$_value" && [ "$_value" -le 65535 ]; then WG_KEEPALIVE="$_value"; fi ;;
+            WG_PORT) if _in_range "$_value" 1 65535; then WG_PORT="$_value"; fi ;;
+            WG_MTU) if _in_range "$_value" 576 9000; then WG_MTU="$_value"; fi ;;
+            WG_KEEPALIVE) if _in_range "$_value" 0 65535; then WG_KEEPALIVE="$_value"; fi ;;
             INGRESS) case "$_value" in kernel|userspace) INGRESS="$_value" ;; esac ;;
             LAN_ROUTE) case "$_value" in on|off) LAN_ROUTE="$_value" ;; esac ;;
             XRAY_ADDR) case "$_value" in ""|*[!0-9A-Fa-f:.,/]*) : ;; *) XRAY_ADDR="$_value" ;; esac ;;
@@ -171,10 +168,8 @@ load_settings() {
             LOGLEVEL) case "$_value" in debug|info|warning|error|none) LOGLEVEL="$_value" ;; esac ;;
             PING_MODE) case "$_value" in get|head|tcp|icmp) PING_MODE="$_value" ;; esac ;;
             PING_URL) case "$_value" in https://*) PING_URL="$_value" ;; esac ;;
-            PING_TIMEOUT)
-                if _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 60 ]; then PING_TIMEOUT="$_value"; fi ;;
-            SUB_REFRESH_HOURS)
-                if _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 8760 ]; then SUB_REFRESH_HOURS="$_value"; fi ;;
+            PING_TIMEOUT) if _in_range "$_value" 1 60; then PING_TIMEOUT="$_value"; fi ;;
+            SUB_REFRESH_HOURS) if _in_range "$_value" 1 8760; then SUB_REFRESH_HOURS="$_value"; fi ;;
             FALLBACK) case "$_value" in on|off) FALLBACK="$_value" ;; esac ;;
             FB_INTERVAL) if _in_range "$_value" 5 600; then FB_INTERVAL="$_value"; fi ;;
             FB_DOWN) if _in_range "$_value" 1 20; then FB_DOWN="$_value"; fi ;;
@@ -3849,7 +3844,9 @@ fallback_menu_add() {
     _fallback_ask "Position in the pool" 1 "$((_fcount + 1))" "$((_fcount + 1))" || { c_ylw "Cancelled."; return 0; }
     _fpos="$_fa"
     fallback_pick_node "$_draft" "$_fpos" || { c_ylw "Cancelled."; return 0; }
-    locked_call fallback_save_pool "$_draft"
+    # The pick was checked against a copy; the add runs on the pool as it is now,
+    # so a refresh that changed it meanwhile is not overwritten.
+    locked_call fallback_add "$_fid" "$_fn" "$_fpos"
 }
 
 fallback_test() {
@@ -3889,12 +3886,13 @@ fallback_install() {   # <draft> <interval> <down> <up> <timeout> <return on|off
     txn_commit
 }
 
-fallback_save_pool() {   # <draft>
-    py "$MKFALLBACK" count --pool "$1" >/dev/null || fatal "the new pool is malformed"
+fallback_add() {   # <subscription id> <node number> <position>
+    sub_valid_id "$1" || fatal "no subscription $1"
     txn_begin
-    atomic_write "$FB_POOL" 600 < "$1" || fatal "could not save the pool"
+    py "$MKFALLBACK" add --pool "$FB_POOL" --sub "$1" --catalog "$SUB_DIR/$1/catalog.json" \
+        --index "$2" --position "$3" || fatal "the pool is unchanged"
     txn_commit
-    c_grn "Pool saved."
+    c_grn "Added at position $3."
 }
 
 fallback_remove() {   # <position>
@@ -3908,6 +3906,13 @@ fallback_remove() {   # <position>
     fi
     txn_commit
     c_grn "Removed position $1."
+    if [ "$FALLBACK" = on ]; then
+        case "$(py "$MKFALLBACK" status --pool "$FB_POOL" --state "$FB_STATE" --last "$FB_LAST" \
+                --selected "$SUB_SELECTED_META" --subs-dir "$SUB_DIR" 2>/dev/null)" in
+            "the active node is not in the pool"*)
+                c_ylw "The active node is not in the pool any more: the next check switches to the highest-priority node that answers." ;;
+        esac
+    fi
 }
 
 fallback_order() {   # <position>...
@@ -4028,17 +4033,13 @@ sub_selected_sub() {
 sub_active_line() {
     [ -s "$SUB_SELECTED_META" ] || return 0
     PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py - "$BIN_DIR" "$SUB_SELECTED_META" "$SUB_DIR" <<'PYEOF' 2>/dev/null || true
-import json, os, sys
+import json, sys
 sys.path.insert(0, sys.argv[1])
 import mksub
 meta = json.load(open(sys.argv[2], encoding="utf-8"))
 sub = str(meta.get("sub", ""))
-try:
-    with open(os.path.join(sys.argv[3], sub, "name"), encoding="utf-8") as fh:
-        name = fh.read(512).strip() if sub.isdigit() else ""
-except OSError:
-    name = ""
-print("[%s] %s (%s)" % (mksub.clean(name, 24) or "?", mksub.clean(meta.get("label", ""), 36) or "(no label)",
+print("[%s] %s (%s)" % (mksub.sub_name(sys.argv[3], sub, 24) if sub.isdigit() else "?",
+                        mksub.clean(meta.get("label", ""), 36) or "(no label)",
                         mksub.clean(meta.get("scheme", ""), 12)))
 PYEOF
 }
@@ -4306,9 +4307,7 @@ sub_refresh_all() {
 }
 
 sub_set_interval() {
-    if ! _uint "$1" || [ "$1" -lt 1 ] || [ "$1" -gt 8760 ]; then
-        fatal "refresh interval must be 1-8760 hours"
-    fi
+    _in_range "$1" 1 8760 || fatal "refresh interval must be 1-8760 hours"
     txn_begin
     SUB_REFRESH_HOURS="$1"; save_settings
     enable_refresh_timer || fatal "could not update refresh timer"

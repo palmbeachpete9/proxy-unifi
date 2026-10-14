@@ -690,5 +690,36 @@ cp "$T/pool.good" "$T/root/etc/fallback.json"
 [ ! -e "$T/root/.lock" ] || exit 1
 [ ! -e "$T/root/.transactions/active" ] || exit 1
 
+# "Add a node" adds to the pool as it is when saving: a change made while the
+# user was picking (a refresh marking an entry missing) is kept.
+{ printf '3\n2\n'; sleep 2
+  python3 - "$T/root/etc/fallback.json" <<'PY'
+import json, sys
+pool = json.load(open(sys.argv[1]))
+pool["nodes"][0]["missing"] = True
+json.dump(pool, open(sys.argv[1], "w"))
+PY
+  printf '1\n2\n\n0\n'; } | menu_input > "$T/fb-add-race.out" 2>&1
+python3 -c 'import json,sys; n=json.load(open(sys.argv[1]))["nodes"]
+assert [(e["meta"]["label"], e["missing"]) for e in n] == [("two-b", False), ("two-a", True)], n' "$T/root/etc/fallback.json"
+# Removing the active node from the pool says what happens next, and the next
+# check moves to the best pool node. Subscription 3 is a copy of 2.
+cp -Rp "$T/root/etc/subscription/2" "$T/root/etc/subscription/3"
+rm -f "$T/root/etc/fallback.json"
+for _e in 3:1 2:1 2:2; do
+    python3 "$T/root/bin/mkfallback.py" add --pool "$T/root/etc/fallback.json" --sub "${_e%:*}" \
+        --catalog "$T/root/etc/subscription/${_e%:*}/catalog.json" --index "${_e#*:}"
+done
+echo "ok 40" > "$STATE/probe_3_$(printf %.8s "$ida")"
+printf '3\n8\n\n0\n' | menu_input >/dev/null 2>&1
+grep -q '^FALLBACK="on"' "$T/root/etc/settings.env"
+python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["sub"] == "2"' "$T/root/etc/subscription/selected.json"
+printf '3\n3\n2\n\n0\n' | menu_input > "$T/fb-remove-active.out" 2>&1
+grep -q 'the next check switches to the highest-priority node that answers' "$T/fb-remove-active.out"
+grep -q '^FALLBACK="on"' "$T/root/etc/settings.env"
+run_cli fallback-check >/dev/null
+python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["sub"] == "3"' "$T/root/etc/subscription/selected.json"
+[ ! -e "$T/root/.lock" ] || exit 1
+
 [ ! -e "$STATE/stale-lock" ] || { echo "lock recorded a dead owner" >&2; exit 1; }
 echo lifecycle-ok

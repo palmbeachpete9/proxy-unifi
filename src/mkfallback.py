@@ -31,6 +31,7 @@ import sys
 import tempfile
 import time
 
+import mksub
 from proxylib import die, dispatch_subcommand
 
 SCHEMA = 1
@@ -40,23 +41,7 @@ _ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _write_json(path, value):
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".write.", dir=directory)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fd = -1
-            json.dump(value, fh, ensure_ascii=False, sort_keys=True)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
+    mksub._atomic_write_text(path, json.dumps(value, ensure_ascii=False, sort_keys=True))
 
 
 def _valid_entry(entry):
@@ -92,19 +77,13 @@ def save_pool(path, nodes):
     _write_json(path, {"schema": SCHEMA, "nodes": nodes})
 
 
-def _catalog(path):
-    import mksub
-    return mksub._load(path)
-
-
 def cmd_add(args):
-    import mksub
     if not _SUB_RE.match(args.sub):
         die("invalid subscription id")
     nodes = load_pool(args.pool)
     if len(nodes) >= MAX_POOL:
         die("the pool holds at most %d nodes" % MAX_POOL)
-    nd = next((n for n in _catalog(args.catalog)["nodes"] if n["n"] == args.index), None)
+    nd = next((n for n in mksub._load(args.catalog)["nodes"] if n["n"] == args.index), None)
     if nd is None:
         die("no node #%d in this subscription" % args.index)
     if not nd.get("recognized"):
@@ -146,7 +125,6 @@ def cmd_drop_sub(args):
 
 def rematch(nodes, sub, cat):
     """Re-point the pool entries of one refreshed subscription; returns nodes."""
-    import mksub
     for entry in nodes:
         if entry["sub"] != sub:
             continue
@@ -161,7 +139,7 @@ def rematch(nodes, sub, cat):
 def cmd_rematch(args):
     if not os.path.exists(args.pool):
         return
-    save_pool(args.pool, rematch(load_pool(args.pool), args.sub, _catalog(args.catalog)))
+    save_pool(args.pool, rematch(load_pool(args.pool), args.sub, mksub._load(args.catalog)))
 
 
 # ---- the watchdog --------------------------------------------------------
@@ -198,6 +176,11 @@ def _record(state, entry, ok, ms, err, now, streaks=True):
 
 
 def _switch_to_first_online(pool, state, order, frm, probe, apply, now, reason, log):
+    if state["note"]:
+        # ponytail: nothing answered last time (the WAN may be down), so check one
+        # candidate per run, in turn, instead of starting a test core for each.
+        order = [order[state["rot"] % len(order)]]
+        state["rot"] += 1
     for i in order:
         ok, ms, err = probe(i, "core")
         _record(state, pool[i], ok, ms, err, now)
@@ -224,6 +207,8 @@ def run_once(pool, state, active, cfg, probe, apply, now):
     apply(index, reason) -> (ok, err).
     """
     log = []
+    keys = {_key(e) for e in pool}
+    state["nodes"] = {k: v for k, v in state["nodes"].items() if k in keys}
     usable = [i for i, e in enumerate(pool) if not e.get("missing")]
     if len(usable) < 2:
         return log
@@ -324,22 +309,7 @@ def _cli_apply(cli, entry, expected, reason):
     return rc == 0, why
 
 
-def _when(epoch):
-    moment = time.localtime(epoch)
-    return time.strftime("%H:%M" if moment[:3] == time.localtime()[:3] else "%d %b %H:%M", moment)
-
-
-def _sub_name(subs_dir, sub):
-    import mksub
-    try:
-        with open(os.path.join(subs_dir, sub, "name"), "r", encoding="utf-8") as fh:
-            return mksub.clean(fh.read(512).strip(), 16) or "sub %s" % sub
-    except (OSError, UnicodeError):
-        return "sub %s" % sub
-
-
 def _label(entry):
-    import mksub
     return mksub.clean(entry["meta"].get("label", ""), 24) or "(no label)"
 
 
@@ -369,14 +339,24 @@ def _status_text(entry, node):
         return "missing from subscription"
     if not node or not node.get("at"):
         return "not checked yet"
-    if not node.get("err"):
-        return "online  %4d ms" % node.get("ms", 0)
-    return "offline since %s (%s)" % (_when(node.get("since") or node["at"]), node["err"][:40])
+    if node.get("err"):
+        return "offline since %s (%s)" % (mksub.when(node.get("since") or node["at"]), node["err"][:40])
+    text = "online  %4d ms" % node.get("ms", 0)
+    # Nodes below the active one are not checked while it works: say how old this is.
+    if time.time() - node["at"] > 300:
+        text += " (checked %s)" % mksub.when(node["at"])
+    return text
+
+
+TOO_FEW = "inactive: fewer than 2 pool nodes are available"
+
+
+def _too_few(pool):
+    return sum(not e.get("missing") for e in pool) < 2
 
 
 def _row(subs_dir, pos, entry):
-    import mksub
-    return "  %d. %s %s %-8s" % (pos, mksub.pad("[%s]" % _sub_name(subs_dir, entry["sub"]), 18),
+    return "  %d. %s %s %-8s" % (pos, mksub.pad("[%s]" % mksub.sub_name(subs_dir, entry["sub"], 16), 18),
                                   mksub.pad(_label(entry), 24),
                                   mksub.clean(entry["meta"].get("scheme", ""), 8))
 
@@ -420,9 +400,11 @@ def cmd_show(args):
         sys.stdout.write("  tunnel check failing; the node answers through a test core\n")
     if state.get("note"):
         sys.stdout.write("  %s\n" % state["note"])
+    if pool and _too_few(pool):
+        sys.stdout.write("  fallback is %s\n" % TOO_FEW)
     last = _last(args.last)
     if last:
-        sys.stdout.write("Last switch: %s  %s\n" % (_when(last["at"]), last["line"][:100]))
+        sys.stdout.write("Last switch: %s  %s\n" % (mksub.when(last["at"]), last["line"][:100]))
 
 
 def cmd_status(args):
@@ -431,13 +413,15 @@ def cmd_status(args):
     active = _active(args.selected)
     pos = next((i for i, e in enumerate(pool, 1) if active == (e["sub"], e["meta"]["id"])), 0)
     if pos:
-        text = "active #%d of %d ([%s] %s)" % (pos, len(pool), _sub_name(args.subs_dir, pool[pos - 1]["sub"]),
+        text = "active #%d of %d ([%s] %s)" % (pos, len(pool), mksub.sub_name(args.subs_dir, pool[pos - 1]["sub"], 16),
                                               _label(pool[pos - 1]))
     else:
         text = "the active node is not in the pool (%d nodes)" % len(pool)
+    if _too_few(pool):
+        text += ", " + TOO_FEW
     last = _last(args.last)
     if last:
-        text += ", last switch %s" % _when(last["at"])
+        text += ", last switch %s" % mksub.when(last["at"])
     if state.get("tunnel") == "failing":
         text += ", tunnel check failing"
     if state.get("note"):
@@ -448,42 +432,37 @@ def cmd_status(args):
 def main():
     ap = argparse.ArgumentParser(description="proxy-unifi fallback pool")
     sub = ap.add_subparsers(dest="cmd")
+    pool = argparse.ArgumentParser(add_help=False)
+    pool.add_argument("--pool", required=True)
 
-    a = sub.add_parser("add")
-    a.add_argument("--pool", required=True)
+    a = sub.add_parser("add", parents=[pool])
     a.add_argument("--sub", required=True)
     a.add_argument("--catalog", required=True)
     a.add_argument("--index", type=int, required=True)
     a.add_argument("--position", type=int, default=0)
     a.set_defaults(fn=cmd_add)
 
-    r = sub.add_parser("remove")
-    r.add_argument("--pool", required=True)
+    r = sub.add_parser("remove", parents=[pool])
     r.add_argument("--position", type=int, required=True)
     r.set_defaults(fn=cmd_remove)
 
-    o = sub.add_parser("order")
-    o.add_argument("--pool", required=True)
+    o = sub.add_parser("order", parents=[pool])
     o.add_argument("positions", type=int, nargs="+")
     o.set_defaults(fn=cmd_order)
 
-    c = sub.add_parser("count")
-    c.add_argument("--pool", required=True)
-    c.set_defaults(fn=cmd_count)
+    sub.add_parser("count", parents=[pool]).set_defaults(fn=cmd_count)
 
-    d = sub.add_parser("drop-sub")
-    d.add_argument("--pool", required=True)
+    d = sub.add_parser("drop-sub", parents=[pool])
     d.add_argument("--sub", required=True)
     d.set_defaults(fn=cmd_drop_sub)
 
-    m = sub.add_parser("rematch")
-    m.add_argument("--pool", required=True)
+    m = sub.add_parser("rematch", parents=[pool])
     m.add_argument("--sub", required=True)
     m.add_argument("--catalog", required=True)
     m.set_defaults(fn=cmd_rematch)
 
-    r = sub.add_parser("run")
-    for name in ("--pool", "--state", "--last", "--selected", "--cli"):
+    r = sub.add_parser("run", parents=[pool])
+    for name in ("--state", "--last", "--selected", "--cli"):
         r.add_argument(name, required=True)
     r.add_argument("--down", type=int, required=True)
     r.add_argument("--up", type=int, required=True)
@@ -491,15 +470,15 @@ def main():
     r.add_argument("--timeout", type=int, required=True)
     r.set_defaults(fn=cmd_run)
 
-    t = sub.add_parser("test")
-    for name in ("--pool", "--state", "--subs-dir", "--cli"):
+    t = sub.add_parser("test", parents=[pool])
+    for name in ("--state", "--subs-dir", "--cli"):
         t.add_argument(name, required=True)
     t.add_argument("--timeout", type=int, required=True)
     t.set_defaults(fn=cmd_test)
 
     for name, fn in (("show", cmd_show), ("status", cmd_status)):
-        v = sub.add_parser(name)
-        for opt in ("--pool", "--state", "--last", "--selected", "--subs-dir"):
+        v = sub.add_parser(name, parents=[pool])
+        for opt in ("--state", "--last", "--selected", "--subs-dir"):
             v.add_argument(opt, required=True)
         v.set_defaults(fn=fn)
 

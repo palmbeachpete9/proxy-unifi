@@ -1456,6 +1456,64 @@ with tempfile.TemporaryDirectory() as tmp:
     assert json.load(open(os.path.join(tmp, "state")))["note"] == ""
 PY
 
+    # Long-running behavior: an outage (nothing answers, e.g. the WAN is down)
+    # costs one candidate check per run after the first sweep; the state keeps
+    # only pool nodes; old results show their age; too few usable nodes is said.
+    py_case "mkfallback: outages, old results, too few nodes" "$SRC" <<'PY'
+import contextlib, io, json, os, sys, tempfile, time
+sys.path.insert(0, sys.argv[1])
+import mkfallback as fb
+def entry(i, missing=False):
+    return {"sub": "1", "meta": {"id": ("%x" % i) * 64, "label": "n%d" % i, "kind": "link",
+                                 "scheme": "vless", "server": "s"}, "missing": missing}
+pool = [entry(i) for i in (1, 2, 3, 4)]
+active = ("1", pool[0]["meta"]["id"])
+cfg = {"down": 3, "up": 2, "ret": True}
+calls = []
+def down(i, kind):
+    calls.append((i, kind))
+    return (False, 0, "timeout")
+state = fb.load_state("/nonexistent")
+state["nodes"]["1:" + "e" * 64] = {"fails": 0, "oks": 1, "at": 0, "ms": 0, "err": ""}
+for _ in range(3):
+    fb.run_once(pool, state, active, cfg, down, lambda i, r: (True, ""), 0)
+assert "1:" + "e" * 64 not in state["nodes"], state["nodes"]          # gone from the pool, gone from the state
+assert [c for c in calls if c[0] != 0] == [(1, "core"), (2, "core"), (3, "core")], calls   # the first sweep
+for run in range(3):
+    del calls[:]
+    fb.run_once(pool, state, active, cfg, down, lambda i, r: (True, ""), 0)
+    others = [c for c in calls if c[0] != 0]
+    assert len(others) == 1, (run, calls)                              # then one candidate per run
+seen = set()
+for _ in range(3):
+    del calls[:]
+    fb.run_once(pool, state, active, cfg, down, lambda i, r: (True, ""), 0)
+    seen.update(c[0] for c in calls if c[0] != 0)
+assert seen == {1, 2, 3}, seen                                           # in turn: every candidate gets checked
+# the active node dies while nothing has been unreachable before: a full sweep finds #4 at once
+applied = []
+state = fb.load_state("/nonexistent")
+for _ in range(3):
+    fb.run_once(pool, state, active, cfg, lambda i, k: (i == 3, 9, "" if i == 3 else "timeout"),
+                lambda i, r: (applied.append(i), (True, ""))[1], 0)
+assert applied == [3], applied
+with tempfile.TemporaryDirectory() as tmp:
+    pf, sf, lf, af = (os.path.join(tmp, n) for n in ("pool", "state", "last", "sel"))
+    fb.save_pool(pf, [entry(1), entry(2, missing=True)])
+    json.dump({"sub": "1", "id": "1" * 64}, open(af, "w"))
+    now = int(time.time())
+    json.dump({"schema": 1, "rot": 0, "nodes": {"1:" + "1" * 64: {"fails": 0, "oks": 3, "at": now - 7200,
+                                                                    "ms": 40, "err": ""}}}, open(sf, "w"))
+    args = type("A", (), dict(pool=pf, state=sf, last=lf, selected=af, subs_dir=tmp))()
+    for cmd in (fb.cmd_show, fb.cmd_status):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cmd(args)
+        assert "fewer than 2 pool nodes" in out.getvalue(), out.getvalue()
+        if cmd is fb.cmd_show:
+            assert "(checked " in out.getvalue(), out.getvalue()        # two hours old: says so
+PY
+
     # mkawg: AWG 1.5-3.1 parser, bridge generator, profile catalog, and UI safety.
     py_case "mkawg parser and UI corpus" "$SRC" <<'PY'
 import base64

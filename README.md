@@ -231,7 +231,9 @@ priority order. While fallback is on, a watchdog checks the active node through
 the tunnel at a set interval. When it fails a set number of checks in a row it
 counts as offline, and the tunnel moves to the next node in priority order that
 answers right now. With "return to higher priority" on, the tunnel goes back to a
-better node once it has passed a set number of checks in a row.
+better node once it has passed a set number of checks in a row. If no pool node
+answers (for example while the internet connection is down), it checks one node
+per interval instead of all of them, to spare the gateway's CPU.
 
 The wizard asks for the number of nodes, each node (subscription, then node),
 their order, and the timing:
