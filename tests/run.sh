@@ -733,6 +733,23 @@ assert pcat["meta"]["format"] == "json" and pcat["meta"]["count"] == 1, pcat
 pn = pcat["nodes"][0]
 assert pn["kind"] == "pool" and pn["recognized"] and pn["members"] == 2 and pn["strategy"] == "leastLoad", pn
 assert json.loads(pn["profile"])["remarks"] == "DE Auto"
+# Profiles written for apps that open more inbounds stay selectable.
+multi = json.loads(json.dumps(prof)); multi["remarks"] = "DE Apps"
+multi["inbounds"] += [{"tag": "http", "protocol": "http"}, {"tag": "api", "protocol": "dokodemo-door"}]
+multi["routing"]["rules"] = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+                             {"type": "field", "inboundTag": ["socks", "http"], "balancerTag": "B"}]
+mn = mksub.process_body(json.dumps([multi]).encode())["nodes"][0]
+assert mn["recognized"] and not mn["reason"] and mn["members"] == 2, mn
+# A catalog saved by an earlier version, which rejected such profiles, shows
+# and selects them without a refresh.
+stale = dict(mn, recognized=False, members=0, server="profile",
+             reason="profile routing references an inbound removed by the WireGuard overlay")
+with tempfile.TemporaryDirectory() as tmp:
+    path = os.path.join(tmp, "catalog")
+    json.dump({"schema": mksub.SCHEMA_VERSION, "meta": {"count": 1, "supported": 0}, "nodes": [stale]},
+              open(path, "w"))
+    node = mksub._load(path)["nodes"][0]
+    assert node["recognized"] and not node["reason"] and node["server"] == "2 nodes, leastLoad", node
 same_a = dict(prof); same_a["remarks"] = "⬆️ Автовыбор по алгоритму ⬆️"
 same_b = json.loads(json.dumps(same_a, sort_keys=True))
 same_cat = mksub.process_body(json.dumps([same_a, same_b]).encode())
@@ -1602,16 +1619,21 @@ PY
     fi
     # balancer pool: build overlay + validate merged confdir
     printf '%s' "$XP" > "$_d/sk"; printf '%s' "$UP" > "$_d/pk"
-    # profile carries a hostile extra inbound on 0.0.0.0; sanitizer must drop it.
+    # profile carries a hostile extra inbound on 0.0.0.0 and the HTTP/DNS/API
+    # entry points a provider's app opens, with rules for them: the sanitizer
+    # drops the inbounds and the rules that name only them.
     cat > "$_d/profile.json" <<EOF
-{"log":{"loglevel":"warning"},"inbounds":[{"tag":"socks","protocol":"socks","listen":"127.0.0.1","port":10808,"settings":{"udp":true},"sniffing":{"enabled":true,"destOverride":["tls"]}},{"tag":"EVIL","protocol":"socks","listen":"0.0.0.0","port":1080,"settings":{"udp":true}}],"outbounds":[{"protocol":"freedom","tag":"proxy"},{"protocol":"freedom","tag":"proxy-2"},{"protocol":"blackhole","tag":"block"}],"routing":{"balancers":[{"tag":"B","selector":["proxy"],"strategy":{"type":"leastPing"},"fallbackTag":"block"}],"rules":[{"type":"field","network":"tcp,udp","balancerTag":"B"}]},"burstObservatory":{"subjectSelector":["proxy"],"pingConfig":{"destination":"https://www.gstatic.com/generate_204","interval":"1m","timeout":"3s"}}}
+{"log":{"loglevel":"warning"},"inbounds":[{"tag":"socks","protocol":"socks","listen":"127.0.0.1","port":10808,"settings":{"udp":true},"sniffing":{"enabled":true,"destOverride":["tls"]}},{"tag":"EVIL","protocol":"socks","listen":"0.0.0.0","port":1080,"settings":{"udp":true}},{"tag":"http","protocol":"http","listen":"127.0.0.1","port":10809},{"tag":"dns-in","protocol":"dokodemo-door","listen":"127.0.0.1","port":10853,"settings":{"address":"1.1.1.1","port":53,"network":"udp"}}],"outbounds":[{"protocol":"freedom","tag":"proxy"},{"protocol":"freedom","tag":"proxy-2"},{"protocol":"blackhole","tag":"block"}],"api":{"tag":"api","services":["StatsService"]},"routing":{"balancers":[{"tag":"B","selector":["proxy"],"strategy":{"type":"leastPing"},"fallbackTag":"block"}],"rules":[{"type":"field","inboundTag":["dns-in"],"outboundTag":"block"},{"type":"field","inboundTag":["api"],"outboundTag":"api"},{"type":"field","inboundTag":["socks","http"],"network":"tcp,udp","balancerTag":"B"},{"type":"field","network":"tcp,udp","balancerTag":"B"}]},"burstObservatory":{"subjectSelector":["proxy"],"pingConfig":{"destination":"https://www.gstatic.com/generate_204","interval":"1m","timeout":"3s"}}}
 EOF
     mkdir -p "$_d/pool"
     if python3 "$SRC/mkjson.py" overlay --profile "$_d/profile.json" \
          --out-provider "$_d/pool/01-provider.json" --out-overlay "$_d/pool/99-overlay.json" \
          --port 51821 --secret-key-file "$_d/sk" --peer-pubkey-file "$_d/pk" >/dev/null 2>&1 \
        && "$XR" run -test -confdir "$_d/pool" >/dev/null 2>&1 \
-       && ! grep -q '0\.0\.0\.0' "$_d/pool/01-provider.json"
+       && ! grep -q '0\.0\.0\.0' "$_d/pool/01-provider.json" \
+       && python3 -c 'import json, sys
+tags = [r.get("inboundTag") for r in json.load(open(sys.argv[1]))["routing"]["rules"]]
+assert tags == [["socks", "http"], None], tags' "$_d/pool/01-provider.json"
     then ok "xray balancer pool (-confdir)"; else bad "xray balancer pool (-confdir)"; fi
     rm -rf "$_d"
 

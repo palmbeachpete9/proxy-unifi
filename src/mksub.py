@@ -330,15 +330,9 @@ def _profile_catalog_node(prof, label_hint="", identity_salt="",
         label = label_hint
     else:
         label = profile_label or label_hint
-    recognized, reason, members, strat, _ = _classify_profile(prof)
-    return {
-        "kind": "pool", "scheme": "json", "label": label,
-        "server": ("%d nodes, %s" % (members, strat)) if members else "profile",
-        "recognized": recognized, "engine": "xraypool", "reason": reason,
-        "members": members, "strategy": strat,
-        "id": hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest(),
-        "profile": raw_json,
-    }
+    return dict(_pool_verdict(prof), kind="pool", scheme="json", label=label, engine="xraypool",
+                id=hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest(),
+                profile=raw_json)
 
 
 def _json_profile_from_text(text):
@@ -523,14 +517,8 @@ def _process_json(text, headers):
         seen.add(nid)
         label = prof.get("remarks") if isinstance(prof.get("remarks"), str) else ""
         # classify + count balancer members; reject profiles we can't host
-        recognized, reason, members, strat, _ = _classify_profile(prof)
-        nodes.append({
-            "kind": "pool", "scheme": "json", "label": label,
-            "server": ("%d nodes, %s" % (members, strat)) if members else "profile",
-            "recognized": recognized, "engine": "xraypool", "reason": reason,
-            "members": members, "strategy": strat,
-            "id": nid, "profile": raw_json,
-        })
+        nodes.append(dict(_pool_verdict(prof), kind="pool", scheme="json", label=label,
+                          engine="xraypool", id=nid, profile=raw_json))
     for n, nd in enumerate(nodes, 1):
         nd["n"] = n
     if not nodes:
@@ -541,6 +529,13 @@ def _process_json(text, headers):
     meta = {"count": len(nodes), "supported": supported, "format": "json"}
     meta.update(_meta_from_headers(headers))
     return {"schema": SCHEMA_VERSION, "meta": meta, "nodes": nodes}
+
+
+def _pool_verdict(prof):
+    """The catalog fields a pool profile gets from the current rules."""
+    recognized, reason, members, strat, _ = _classify_profile(prof)
+    return {"recognized": recognized, "reason": reason, "members": members, "strategy": strat,
+            "server": ("%d nodes, %s" % (members, strat)) if members else "profile"}
 
 
 def _classify_profile(prof):
@@ -1002,6 +997,13 @@ def _load(path):
             die("catalog has a duplicate node id")
         seen_n.add(nd["n"])
         seen_id.add(nd["id"])
+        if nd.get("kind") == "pool" or nd.get("scheme") == "json":
+            # A catalog saved by an earlier version may carry stale verdicts.
+            try:
+                prof = json.loads(nd["profile"])
+            except ValueError:
+                die("catalog pool node has an invalid profile")
+            nd.update(_pool_verdict(prof))
     return cat
 
 
