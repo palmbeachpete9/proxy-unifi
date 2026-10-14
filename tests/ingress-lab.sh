@@ -23,7 +23,8 @@ NS=pu-lab; CLIENT=pu-lab-client; LAN=pu-lab-lan; OTHER=pu-lab-oth
 # like UBIOS_PREROUTING_PBR, an ip rule sending that mark to the VPN client's
 # table, and a client interface that drops everything, so LAN traffic only
 # arrives if the mode routed it to Xray. An earlier rule for OTHER's subnet
-# plays UniFi's "lookup main", PU_LAB_FW its FORWARD firewall.
+# plays UniFi's "lookup main", PU_LAB_FW its FORWARD firewall for LAN traffic,
+# PU_LAB_BL its threat blocklists and stateful return path into the LAN.
 UDEV=pu-lab-u; UTABLE=7790; UMARK=0x21670000/0x3fff0000; URULE=0x21660000/0x3ffe0000
 VETH=pu-lab-v0; WGDEV=pu-lab-wg; CDEV=pu-lab-c
 HOST_IP=169.254.78.1; PORT=41829; TARGET=198.51.100.7
@@ -69,6 +70,8 @@ cleanup() {
     while iptables -D FORWARD -i pu-lab-o0 -o pu-lab-l0 -m conntrack --ctstate ESTABLISHED,RELATED \
         -j ACCEPT 2>/dev/null; do :; done
     iptables -F PU_LAB_FW 2>/dev/null || true; iptables -X PU_LAB_FW 2>/dev/null || true
+    while iptables -D FORWARD -o pu-lab-l0 -j PU_LAB_BL 2>/dev/null; do :; done
+    iptables -F PU_LAB_BL 2>/dev/null || true; iptables -X PU_LAB_BL 2>/dev/null || true
     [ -z "${_forward_was:-}" ] || echo "$_forward_was" > /proc/sys/net/ipv4/ip_forward
     wait 2>/dev/null || true
     [ -n "${LAB_KEEP:-}" ] || rm -rf "$T"
@@ -96,6 +99,7 @@ sed \
     -e "s|^INGRESS_LR_NS=.*|INGRESS_LR_NS=\"pu-lab-r1\"|" \
     -e "s|^INGRESS_LR_HOST_IP=.*|INGRESS_LR_HOST_IP=\"169.254.78.5\"|" \
     -e "s|^INGRESS_LR_NS_IP=.*|INGRESS_LR_NS_IP=\"169.254.78.6\"|" \
+    -e "s|^INGRESS_LR_SRC=.*|INGRESS_LR_SRC=\"169.254.78.10\"|" \
     -e "s|^HOST_MOUNT_NS=.*|HOST_MOUNT_NS=\"/proc/$$/ns/mnt\"|" \
     -e "s|^FW_CHAIN=.*|FW_CHAIN=\"PU_LAB_WG\"|" \
     "$REPO/src/proxy-unifi" > "$T/cli"
@@ -362,6 +366,9 @@ iptables -t nat -A PREROUTING -i pu-lab-l0 -p tcp --dport 5300 -j DNAT --to-dest
 iptables -N PU_LAB_FW 2>/dev/null || iptables -F PU_LAB_FW
 iptables -A PU_LAB_FW -j ACCEPT
 iptables -I FORWARD -i pu-lab-l0 -j PU_LAB_FW
+iptables -N PU_LAB_BL 2>/dev/null || iptables -F PU_LAB_BL
+iptables -A PU_LAB_BL -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -I FORWARD -o pu-lab-l0 -j PU_LAB_BL
 iptables -I FORWARD -i pu-lab-o0 -o pu-lab-l0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 serve_in "$OTHER" 10.98.0.2 5301 other-net
 serve_in "$LAN" 10.99.0.2 5302 lan-host
@@ -384,7 +391,9 @@ assert inbound["sniffing"]["routeOnly"] is True
 PY
 check "overlay is readable by the core" [ "$(stat -c %a "$T/run/ingress.json")" = 644 ]
 check "WireGuard port guarded before use" iptables -C PU_LAB_WG -p udp --dport "$WG_PORT" ! -i lo -j DROP
-check "tunnel MTU on the veth" [ "$(cat /sys/class/net/$VETH/mtu)" = 1340 ]
+check "full-size packets on the veth" [ "$(cat /sys/class/net/$VETH/mtu)" = 1500 ]
+check "tunnel MTU on the route to the tunnel side" \
+    sh -c "ip route show 169.254.78.2/32 dev $VETH | grep -q ' mtu 1340'"
 
 if [ "$MODE" = wireguard ]; then
     check "kernel WireGuard holds the port" sh -c "ss -lun | grep -q ':$WG_PORT '"
@@ -410,6 +419,13 @@ check "TCP through the kernel path" [ "${_tcp%% *}" -gt 0 ] 2>/dev/null
 info "kernel path: $(printf '%s\n' "$_tcp" | mbit) Mbit/s in this lab"
 check "UDP through the kernel path" [ "$(client_udp "$ECHO")" = ok ]
 check "UDP to a privileged port (DNS-like) through the kernel path" [ "$(client_udp "$LOW")" = ok ]
+# Besides TPROXY's TCP and UDP only ICMP gets in from the veth: protocol 253
+# (reserved for experiments) stands in for GRE, ESP, SCTP and the rest.
+_other() { iptables -L PU_LAB_IN -v -x -n | awk -v dev="$VETH" '$3 == "DROP" && $6 == dev { print $1; exit }'; }
+_other_was="$(_other)"
+ip netns exec "$CLIENT" python3 -c 'import socket, sys; socket.socket(socket.AF_INET, socket.SOCK_RAW, 253).sendto(b"x", (sys.argv[1], 0))' "$TARGET"
+sleep 0.2
+check "other protocols from the veth are dropped" [ "$(_other)" -gt "${_other_was:-0}" ]
 check "direct routes still refuse private targets" [ "$(client_private)" = 0 ]
 check "the core logged the refusal" grep -q 'blocked target: tcp:127.0.0.1' "$T/core.log"
 check "UDP reply on a port the host shares (SO_REUSEADDR)" [ "$(client_udp "$SHARED")" = ok ]
@@ -435,11 +451,13 @@ _tx() { ip -s -s link show pu-lab-l0 | awk '/TX:/ { getline; print $1, $2; exit 
 _tx0="$(_tx)"
 _lan="$(client_tcp "$LAN")"
 _tx1="$(_tx)"
-# Like WireGuard's, the pair's packets reach the LAN driver finished: no
-# TSO/GSO packets beyond the tunnel MTU (the average includes the Ethernet header).
+# The pair's packets reach the LAN driver finished, like WireGuard's (no
+# TSO/GSO packets), and full-size: no tunnel MTU on this path (the average
+# includes the Ethernet header).
 _avg="$(printf '%s %s\n' "$_tx0" "$_tx1" | awk '{ p = $4 - $2; print (p > 0 ? int(($3 - $1) / p) : 0) }')"
 info "LAN route: $_avg bytes per packet towards the LAN"
-check "LAN route packets reach the LAN at most MTU-sized" sh -c "[ $_avg -gt 0 ] && [ $_avg -le 1354 ]"
+check "LAN route packets reach the LAN full-size, never beyond the MTU" \
+    sh -c "[ $_avg -gt 1354 ] && [ $_avg -le 1514 ]"
 check "LAN TCP on a Policy Table route reaches Xray without WireGuard" [ "${_lan%% *}" -gt 0 ]
 info "LAN route: $(printf '%s\n' "$_lan" | mbit) Mbit/s in this lab"
 check "LAN UDP on a Policy Table route" [ "$(client_udp "$ECHO" "$LAN")" = ok ]
@@ -450,9 +468,12 @@ check "multicast is not sent to Xray" sh -c "! grep -q '224\.0\.0\.251' '$T/core
 iptables -R PU_LAB_FW 1 -j DROP
 check "UniFi's FORWARD firewall still decides" [ "$(client_tcp "$LAN" | cut -d' ' -f1)" = 0 ]
 iptables -R PU_LAB_FW 1 -j ACCEPT
+iptables -I PU_LAB_BL 1 -s "$TARGET" -j DROP
+check "UniFi's blocklists still see the replies" [ "$(client_tcp "$LAN" | cut -d' ' -f1)" = 0 ]
+iptables -D PU_LAB_BL -s "$TARGET" -j DROP
 check "the LAN host answers the gateway" [ "$(read_from - 10.99.0.2 5302)" = lan-host ]
 # From the second pair, the gateway forwards only replies and delivers nothing.
-_drops() { iptables -L FORWARD -v -x -n | awk '$3 == "DROP" && / pu-lab-r0 / && !/ctdir/ { print $1; exit }'; }
+_drops() { iptables -L FORWARD -v -x -n | awk '$3 == "DROP" && / pu-lab-r0 / { s += $1 } END { print s + 0 }'; }
 _before="$(_drops)"
 ip -n "$NS" route add 10.99.0.2/32 via 169.254.78.5 dev pu-lab-r1
 check "the pair cannot open connections into the LAN" [ "$(read_from "$NS" 10.99.0.2 5302)" = closed ]

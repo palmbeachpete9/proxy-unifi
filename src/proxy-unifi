@@ -95,6 +95,8 @@ INGRESS_LR="pu-lr0"                             # LAN route veth, root end (LAN_
 INGRESS_LR_NS="pu-lr1"
 INGRESS_LR_HOST_IP="169.254.77.5"
 INGRESS_LR_NS_IP="169.254.77.6"
+INGRESS_LR_SRC="169.254.77.10"                  # LAN route traffic's source towards Xray
+INGRESS_MTU="1500"                              # the veth pairs; the tunnel's MTU is set per route
 INGRESS_RT_METRIC="1"                           # wins over UniFi's own route in its client table
 HOST_MOUNT_NS="/proc/1/ns/mnt"                  # the mount namespace named netns live in
 
@@ -104,7 +106,7 @@ WG_PORT="51821"
 WG_MTU="1340"
 WG_KEEPALIVE="25"
 INGRESS="kernel"                  # kernel | userspace (see "Kernel WireGuard ingress")
-LAN_ROUTE="off"                   # on: route Policy Table traffic to Xray instead of encrypting it
+LAN_ROUTE="on"                    # on: route Policy Table traffic to Xray instead of encrypting it
 XRAY_ADDR="10.7.0.1/32"
 UNIFI_ADDR="10.7.0.2/32"
 INNER_DNS="8.8.8.8"
@@ -1384,6 +1386,8 @@ fw_reconcile() {
                     return 0
                 fi
                 _ingress_rules_ok || _ingress_rules_add || return 1
+                # UniFi rebuilds its client table when the client restarts.
+                _ingress_rt_route || true
                 if service_healthy; then rm -f "$INGRESS_FAILS"; fi
             elif [ "$(current_engine)" = "singbox" ] || [ "$(current_engine)" = "awg" ]; then
                 fw_lock
@@ -1620,15 +1624,18 @@ _ingress_setup() {
     _ingress_wg_link || return 1
     _ingress_step ip link add "$INGRESS_VETH" type veth peer name "$INGRESS_VETH_NS" \
         netns "$INGRESS_NS" || return 1
-    # The veth carries the tunnel MTU, so Xray's sockets advertise an MSS that
-    # fits the tunnel instead of relying on path-MTU discovery through NAT.
+    # The route to the tunnel side carries the tunnel MTU, so Xray's sockets
+    # advertise an MSS that fits the tunnel instead of relying on path-MTU
+    # discovery through NAT; LAN route traffic, from another address, keeps
+    # full-size packets.
     _ingress_step ip addr add "$INGRESS_HOST_IP/30" dev "$INGRESS_VETH" || return 1
-    _ingress_step ip link set "$INGRESS_VETH" mtu "$WG_MTU" up || return 1
+    _ingress_step ip link set "$INGRESS_VETH" mtu "$INGRESS_MTU" up || return 1
+    _ingress_step ip route replace "$INGRESS_NS_IP/32" dev "$INGRESS_VETH" mtu "$WG_MTU" || return 1
     _ingress_step ip -n "$INGRESS_NS" link set lo up || return 1
     _ingress_step ip -n "$INGRESS_NS" addr add "$_is_xa/32" dev "$INGRESS_WG" || return 1
     _ingress_step ip -n "$INGRESS_NS" link set "$INGRESS_WG" mtu "$WG_MTU" up || return 1
     _ingress_step ip -n "$INGRESS_NS" addr add "$INGRESS_NS_IP/30" dev "$INGRESS_VETH_NS" || return 1
-    _ingress_step ip -n "$INGRESS_NS" link set "$INGRESS_VETH_NS" mtu "$WG_MTU" up || return 1
+    _ingress_step ip -n "$INGRESS_NS" link set "$INGRESS_VETH_NS" mtu "$INGRESS_MTU" up || return 1
     # Forward between the two links, whatever source address the UniFi client
     # uses: traffic out through the veth, replies back into the tunnel.
     # shellcheck disable=SC2016 # expanded by the namespaced shell
@@ -1651,11 +1658,11 @@ _ingress_setup() {
     _ingress_step ip link add "$INGRESS_LR" type veth peer name "$INGRESS_LR_NS" \
         netns "$INGRESS_NS" || return 1
     _ingress_step ip addr add "$INGRESS_LR_HOST_IP/30" dev "$INGRESS_LR" || return 1
-    # The tunnel MTU here too: the gateway, not the namespace, then answers
-    # oversized LAN packets, and the MSS clamp below fits the first pair.
-    _ingress_step ip link set "$INGRESS_LR" mtu "$WG_MTU" up || return 1
+    # No WireGuard on this path: full-size packets (the MSS clamp below covers
+    # LANs with a larger MTU).
+    _ingress_step ip link set "$INGRESS_LR" mtu "$INGRESS_MTU" up || return 1
     _ingress_step ip -n "$INGRESS_NS" addr add "$INGRESS_LR_NS_IP/30" dev "$INGRESS_LR_NS" || return 1
-    _ingress_step ip -n "$INGRESS_NS" link set "$INGRESS_LR_NS" mtu "$WG_MTU" up || return 1
+    _ingress_step ip -n "$INGRESS_NS" link set "$INGRESS_LR_NS" mtu "$INGRESS_MTU" up || return 1
     # Only finished packets leave the pair, MTU-sized and checksummed, as they
     # do from UniFi's WireGuard client. Otherwise Xray's TSO/GSO packets reach
     # the LAN driver for segmentation and checksumming, which it never does on
@@ -1675,6 +1682,11 @@ _ingress_setup() {
     _ingress_step ip -n "$INGRESS_NS" route add default via "$INGRESS_LR_HOST_IP" \
         dev "$INGRESS_LR_NS" table 101 || return 1
     _ingress_step ip -n "$INGRESS_NS" rule add pref 90 fwmark 0x1/0x1 lookup 101 || return 1
+    # Towards Xray from their own address, which the tunnel MTU route misses.
+    _ingress_step ip -n "$INGRESS_NS" addr add "$INGRESS_LR_SRC/32" dev "$INGRESS_VETH_NS" || return 1
+    _ingress_step ip netns exec "$INGRESS_NS" iptables -t nat -I POSTROUTING 1 -o "$INGRESS_VETH_NS" \
+        -m connmark --mark 0x1/0x1 -j SNAT --to-source "$INGRESS_LR_SRC" || return 1
+    _ingress_step ip route replace "$INGRESS_LR_SRC/32" dev "$INGRESS_VETH" || return 1
     _ingress_rt_route
 }
 
@@ -1685,7 +1697,9 @@ _ingress_setup() {
 # tables, and the FORWARD firewall (which sees pu-lr0, not wgclt, as the egress
 # interface). The namespace passes the traffic to Xray's TPROXY path through
 # the first pair and returns the replies through the second, where the gateway
-# forwards only replies of connections it forwarded there itself. Traffic the
+# drops all but replies of connections it forwarded there itself; those go on
+# through UniFi's FORWARD chain (its threat blocklists) like replies from wgclt
+# do. Traffic the
 # gateway sends through the client itself (UniFi's DNS forwarder for it) takes
 # the pair too; of that, only replies come back in.
 
@@ -1721,17 +1735,11 @@ _ingress_rt_ok() {
     iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_LR" -m conntrack --ctstate ESTABLISHED,RELATED \
             --ctdir REPLY -j ACCEPT 2>/dev/null \
         && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_LR" -j DROP 2>/dev/null \
-        && iptables -S FORWARD 2>/dev/null | grep -m 1 -- "-i $INGRESS_LR " | grep -q -- "-j ACCEPT" \
-        && iptables -C FORWARD -i "$INGRESS_LR" -m conntrack --ctstate ESTABLISHED,RELATED \
-            --ctdir REPLY -j ACCEPT 2>/dev/null \
-        && iptables -C FORWARD -i "$INGRESS_LR" -j DROP 2>/dev/null \
+        && iptables -C FORWARD -i "$INGRESS_LR" -m conntrack --ctdir ORIGINAL -j DROP 2>/dev/null \
+        && iptables -C FORWARD -i "$INGRESS_LR" -m conntrack ! --ctstate ESTABLISHED,RELATED \
+            -j DROP 2>/dev/null \
         && iptables -t mangle -C POSTROUTING -o "$INGRESS_LR" -p tcp \
-            --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
-        || return 1
-    ip link show "$INGRESS_LR" >/dev/null 2>&1 || return 0
-    _ro_tbl="$(_ingress_rt_table)" || return 0
-    ip route show table "$_ro_tbl" 2>/dev/null \
-        | grep -q "^default via $INGRESS_LR_NS_IP dev $INGRESS_LR .*metric $INGRESS_RT_METRIC\\( \\|\$\\)"
+            --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
 }
 
 # Root-namespace rules of the mode; they name pu-lr0 before it exists.
@@ -1748,10 +1756,12 @@ _ingress_rt_add() {
     _ingress_step iptables -I "$INGRESS_IN_CHAIN" 1 -i "$INGRESS_LR" -j DROP || return 1
     _ingress_step iptables -I "$INGRESS_IN_CHAIN" 1 -i "$INGRESS_LR" -m conntrack \
         --ctstate ESTABLISHED,RELATED --ctdir REPLY -j ACCEPT || return 1
-    # Only replies, of connections the gateway forwarded into the pair.
-    _ingress_step iptables -I FORWARD 1 -i "$INGRESS_LR" -j DROP || return 1
-    _ingress_step iptables -I FORWARD 1 -i "$INGRESS_LR" -m conntrack --ctstate ESTABLISHED,RELATED \
-        --ctdir REPLY -j ACCEPT || return 1
+    # Nothing but replies, of connections the gateway forwarded into the pair.
+    # Those are not accepted here: UniFi's FORWARD chain, its threat blocklists
+    # included, decides on them as on replies from wgclt.
+    _ingress_step iptables -I FORWARD 1 -i "$INGRESS_LR" -m conntrack ! --ctstate ESTABLISHED,RELATED \
+        -j DROP || return 1
+    _ingress_step iptables -I FORWARD 1 -i "$INGRESS_LR" -m conntrack --ctdir ORIGINAL -j DROP || return 1
     # Clamp like UniFi does for wgclt; the counter shows what its firewall let through.
     _ingress_step iptables -t mangle -A POSTROUTING -o "$INGRESS_LR" -p tcp \
         --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || return 1
@@ -1760,6 +1770,10 @@ _ingress_rt_add() {
 
 # Idempotent; the route goes with the pair.
 _ingress_rt_del() {
+    while iptables -D FORWARD -i "$INGRESS_LR" -m conntrack --ctdir ORIGINAL -j DROP 2>/dev/null; do :; done
+    while iptables -D FORWARD -i "$INGRESS_LR" -m conntrack ! --ctstate ESTABLISHED,RELATED \
+        -j DROP 2>/dev/null; do :; done
+    # The rules of earlier versions, which accepted the replies before UniFi's chain.
     while iptables -D FORWARD -i "$INGRESS_LR" -m conntrack --ctstate ESTABLISHED,RELATED \
         --ctdir REPLY -j ACCEPT 2>/dev/null; do :; done
     while iptables -D FORWARD -i "$INGRESS_LR" -j DROP 2>/dev/null; do :; done
@@ -1781,7 +1795,7 @@ ingress_rt_status() {
 }
 
 # Root-namespace rules: TPROXY every TCP/UDP packet from the veth to Xray, admit
-# from the veth only the TCP/UDP that TPROXY marked for Xray (and ICMP), keep Xray's
+# from the veth only the TCP/UDP that TPROXY marked for Xray and ICMP, keep Xray's
 # listener off every other interface, never forward from the veth (no tunnel
 # traffic may bypass the proxy), and deliver the veth's traffic locally.
 _ingress_rules_ok() {
@@ -1792,9 +1806,8 @@ _ingress_rules_ok() {
         && iptables -t mangle -C "$INGRESS_TP_CHAIN" -p udp $_ir_tp 2>/dev/null \
         && iptables -C INPUT -j "$INGRESS_IN_CHAIN" 2>/dev/null \
         && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -m mark --mark "$INGRESS_MARK" -j ACCEPT 2>/dev/null \
-        && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p tcp -j DROP 2>/dev/null \
-        && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p udp -j DROP 2>/dev/null \
-        && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -j ACCEPT 2>/dev/null \
+        && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p icmp -j ACCEPT 2>/dev/null \
+        && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -j DROP 2>/dev/null \
         && iptables -C "$INGRESS_IN_CHAIN" -p tcp --dport "$INGRESS_PORT" -j DROP 2>/dev/null \
         && iptables -C "$INGRESS_IN_CHAIN" -p udp --dport "$INGRESS_PORT" -j DROP 2>/dev/null \
         && iptables -C FORWARD -i "$INGRESS_VETH" -j DROP 2>/dev/null \
@@ -1819,13 +1832,12 @@ _ingress_rules_add() {
     # Should the TPROXY rule ever be lost, the veth's TCP and UDP would reach
     # every service the gateway runs on a wildcard address (everything from the
     # veth is delivered locally). Only what TPROXY handed to Xray carries its
-    # mark (no xt_socket needed, which UniFi kernels lack); ICMP, errors
-    # included, still gets in.
+    # mark (no xt_socket needed, which UniFi kernels lack); besides it only
+    # ICMP, errors included, gets in, no other protocol.
     _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -m mark --mark "$INGRESS_MARK" \
         -j ACCEPT || return 1
-    _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p tcp -j DROP || return 1
-    _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p udp -j DROP || return 1
-    _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -j ACCEPT || return 1
+    _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p icmp -j ACCEPT || return 1
+    _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -j DROP || return 1
     _ingress_step iptables -A "$INGRESS_IN_CHAIN" -p tcp --dport "$INGRESS_PORT" -j DROP || return 1
     _ingress_step iptables -A "$INGRESS_IN_CHAIN" -p udp --dport "$INGRESS_PORT" -j DROP || return 1
     iptables -C INPUT -j "$INGRESS_IN_CHAIN" 2>/dev/null \

@@ -214,6 +214,9 @@ PY
 LINK='vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.1.1.1:443?security=none&type=tcp#test'
 printf '1\n%s\n\n0\n' "$LINK" | menu_input >/dev/null
 [ -s "$T/root/etc/config.json" ] || exit 1
+# A fresh install runs everything that is fast by default.
+grep -q '^INGRESS="kernel"$' "$T/root/etc/settings.env"
+grep -q '^LAN_ROUTE="on"$' "$T/root/etc/settings.env"
 [ -s "$T/root/etc/link.txt" ] || exit 1
 [ ! -e "$T/root/.transactions/active" ] || exit 1
 [ ! -e "$T/root/.lock" ] || exit 1

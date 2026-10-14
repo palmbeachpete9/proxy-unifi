@@ -89,20 +89,22 @@ to Xray, which routes it exactly as before (same inbound tag and sniffing).
   from the remote address and port, which fails for ports the gateway itself holds
   (UniFi's STUN on 3478, for example). Those replies are lost; `proxy status`
   lists the ports. TCP is unaffected.
-- **Privilege:** only in this mode, the core gets one capability, `CAP_NET_RAW`,
-  which transparent sockets require.
+- **Privilege:** only in this mode, the core gets `CAP_NET_RAW`, which
+  transparent sockets require, and `CAP_NET_BIND_SERVICE`, so it can answer UDP
+  from remote ports below 1024 (DNS, QUIC).
 - **Private addresses:** as with Xray's WireGuard inbound, direct (freedom) routes
   refuse private and loopback targets for tunnel clients.
-- **LAN route (optional, off by default):** `proxy set lan-route on`, or the menu
+- **LAN route (on by default):** `proxy set lan-route off|on`, or the menu
   under WireGuard settings. LAN traffic that a Policy Table route sends to this
   VPN Client is routed into a second proxy-unifi veth pair instead of being
   encrypted, and
-  reaches Xray without both WireGuard passes. UniFi still processes it first: its
+  reaches Xray without both WireGuard passes, in full-size packets. UniFi still processes it first: its
   marking, NAT (DNS interception, hotspot), its other routing tables, and its
   FORWARD firewall. The firewall sees `pu-lr0` instead of `wgclt` as the egress
   interface, so rules written for the VPN zone's interface do not match; rules by
   address or by LAN interface still do. Only replies to connections the gateway
-  forwarded into the pair come back from it. Traffic the gateway itself sends
+  forwarded into the pair come back from it, and UniFi's FORWARD chain (its
+  threat blocklists included) decides on them as on replies from `wgclt`. Traffic the gateway itself sends
   through the VPN client (such as UniFi's DNS forwarder for it) takes the pair
   too, and only its replies reach the gateway. `proxy status` shows `lan route` with how many TCP connections
   UniFi's firewall let through; it reports `blocked` if strict reverse-path
