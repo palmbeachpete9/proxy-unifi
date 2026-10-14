@@ -39,7 +39,8 @@ SERVICE_STATE_MARKER="$WORKDIR/service-state-active"
 
 snapshot_service_state() {
     mkdir -p "$SERVICE_STATE_BACKUP"
-    for _unit in proxy-unifi.service proxy-unifi-refresh.service proxy-unifi-refresh.timer proxy-unifi-guard.service proxy-unifi-guard.timer; do
+    for _unit in proxy-unifi.service proxy-unifi-refresh.service proxy-unifi-refresh.timer proxy-unifi-guard.service proxy-unifi-guard.timer \
+                 proxy-unifi-fallback.service proxy-unifi-fallback.timer; do
         if [ -e "/etc/systemd/system/$_unit" ]; then
             : > "$SERVICE_STATE_BACKUP/$_unit.present"
             cp -p "/etc/systemd/system/$_unit" "$SERVICE_STATE_BACKUP/$_unit" || return 1
@@ -55,7 +56,8 @@ restore_service_state() {
     [ -f "$SERVICE_STATE_MARKER" ] || return 0
     [ -f "$SERVICE_STATE_BACKUP/snapshotted" ] || return 0
     systemctl daemon-reload >/dev/null 2>&1 || return 1
-    for _unit in proxy-unifi.service proxy-unifi-refresh.service proxy-unifi-refresh.timer proxy-unifi-guard.service proxy-unifi-guard.timer; do
+    for _unit in proxy-unifi.service proxy-unifi-refresh.service proxy-unifi-refresh.timer proxy-unifi-guard.service proxy-unifi-guard.timer \
+                 proxy-unifi-fallback.service proxy-unifi-fallback.timer; do
         if [ ! -f "$SERVICE_STATE_BACKUP/$_unit.present" ]; then
             systemctl disable --now "$_unit" >/dev/null 2>&1 || true
             rm -f "/etc/systemd/system/$_unit"

@@ -56,6 +56,10 @@ REFRESH_TIMER_FILE="/etc/systemd/system/${SERVICE_NAME}-refresh.timer"
 GUARD_SERVICE_NAME="${SERVICE_NAME}-guard"
 GUARD_SERVICE_FILE="/etc/systemd/system/${GUARD_SERVICE_NAME}.service"
 GUARD_TIMER_FILE="/etc/systemd/system/${GUARD_SERVICE_NAME}.timer"
+FB_SERVICE_NAME="${SERVICE_NAME}-fallback"
+FB_SERVICE_FILE="/etc/systemd/system/${FB_SERVICE_NAME}.service"
+FB_TIMER_FILE="/etc/systemd/system/${FB_SERVICE_NAME}.timer"
+FB_LAST="$ROOT/fallback.last"               # the last switch (written only when one happens)
 ONBOOT_DST="/data/on_boot.d/15-proxy-unifi.sh"
 LOCK_DIR="$ROOT/.lock"
 TXN_ROOT="$ROOT/.transactions"
@@ -79,6 +83,7 @@ INGRESS_RUN="/run/proxy-unifi"                  # root-owned tmpfs state, gone a
 INGRESS_OVERLAY="$INGRESS_RUN/ingress.json"     # Xray inbound overlay for the running core
 INGRESS_ACTIVE="$INGRESS_RUN/kernel-ingress"    # present while the kernel path is up
 INGRESS_ERROR="$INGRESS_RUN/kernel-ingress.error"
+FB_STATE="$INGRESS_RUN/fallback.state"         # the watchdog's counters, in RAM
 INGRESS_FAILS="$INGRESS_RUN/kernel-ingress.failures"  # core exits on the kernel path
 INGRESS_NS="proxy-unifi"
 INGRESS_WG="pu-wg"
@@ -117,7 +122,11 @@ PING_URL="https://www.gstatic.com/generate_204"
 PING_TIMEOUT="5"
 SUB_REFRESH_HOURS="6"
 FALLBACK="off"                    # on: the watchdog switches pool nodes (see "Fallback pool")
+FB_INTERVAL="20"                  # seconds between watchdog runs
+FB_DOWN="3"                       # failed checks in a row before a node is offline
+FB_UP="5"                         # good checks in a row before a node is back online
 FB_TIMEOUT="5"                    # seconds per check
+FB_RETURN="on"                    # return to a higher-priority node once it is back
 SUB_USER_AGENT_DEFAULT="Happ/2.0"
 SUB_USER_AGENT_LEGACY_DEFAULT="proxy-unifi/1.1"
 SUB_USER_AGENT="$SUB_USER_AGENT_DEFAULT"
@@ -139,6 +148,7 @@ need_root() {
 }
 
 _uint() { case "$1" in ""|*[!0-9]*) return 1;; *) return 0;; esac; }
+_in_range() { _uint "$1" && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]; }   # <value> <min> <max>
 
 load_settings() {
     [ -f "$SETTINGS" ] || return 0
@@ -165,6 +175,12 @@ load_settings() {
                 if _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 60 ]; then PING_TIMEOUT="$_value"; fi ;;
             SUB_REFRESH_HOURS)
                 if _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 8760 ]; then SUB_REFRESH_HOURS="$_value"; fi ;;
+            FALLBACK) case "$_value" in on|off) FALLBACK="$_value" ;; esac ;;
+            FB_INTERVAL) if _in_range "$_value" 5 600; then FB_INTERVAL="$_value"; fi ;;
+            FB_DOWN) if _in_range "$_value" 1 20; then FB_DOWN="$_value"; fi ;;
+            FB_UP) if _in_range "$_value" 1 50; then FB_UP="$_value"; fi ;;
+            FB_TIMEOUT) if _in_range "$_value" 2 30; then FB_TIMEOUT="$_value"; fi ;;
+            FB_RETURN) case "$_value" in on|off) FB_RETURN="$_value" ;; esac ;;
             SUB_USER_AGENT)
                 case "$_value" in
                     "$SUB_USER_AGENT_LEGACY_DEFAULT")
@@ -239,6 +255,12 @@ PING_URL="$PING_URL"
 PING_TIMEOUT="$PING_TIMEOUT"
 SUB_REFRESH_HOURS="$SUB_REFRESH_HOURS"
 SUB_USER_AGENT="$SUB_USER_AGENT"
+FALLBACK="$FALLBACK"
+FB_INTERVAL="$FB_INTERVAL"
+FB_DOWN="$FB_DOWN"
+FB_UP="$FB_UP"
+FB_TIMEOUT="$FB_TIMEOUT"
+FB_RETURN="$FB_RETURN"
 EOF
 }
 
@@ -494,6 +516,12 @@ restore_runtime_state() {
     else
         systemctl stop "${SERVICE_NAME}-refresh.timer" >/dev/null 2>&1 || true
     fi
+    if [ -f "$_state/fb-timer-enabled" ]; then
+        ( load_settings; write_fallback_timer ) 2>/dev/null || true
+        systemctl enable --now "$FB_SERVICE_NAME.timer" >/dev/null 2>&1 || true
+    else
+        systemctl disable --now "$FB_SERVICE_NAME.timer" >/dev/null 2>&1 || true
+    fi
     fw_reconcile || true
 }
 
@@ -531,6 +559,7 @@ txn_begin() {
     if systemctl is-enabled --quiet "${SERVICE_NAME}-refresh.timer" 2>/dev/null; then
         : > "$TXN_DIR/timer-enabled"
     fi
+    if systemctl is-enabled --quiet "$FB_SERVICE_NAME.timer" 2>/dev/null; then : > "$TXN_DIR/fb-timer-enabled"; fi
     : > "$TXN_DIR/runtime-state"
     fsync_tree "$TXN_DIR" || fatal "could not persist state transaction snapshot"
     printf '%s\n' "$TXN_DIR" | atomic_write "$TXN_MARKER" 600 \
@@ -2026,6 +2055,10 @@ EOF
     # systemctl takes unit names here; a file path is not a startable unit.
     systemctl enable --now "$GUARD_SERVICE_NAME.timer" >/dev/null 2>&1 \
         || fatal "could not start firewall guard timer"
+    if [ "$FALLBACK" = on ]; then
+        write_fallback_timer || fatal "could not write the fallback timer"
+        systemctl enable --now "$FB_SERVICE_NAME.timer" >/dev/null 2>&1 || fatal "could not start the fallback timer"
+    fi
 }
 
 boot_recover() {
@@ -2200,7 +2233,10 @@ cmd_import_json() {
     # a pool import supersedes any single link + subscription selection
     rm -f "$OUTBOUND_LINK" 2>/dev/null || true
     rm -f "$AWG_SELECTED" 2>/dev/null || true
-    [ "${_FROM_SUB:-0}" = "1" ] || rm -f "$SUB_SELECTED" "$SUB_SELECTED_META" 2>/dev/null || true
+    if [ "${_FROM_SUB:-0}" != "1" ]; then
+        rm -f "$SUB_SELECTED" "$SUB_SELECTED_META" 2>/dev/null || true
+        fallback_detach
+    fi
     save_settings
     restart_service || fatal "profile was valid, but the service failed its startup health check"
     [ "$_cmd_owned" = 1 ] && txn_commit
@@ -2238,7 +2274,10 @@ cmd_import() {
     # A manual import detaches any subscription selection (so a later 'sub refresh'
     # won't think this hand-picked link came from the subscription). sub_select sets
     # _FROM_SUB=1 to keep its own marker.
-    [ "${_FROM_SUB:-0}" = "1" ] || rm -f "$SUB_SELECTED" "$SUB_SELECTED_META" 2>/dev/null || true
+    if [ "${_FROM_SUB:-0}" != "1" ]; then
+        rm -f "$SUB_SELECTED" "$SUB_SELECTED_META" 2>/dev/null || true
+        fallback_detach
+    fi
     # Apply immediately (starts the service even if autostart is off; the unit's
     # ConditionPathExists is now satisfied because config.json exists).
     restart_service || fatal "link was valid, but the service failed its startup health check"
@@ -2308,6 +2347,13 @@ cmd_status() {
         if [ -x "$XRAY" ]; then echo "core:      $(core_version "$XRAY")"; else echo "core:      xray not installed"; fi
     fi
     echo "server:    $(current_server)"
+    if [ "$FALLBACK" = on ]; then
+        echo "fallback:  on, $(PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKFALLBACK" status --pool "$FB_POOL" \
+            --state "$FB_STATE" --last "$FB_LAST" --selected "$SUB_SELECTED_META" --subs-dir "$SUB_DIR" \
+            2>/dev/null || echo "the pool cannot be read")"
+    else
+        echo "fallback:  off"
+    fi
     # The sing-box-based cores and kernel WireGuard bind the WG port on all
     # interfaces; a firewall rule blocks non-loopback access. Report the
     # protection actually in effect.
@@ -3437,6 +3483,7 @@ awg_select() {
     # subscriptions and AWG profiles so the user can switch back later.
     rm -f "$OUTBOUND_LINK" "$SUB_SELECTED" "$SUB_SELECTED_META" 2>/dev/null || true
     rm -rf "$POOL_DIR" "$POOL_SRC" 2>/dev/null || true
+    fallback_detach
     save_settings
     restart_service || fatal "profile was valid, but the service failed its startup health check"
     txn_commit
@@ -4076,9 +4123,73 @@ _fallback_probe() {   # <subscription id> <node id> <live|core>
     if [ "$_rc" = 0 ]; then echo "ok $_ms"; else echo "fail $_why"; fi
 }
 
-# Until the watchdog's settings exist these keep the subscription code complete.
-fallback_detach() { :; }
-fallback_set() { :; }
+write_fallback_timer() {
+    atomic_write "$FB_SERVICE_FILE" 644 <<EOF || return 1
+[Unit]
+Description=proxy-unifi fallback watchdog run
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$BIN_DIR/proxy-unifi fallback-check
+Nice=10
+# No "started/finished" pair every interval in the journal; switches log at notice.
+LogLevelMax=notice
+EOF
+    atomic_write "$FB_TIMER_FILE" 644 <<EOF || return 1
+[Unit]
+Description=proxy-unifi fallback watchdog
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=${FB_INTERVAL}s
+AccuracySec=1s
+Unit=$FB_SERVICE_NAME.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload 2>/dev/null || return 1
+}
+
+# Turn the watchdog on or off (inside a transaction).
+fallback_set() {   # on|off
+    FALLBACK="$1"; save_settings
+    if [ "$1" = on ]; then
+        write_fallback_timer || fatal "could not write the fallback timer"
+        systemctl enable --now "$FB_SERVICE_NAME.timer" >/dev/null 2>&1 || fatal "could not start the fallback timer"
+    else
+        systemctl disable --now "$FB_SERVICE_NAME.timer" >/dev/null 2>&1 || true
+    fi
+}
+
+# A node chosen by hand takes over from the watchdog; the pool is kept.
+fallback_detach() {
+    [ "$FALLBACK" = on ] || return 0
+    fallback_set off
+    c_ylw "Fallback turned off: you chose the node yourself (the pool is kept)."
+}
+
+# 0 when a live process holds the CLI lock.
+lock_busy() {
+    [ -d "$LOCK_DIR" ] || return 1
+    _lb="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    case "$_lb" in ""|*[!0-9]*) return 0 ;; esac
+    kill -0 "$_lb" 2>/dev/null
+}
+
+# One watchdog run (the timer's job). It never waits: a held lock means the
+# user is changing things, and a stopped service stays stopped.
+fallback_check() {
+    [ "$FALLBACK" = on ] || return 0
+    [ "$(_unit_state)" != inactive ] || return 0
+    if lock_busy; then return 0; fi
+    [ -s "$FB_POOL" ] || return 0
+    mkdir -p "$INGRESS_RUN" || return 1
+    py "$MKFALLBACK" run --pool "$FB_POOL" --state "$FB_STATE" --last "$FB_LAST" \
+        --selected "$SUB_SELECTED_META" --cli "$BIN_DIR/proxy-unifi" \
+        --down "$FB_DOWN" --up "$FB_UP" --return "$FB_RETURN" --timeout "$FB_TIMEOUT"
+}
 
 # One watchdog switch, under the lock. A decision that went stale while the
 # run was checking (fallback turned off, the active node changed) exits 3.
@@ -4115,7 +4226,9 @@ cmd_uninstall() {
     fw_unlock                       # drop the userspace-core firewall guard, if any
     rm -rf "$INGRESS_RUN"
     disable_guard_timer
-    rm -f "$SERVICE_FILE" "$REFRESH_SERVICE_FILE" "$REFRESH_TIMER_FILE" "$ONBOOT_DST"
+    systemctl disable --now "$FB_SERVICE_NAME.timer" >/dev/null 2>&1 || true
+    rm -f "$SERVICE_FILE" "$REFRESH_SERVICE_FILE" "$REFRESH_TIMER_FILE" "$ONBOOT_DST" \
+        "$FB_SERVICE_FILE" "$FB_TIMER_FILE"
     remove_proxy_link
     systemctl daemon-reload 2>/dev/null || true
     c_ylw "Removed service + boot hook. Data kept at $ROOT (delete it manually to purge keys/config)."
@@ -4158,7 +4271,7 @@ case "$cmd" in
     # Takes the lock only to install each downloaded catalog.
     sub-refresh-auto) need_root ;;
     # Read-only, and called while the watchdog decides: never waits for the lock.
-    _fallback-probe) need_root ;;
+    _fallback-probe|fallback-check) need_root ;;
     *) need_root; acquire_lock; recover_transaction ;;
 esac
 load_settings
@@ -4186,6 +4299,7 @@ case "$cmd" in
     install-service) install_service ;;
     boot-recover)    boot_recover ;;
     _fw-reconcile)   fw_reconcile ;;
+    fallback-check)  fallback_check ;;
     _fallback-probe) _fallback_probe "${1:-}" "${2:-}" "${3:-}" ;;
     _fallback-apply) _fallback_apply "${1:-}" "${2:-}" "${3:-}" "${4:-}" ;;
     sub-refresh-auto)

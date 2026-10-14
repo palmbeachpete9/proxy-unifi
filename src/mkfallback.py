@@ -290,11 +290,18 @@ def _active(path):
     return None
 
 
+def _cli(args, timeout):
+    """(exit status, output) of a CLI callback. Output goes through a file, not a
+    pipe: a process the callback leaves running must not hold this run open."""
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as out:
+        done = subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, timeout=timeout)
+        out.seek(0)
+        return done.returncode, out.read(65536)
+
+
 def _cli_probe(cli, entry, kind, timeout):
     try:
-        out = subprocess.run([cli, "_fallback-probe", entry["sub"], entry["meta"]["id"], kind],
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             universal_newlines=True, timeout=timeout * 3 + 40).stdout
+        _, out = _cli([cli, "_fallback-probe", entry["sub"], entry["meta"]["id"], kind], timeout * 3 + 40)
     except (OSError, subprocess.SubprocessError):
         return False, 0, "check did not finish"
     word, _, rest = (out.strip().splitlines() or [""])[0].partition(" ")
@@ -307,17 +314,14 @@ def _cli_probe(cli, entry, kind, timeout):
 
 def _cli_apply(cli, entry, expected, reason):
     try:
-        done = subprocess.run([cli, "_fallback-apply", entry["sub"], entry["meta"]["id"],
-                               expected or "-", reason],
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              universal_newlines=True, timeout=600)
+        rc, out = _cli([cli, "_fallback-apply", entry["sub"], entry["meta"]["id"], expected or "-", reason], 600)
     except (OSError, subprocess.SubprocessError):
         return False, "switch did not finish"
-    lines = [line for line in done.stdout.splitlines() if line.strip()]
-    why = lines[-1][:80] if lines else "exit %d" % done.returncode
-    if done.returncode == 3:
+    lines = [line for line in out.splitlines() if line.strip()]
+    why = lines[-1][:80] if lines else "exit %d" % rc
+    if rc == 3:
         raise Stale(why)
-    return done.returncode == 0, why
+    return rc == 0, why
 
 
 def _when(epoch):

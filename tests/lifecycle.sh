@@ -39,6 +39,8 @@ sed \
     -e "s|^REFRESH_TIMER_FILE=.*|REFRESH_TIMER_FILE=\"$T/proxy-unifi-refresh.timer\"|" \
     -e "s|^GUARD_SERVICE_FILE=.*|GUARD_SERVICE_FILE=\"$T/proxy-unifi-guard.service\"|" \
     -e "s|^GUARD_TIMER_FILE=.*|GUARD_TIMER_FILE=\"$T/proxy-unifi-guard.timer\"|" \
+    -e "s|^FB_SERVICE_FILE=.*|FB_SERVICE_FILE=\"$T/proxy-unifi-fallback.service\"|" \
+    -e "s|^FB_TIMER_FILE=.*|FB_TIMER_FILE=\"$T/proxy-unifi-fallback.timer\"|" \
     -e "s|^ONBOOT_DST=.*|ONBOOT_DST=\"$T/on_boot.sh\"|" \
     -e "s|^PROXY_LINK=\"/usr/bin/proxy\"|PROXY_LINK=\"$T/proxy\"|" \
     -e "s|^INGRESS_RUN=.*|INGRESS_RUN=\"$T/run\"|" \
@@ -48,6 +50,9 @@ awk -v user="$(id -un)" -v group="$(id -gn)" '
         print "ensure_service_user() { SERVICE_USER=\"" user "\"; SERVICE_GROUP=\"" group "\"; }"
         print "need_root() { :; }"
         print "ingress_supported() { return 0; }"
+        # The watchdog checks nodes through scripted results:
+        # $MOCK_STATE/probe_<sub>_<first 8 hex of the node id> holds "ok MS" or "fail ERROR".
+        print "_fallback_probe() { _fp=\"$MOCK_STATE/probe_${1}_$(printf %.8s \"$2\")\"; if [ -s \"$_fp\" ]; then cat \"$_fp\"; else echo \"fail unscripted\"; fi; }"
         done=1
     }
     { print }
@@ -567,6 +572,52 @@ grep -q '^fail [0-9]* no network in the sandbox$' "$T/root/etc/subscription/2/st
 grep -q '@1.0.0.1:' "$T/root/etc/link.txt"
 [ ! -e "$T/root/.lock" ] || exit 1
 [ ! -e "$T/root/.transactions/active" ] || exit 1
+
+# The fallback watchdog: subscription 2 holds two-a (1.1.1.1) and two-b
+# (1.0.0.1, active). The pool is built with the module directly here; the
+# menu's wizard has its own checks.
+cat2="$T/root/etc/subscription/2/catalog.json"
+idof() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nodes"][int(sys.argv[2])]["id"])' "$cat2" "$1"; }
+ida="$(idof 0)"; idb="$(idof 1)"
+python3 "$T/root/bin/mkfallback.py" add --pool "$T/root/etc/fallback.json" --sub 2 --catalog "$cat2" --index 2
+python3 "$T/root/bin/mkfallback.py" add --pool "$T/root/etc/fallback.json" --sub 2 --catalog "$cat2" --index 1
+printf 'FALLBACK="on"\n' >> "$T/root/etc/settings.env"      # a later line wins in load_settings
+echo "ok 40" > "$STATE/probe_2_$(printf %.8s "$ida")"
+echo "fail timeout" > "$STATE/probe_2_$(printf %.8s "$idb")"
+# #1 (two-b, active) is down: the switch comes on the 3rd run (FB_DOWN=3)
+run_cli fallback-check >/dev/null; run_cli fallback-check >/dev/null
+grep -q '@1.0.0.1:' "$T/root/etc/link.txt"
+run_cli fallback-check > "$T/fb-run.out"
+grep -q '@1.1.1.1:' "$T/root/etc/link.txt"
+grep -q 'switch #1 -> #2' "$T/fb-run.out"
+grep -q '#1 offline after 3 failed checks: timeout' "$T/root/fallback.last"
+grep -q '^FALLBACK="on"' "$T/root/etc/settings.env"      # a watchdog switch keeps it on
+run_cli status | grep -q '^fallback:  on, active #2 of 2'
+# a held lock skips the run (#1 is back, but nothing changes)
+echo "ok 40" > "$STATE/probe_2_$(printf %.8s "$idb")"
+mkdir "$T/root/.lock"; sleep 300 & echo $! > "$T/root/.lock/pid"
+for _r in 1 2 3 4 5 6; do run_cli fallback-check >/dev/null; done
+grep -q '@1.1.1.1:' "$T/root/etc/link.txt"
+kill "$(cat "$T/root/.lock/pid")"; rm -rf "$T/root/.lock"
+# a stopped service is never started by a run
+run_cli stop >/dev/null; run_cli fallback-check >/dev/null
+if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
+run_cli start >/dev/null
+# a stale switch is refused: the expected active node is not the real one
+if run_cli _fallback-apply 2 "$idb" "$(printf '0%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64)" test >/dev/null 2>&1; then exit 1; fi
+grep -q '@1.1.1.1:' "$T/root/etc/link.txt"
+# back to #1 after FB_UP=5 good checks of it (one return check per run)
+for _r in 1 2 3 4; do run_cli fallback-check >/dev/null; done
+grep -q '@1.1.1.1:' "$T/root/etc/link.txt"
+run_cli fallback-check >/dev/null
+grep -q '@1.0.0.1:' "$T/root/etc/link.txt"
+# importing a link by hand turns fallback off and keeps the pool
+run_cli status | grep -q '^fallback:  on, active #1 of 2'
+printf '1\n%s\n\n0\n' "$LINK" | menu_input >/dev/null 2>&1
+grep -q '^FALLBACK="off"' "$T/root/etc/settings.env"
+[ -s "$T/root/etc/fallback.json" ]
+run_cli status | grep -q '^fallback:  off'
+[ ! -e "$T/root/.lock" ] || exit 1
 
 [ ! -e "$STATE/stale-lock" ] || { echo "lock recorded a dead owner" >&2; exit 1; }
 echo lifecycle-ok
