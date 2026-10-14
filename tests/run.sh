@@ -1231,6 +1231,56 @@ for bad_header in ("bad\r\nX: y", "emoji-\U0001f600", "\u043a\u0438\u0440\u0438\
         pass
 PY
 
+    # Several subscriptions: the provider's title names one, a stored selection
+    # finds its node again after a refresh, a node can be extracted by id, node
+    # lists show fallback pool priorities, and one line summarizes each folder.
+    py_case "mksub: title, matcher, extract by id, pool marks, summary" "$SRC" <<'PY'
+import base64, contextlib, io, json, os, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import mksub
+links = "\n".join([
+    "vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.example.com:443?security=tls&type=tcp#DE",
+    "trojan://secret@b.example.com:443?security=tls#NL"]).encode()
+title = "base64:" + base64.b64encode("Провайдер A".encode()).decode()
+cat = mksub.process_body(links, {"profile-title": title})
+assert cat["meta"]["title"] == "Провайдер A", cat["meta"]
+assert mksub.process_body(links, {"profile-title": "Plain"})["meta"]["title"] == "Plain"
+de, nl = cat["nodes"]
+assert mksub.match_node(cat, mksub._selection_meta(nl))[0]["id"] == nl["id"]
+moved = dict(mksub._selection_meta(de), id="0" * 64)
+assert mksub.match_node(cat, moved)[0]["id"] == de["id"]
+assert mksub.match_node(cat, dict(moved, label="gone", server="x:1")) is None
+with tempfile.TemporaryDirectory() as tmp:
+    sub = os.path.join(tmp, "1"); os.makedirs(sub)
+    path = os.path.join(sub, "catalog.json"); json.dump(cat, open(path, "w"))
+    meta, payload = os.path.join(tmp, "m"), os.path.join(tmp, "p")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        mksub.cmd_extract(type("A", (), dict(file=path, index=0, id=nl["id"],
+                                              meta_file=meta, payload_file=payload))())
+    assert out.getvalue().split("\t")[0] == nl["id"] and open(payload).read().startswith("trojan://")
+    pool = os.path.join(tmp, "fallback.json")
+    json.dump({"schema": 1, "nodes": [
+        {"sub": "2", "meta": mksub._selection_meta(de), "missing": False},
+        {"sub": "1", "meta": mksub._selection_meta(nl), "missing": False}]}, open(pool, "w"))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        mksub.cmd_render(type("A", (), dict(file=path, selected=de["id"], pool=pool, sub="1"))())
+    rows = out.getvalue().splitlines()
+    assert rows[0].startswith("  1. [*]    "), rows               # DE: active; its pool entry is sub 2's
+    assert rows[1].startswith("  2. [ ]  2 "), rows               # NL: pool priority 2
+    open(os.path.join(sub, "url.txt"), "w").write("https://x.example/s")
+    open(os.path.join(sub, "name"), "w").write("Provider A")
+    open(os.path.join(sub, "status"), "w").write("fail 1760000000 timeout")
+    os.makedirs(os.path.join(tmp, "7"))                            # no url.txt: not a subscription
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        mksub.cmd_subs(type("A", (), dict(dir=tmp))())
+    lines = out.getvalue().splitlines()
+    assert len(lines) == 1 and lines[0].startswith("1\t"), lines
+    assert "Provider A" in lines[0] and "2 nodes" in lines[0] and "refresh failed" in lines[0], lines
+PY
+
     # mkawg: AWG 1.5-3.1 parser, bridge generator, profile catalog, and UI safety.
     py_case "mkawg parser and UI corpus" "$SRC" <<'PY'
 import base64

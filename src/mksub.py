@@ -177,6 +177,12 @@ def clean(s, maxlen=FIELD_MAX):
     return "".join(rendered)
 
 
+
+def pad(text, width):
+    """text padded with spaces to a display width (wide characters count as 2)."""
+    return text + " " * max(0, width - sum(display_width(ch) for ch in text))
+
+
 # ---- per-protocol shallow extraction --------------------------------------
 def _host_port(u):
     try:
@@ -484,6 +490,15 @@ def _meta_from_headers(headers):
         ui = headers.get("subscription-userinfo")
         if ui:
             meta["userinfo"] = clean(str(ui), 200)
+        title = str(headers.get("profile-title", "")).strip()
+        if title.lower().startswith("base64:"):
+            try:
+                title = base64.b64decode(title[7:] + "=" * (-len(title[7:]) % 4)).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                title = ""
+        title = clean(title, LABEL_MAX)
+        if title:
+            meta["title"] = title
     return meta
 
 
@@ -1014,6 +1029,16 @@ def cmd_render(args):
         print("(no nodes in subscription)")
         return
     selected = getattr(args, "selected", "") or ""
+    # Fallback pool priorities of this subscription's nodes, shown beside them.
+    marks = {}
+    if getattr(args, "pool", "") and os.path.exists(args.pool):
+        try:
+            with open(args.pool, "r", encoding="utf-8") as fh:
+                for pos, entry in enumerate(json.load(fh).get("nodes", []), 1):
+                    if entry.get("sub") == args.sub:
+                        marks[entry["meta"]["id"]] = str(pos)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            marks = {}
     for nd in nodes:
         if not nd.get("recognized"):
             mark = "x"
@@ -1025,8 +1050,8 @@ def cmd_render(args):
         server = clean(nd.get("server", "?"), 40)
         scheme = "ss2022" if nd.get("scheme") == "ss" \
             and nd.get("variant") == "2022" else clean(nd.get("scheme", "?"), 12)
-        line = "%3d. [%s] %-9s %-24s %s" % (
-            nd.get("n", 0), mark, scheme, server, label)
+        line = "%3d. [%s] %2s %-9s %-24s %s" % (
+            nd.get("n", 0), mark, marks.get(nd.get("id"), ""), scheme, server, label)
         if nd.get("reason"):
             prefix = "warning: " if nd.get("recognized") else ""
             line += "  (%s%s)" % (prefix, clean(nd["reason"], 60))
@@ -1112,9 +1137,12 @@ def _migrate_selection_scheme(old, active_link_file):
 
 def cmd_extract(args):
     cat = _load(args.file)
-    nd = next((node for node in cat.get("nodes", []) if node.get("n") == args.index), None)
+    if getattr(args, "id", ""):
+        nd = next((node for node in cat.get("nodes", []) if node.get("id") == args.id), None)
+    else:
+        nd = next((node for node in cat.get("nodes", []) if node.get("n") == args.index), None)
     if nd is None:
-        die("no node #%d in subscription" % args.index)
+        die("no such node in the subscription")
     kind = "pool" if (nd.get("kind") == "pool" or nd.get("scheme") == "json") else "link"
     sys.stdout.write("%s\t%s\t%s\t%s\n" % (
         nd.get("id", ""), "1" if nd.get("recognized") else "0",
@@ -1130,21 +1158,12 @@ def cmd_extract(args):
         die("could not write selection output: %s" % e)
 
 
-def cmd_match(args):
-    """Find one safe refresh replacement for a persisted selection.
+def match_node(cat, old):
+    """The catalog node a stored selection now refers to, as (node, score), or None.
 
     Exact content identity always wins. Otherwise require a unique strong match;
-    ambiguity leaves the active tunnel unchanged instead of switching nodes.
+    ambiguity returns None so the caller leaves the tunnel unchanged.
     """
-    cat = _load(args.file)
-    try:
-        with open(args.selection_file, "r", encoding="utf-8") as fh:
-            old = json.load(fh)
-    except Exception as e:
-        die("could not read selection metadata: %s" % e)
-    if not isinstance(old, dict):
-        die("selection metadata is malformed")
-    old = _migrate_selection_scheme(old, getattr(args, "active_link_file", ""))
     best_score = -1
     best_node = None
     best_count = 0
@@ -1152,10 +1171,7 @@ def cmd_match(args):
         if not nd.get("recognized"):
             continue
         if nd.get("id") == old.get("id"):
-            if args.meta_file:
-                _write_selection_meta(nd, args.meta_file)
-            sys.stdout.write("%s\t%s\t100\n" % (nd["n"], nd["id"]))
-            return
+            return nd, 100
         meta = _selection_meta(nd)
         if meta["kind"] != old.get("kind") or meta["scheme"] != old.get("scheme"):
             continue
@@ -1171,11 +1187,67 @@ def cmd_match(args):
         elif score == best_score:
             best_count += 1
     if best_score < 70 or best_count != 1:
+        return None
+    return best_node, best_score
+
+
+def cmd_match(args):
+    """Find one safe refresh replacement for a persisted selection."""
+    cat = _load(args.file)
+    try:
+        with open(args.selection_file, "r", encoding="utf-8") as fh:
+            old = json.load(fh)
+    except Exception as e:
+        die("could not read selection metadata: %s" % e)
+    if not isinstance(old, dict):
+        die("selection metadata is malformed")
+    old = _migrate_selection_scheme(old, getattr(args, "active_link_file", ""))
+    found = match_node(cat, old)
+    if found is None:
         sys.exit(1)
-    nd = best_node
+    nd, score = found
     if args.meta_file:
         _write_selection_meta(nd, args.meta_file)
-    sys.stdout.write("%s\t%s\t%s\n" % (nd["n"], nd["id"], best_score))
+    sys.stdout.write("%s\t%s\t%s\n" % (nd["n"], nd["id"], score))
+
+
+def cmd_subs(args):
+    """One line per subscription folder: id<TAB>display line (sanitized)."""
+    import time
+    try:
+        names = os.listdir(args.dir)
+    except OSError:
+        return
+    ids = sorted(int(d) for d in names if d.isdigit() and 1 <= int(d) <= 999
+                 and os.path.isfile(os.path.join(args.dir, d, "url.txt")))
+
+    def read(sid, name):
+        try:
+            with open(os.path.join(args.dir, str(sid), name), "r", encoding="utf-8") as fh:
+                return fh.read(512).strip()
+        except (OSError, UnicodeError):
+            return ""
+
+    def when(epoch):
+        moment = time.localtime(epoch)
+        return time.strftime("%H:%M" if moment[:3] == time.localtime()[:3] else "%d %b %H:%M", moment)
+
+    for sid in ids:
+        name = clean(read(sid, "name"), LABEL_MAX) or "(unnamed)"
+        try:
+            count = "%d nodes" % len(_load(os.path.join(args.dir, str(sid), "catalog.json"))["nodes"])
+        except SystemExit:
+            count = "not fetched"
+        status = read(sid, "status").split(" ", 2)
+        state = ""
+        if len(status) > 1 and status[1].isdigit():
+            if status[0] == "ok":
+                state = "refreshed %s" % when(int(status[1]))
+            elif status[0] == "fail":
+                state = "refresh failed %s (%s)" % (
+                    when(int(status[1])), clean(status[2] if len(status) > 2 else "", 40))
+        sys.stdout.write("%d\t%3d. %s %-11s %s\n" % (
+            sid, sid, pad(name, LABEL_MAX), count, state))
 
 
 def main():
@@ -1197,11 +1269,14 @@ def main():
     r = sub.add_parser("render")
     r.add_argument("--file", required=True)
     r.add_argument("--selected", default="")   # id of the active node -> "[*]"
+    r.add_argument("--pool", default="")       # fallback.json: show pool priorities
+    r.add_argument("--sub", default="")        # ... of this subscription's entries
     r.set_defaults(fn=cmd_render)
 
     extract = sub.add_parser("extract")
     extract.add_argument("--file", required=True)
-    extract.add_argument("--index", type=int, required=True)
+    extract.add_argument("--index", type=int, default=0)
+    extract.add_argument("--id", default="")
     extract.add_argument("--meta-file", required=True)
     extract.add_argument("--payload-file", default="")
     extract.set_defaults(fn=cmd_extract)
@@ -1212,6 +1287,10 @@ def main():
     mt.add_argument("--meta-file", default="")
     mt.add_argument("--active-link-file", default="")
     mt.set_defaults(fn=cmd_match)
+
+    sb = sub.add_parser("subs")
+    sb.add_argument("--dir", required=True)
+    sb.set_defaults(fn=cmd_subs)
 
     dispatch_subcommand(ap)
 
