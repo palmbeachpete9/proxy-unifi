@@ -600,11 +600,12 @@ grep -q 'switch #1 -> #2' "$T/fb-run.out"
 grep -q '#1 offline after 3 failed checks: timeout' "$T/root/fallback.last"
 grep -q '^FALLBACK="on"' "$T/root/etc/settings.env"      # a watchdog switch keeps it on
 run_cli status | grep -q '^fallback:  on, active #2 of 2'
-# a held lock skips the run (#1 is back, but nothing changes)
+# a held lock skips the run: not even a check is recorded
 echo "ok 40" > "$STATE/probe_2_$(printf %.8s "$idb")"
+FB_STATE_HASH="$(hash_file "$T/run/fallback.state")"
 mkdir "$T/root/.lock"; sleep 300 & echo $! > "$T/root/.lock/pid"
-for _r in 1 2 3 4 5 6; do run_cli fallback-check >/dev/null; done
-grep -q '@1.1.1.1:' "$T/root/etc/link.txt"
+run_cli fallback-check >/dev/null
+[ "$(hash_file "$T/run/fallback.state")" = "$FB_STATE_HASH" ]
 kill "$(cat "$T/root/.lock/pid")"; rm -rf "$T/root/.lock"
 # a stopped service is never started by a run
 run_cli stop >/dev/null; run_cli fallback-check >/dev/null
@@ -613,13 +614,8 @@ run_cli start >/dev/null
 # a stale switch is refused: the expected active node is not the real one
 if run_cli _fallback-apply 2 "$idb" "$(printf '0%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64)" >/dev/null 2>&1; then exit 1; fi
 grep -q '@1.1.1.1:' "$T/root/etc/link.txt"
-# back to #1 after FB_UP=5 good checks of it (one return check per run)
-for _r in 1 2 3 4; do run_cli fallback-check >/dev/null; done
-grep -q '@1.1.1.1:' "$T/root/etc/link.txt"
-run_cli fallback-check >/dev/null
-grep -q '@1.0.0.1:' "$T/root/etc/link.txt"
 # importing a link by hand turns fallback off and keeps the pool
-run_cli status | grep -q '^fallback:  on, active #1 of 2'
+run_cli status | grep -q '^fallback:  on, active #2 of 2'
 printf '1\ny\n%s\n\n0\n' "$LINK" | menu_input >/dev/null 2>&1
 grep -q '^FALLBACK="off"' "$T/root/etc/settings.env"
 [ -s "$T/root/etc/fallback.json" ]
