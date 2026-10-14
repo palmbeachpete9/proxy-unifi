@@ -485,11 +485,7 @@ check "status reports LAN route mode" grep -q "^lan route: on via table $UTABLE 
 # TPROXY rule alone, tunnel traffic (which then bypasses Xray) must still not
 # reach the gateway's own services.
 iptables -t mangle -D PREROUTING -i "$VETH" -j PU_LAB_TP
-if iptables -C PU_LAB_IN -i "$VETH" -m socket --transparent -j ACCEPT 2>/dev/null; then
-    check "without the TPROXY rule, gateway services stay closed" [ "$(client_service)" = closed ]
-else
-    info "no socket match here: the veth is admitted as a whole"
-fi
+check "without the TPROXY rule, gateway services stay closed" [ "$(client_service)" = closed ]
 iptables -D INPUT -j PU_LAB_IN
 ip rule del pref 11 iif "$VETH" lookup 7708
 check "traffic stops without the rules" [ "$(client_tcp | cut -d' ' -f1)" = 0 ]

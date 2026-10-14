@@ -90,6 +90,7 @@ INGRESS_TABLE="7707"
 INGRESS_PREF="10"
 INGRESS_TP_CHAIN="PROXY_UNIFI_TP"
 INGRESS_IN_CHAIN="PROXY_UNIFI_IN"
+INGRESS_MARK="0x4000/0x4000"                    # set by TPROXY; UniFi's marks use the upper 16 bits
 INGRESS_LR="pu-lr0"                             # LAN route veth, root end (LAN_ROUTE=on)
 INGRESS_LR_NS="pu-lr1"
 INGRESS_LR_HOST_IP="169.254.77.5"
@@ -1780,21 +1781,19 @@ ingress_rt_status() {
 }
 
 # Root-namespace rules: TPROXY every TCP/UDP packet from the veth to Xray, admit
-# from the veth only what TPROXY handed to Xray's transparent sockets (where the
-# kernel has the socket match; otherwise the veth as a whole), keep Xray's
+# from the veth only the TCP/UDP that TPROXY marked for Xray (and ICMP), keep Xray's
 # listener off every other interface, never forward from the veth (no tunnel
 # traffic may bypass the proxy), and deliver the veth's traffic locally.
 _ingress_rules_ok() {
-    _ir_tp="-j TPROXY --on-ip $INGRESS_HOST_IP --on-port $INGRESS_PORT"
-    if iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -m socket --transparent -j ACCEPT 2>/dev/null; then
-        iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p tcp -j DROP 2>/dev/null \
-            && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p udp -j DROP 2>/dev/null || return 1
-    fi
+    _ir_tp="-j TPROXY --on-ip $INGRESS_HOST_IP --on-port $INGRESS_PORT --tproxy-mark $INGRESS_MARK"
     # shellcheck disable=SC2086 # _ir_tp is a fixed list of words
     iptables -t mangle -C PREROUTING -i "$INGRESS_VETH" -j "$INGRESS_TP_CHAIN" 2>/dev/null \
         && iptables -t mangle -C "$INGRESS_TP_CHAIN" -p tcp $_ir_tp 2>/dev/null \
         && iptables -t mangle -C "$INGRESS_TP_CHAIN" -p udp $_ir_tp 2>/dev/null \
         && iptables -C INPUT -j "$INGRESS_IN_CHAIN" 2>/dev/null \
+        && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -m mark --mark "$INGRESS_MARK" -j ACCEPT 2>/dev/null \
+        && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p tcp -j DROP 2>/dev/null \
+        && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p udp -j DROP 2>/dev/null \
         && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -j ACCEPT 2>/dev/null \
         && iptables -C "$INGRESS_IN_CHAIN" -p tcp --dport "$INGRESS_PORT" -j DROP 2>/dev/null \
         && iptables -C "$INGRESS_IN_CHAIN" -p udp --dport "$INGRESS_PORT" -j DROP 2>/dev/null \
@@ -1805,7 +1804,7 @@ _ingress_rules_ok() {
 }
 
 _ingress_rules_add() {
-    _ir_tp="-j TPROXY --on-ip $INGRESS_HOST_IP --on-port $INGRESS_PORT"
+    _ir_tp="-j TPROXY --on-ip $INGRESS_HOST_IP --on-port $INGRESS_PORT --tproxy-mark $INGRESS_MARK"
     iptables -t mangle -N "$INGRESS_TP_CHAIN" 2>/dev/null \
         || _ingress_step iptables -t mangle -F "$INGRESS_TP_CHAIN" || return 1
     # shellcheck disable=SC2086 # _ir_tp is a fixed list of words
@@ -1819,12 +1818,13 @@ _ingress_rules_add() {
         || _ingress_step iptables -F "$INGRESS_IN_CHAIN" || return 1
     # Should the TPROXY rule ever be lost, the veth's TCP and UDP would reach
     # every service the gateway runs on a wildcard address (everything from the
-    # veth is delivered locally); with the socket match, only connections on
-    # Xray's transparent sockets get in, and ICMP (errors included) still does.
-    if iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -m socket --transparent -j ACCEPT 2>/dev/null; then
-        _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p tcp -j DROP || return 1
-        _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p udp -j DROP || return 1
-    fi
+    # veth is delivered locally). Only what TPROXY handed to Xray carries its
+    # mark (no xt_socket needed, which UniFi kernels lack); ICMP, errors
+    # included, still gets in.
+    _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -m mark --mark "$INGRESS_MARK" \
+        -j ACCEPT || return 1
+    _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p tcp -j DROP || return 1
+    _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p udp -j DROP || return 1
     _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -j ACCEPT || return 1
     _ingress_step iptables -A "$INGRESS_IN_CHAIN" -p tcp --dport "$INGRESS_PORT" -j DROP || return 1
     _ingress_step iptables -A "$INGRESS_IN_CHAIN" -p udp --dport "$INGRESS_PORT" -j DROP || return 1
