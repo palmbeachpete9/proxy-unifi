@@ -344,11 +344,16 @@ cat["meta"]["supported"] = 0
 json.dump(cat, open(sys.argv[3], "w"))
 PY
 rm -f "$T/root/etc/engine"
-printf '2\n3\n1\n\n0\n' | menu_input > "$T/sub-select.out" 2>&1
-grep -q 'nodes: *1 (1 supported)' "$T/sub-select.out"
+printf '2\n1\n1\n\n0\n' | menu_input > "$T/sub-select.out" 2>&1
+grep -q ' 1 node ' "$T/sub-select.out"
 if grep -q 'unsupported' "$T/sub-select.out"; then exit 1; fi
 [ "$(cat "$T/root/etc/engine")" = xraypool ]
 [ -s "$T/root/etc/subscription/selected" ]
+# The single-subscription layout of earlier versions became subscription 1.
+[ -s "$T/root/etc/subscription/1/url.txt" ] && [ ! -e "$T/root/etc/subscription/url.txt" ]
+[ -s "$T/root/etc/subscription/1/catalog.json" ] && [ -s "$T/root/etc/subscription/1/name" ]
+python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["sub"] == "1"' \
+    "$T/root/etc/subscription/selected.json"
 [ ! -e "$T/root/.transactions/active" ] || exit 1
 OLD_KEY="$(cat "$T/root/etc/wg/wg_private.key")"
 OLD_OVERLAY="$(hash_file "$T/root/etc/pool/99-overlay.json")"
@@ -504,6 +509,64 @@ grep -q 'bench duration must be 5-' "$T/bench.out"
 if run_cli bench 5 'ftp://example.com/x' > "$T/bench.out" 2>&1; then exit 1; fi
 grep -q 'bench URL must start with http:// or https://' "$T/bench.out"
 run_cli help | grep -q '^  proxy bench '
+
+# Several subscriptions: choose the subscription, then the node. A second one
+# is placed by hand (the sandbox has no network).
+mkdir -p "$T/root/etc/subscription/2"; chmod 700 "$T/root/etc/subscription/2"
+printf 'https://two.example/s' > "$T/root/etc/subscription/2/url.txt"
+printf 'Second' > "$T/root/etc/subscription/2/name"
+python3 - "$REPO/src" "$T/root/etc/subscription/2/catalog.json" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import mksub
+links = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.1.1.1:443?security=none&type=tcp#two-a\n" \
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.0.0.1:443?security=none&type=tcp#two-b"
+json.dump(mksub.process_body(links.encode()), open(sys.argv[2], "w"))
+PY
+printf '2\n1\n2\n2\n\n0\n' | menu_input > "$T/sub2.out" 2>&1
+grep -q 'Second' "$T/sub2.out"
+[ "$(cat "$T/root/etc/engine")" = xray ]
+grep -q '@1.0.0.1:' "$T/root/etc/link.txt"
+python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["sub"] == "2"' \
+    "$T/root/etc/subscription/selected.json"
+printf '2\n0\n' | menu_input > "$T/sub-menu.out" 2>&1
+grep -q 'Active node: \[Second\] two-b' "$T/sub-menu.out"
+# rename 2, then remove 1 (asks first); 2 keeps its number and its selection
+printf '2\n5\n2\nRenamed\n\n0\n' | menu_input >/dev/null 2>&1
+[ "$(cat "$T/root/etc/subscription/2/name")" = Renamed ]
+printf '2\n4\n1\nn\n\n0\n' | menu_input >/dev/null 2>&1
+[ -d "$T/root/etc/subscription/1" ]
+printf '2\n4\n1\ny\n\n0\n' | menu_input >/dev/null 2>&1
+[ ! -e "$T/root/etc/subscription/1" ] && [ -d "$T/root/etc/subscription/2" ]
+[ -s "$T/root/etc/subscription/selected.json" ]
+# a per-subscription User-Agent, then back to the default
+printf '2\n8\n2\nv2rayN/7\n\n0\n' | menu_input >/dev/null 2>&1
+[ "$(cat "$T/root/etc/subscription/2/ua")" = v2rayN/7 ]
+printf '2\n8\n2\n\n\n0\n' | menu_input >/dev/null 2>&1
+[ ! -e "$T/root/etc/subscription/2/ua" ]
+# Refreshing all with no network: the failure is recorded, the catalog kept,
+# and downloads never hold the lock (the stub fetch below takes 3 s).
+cp "$T/root/bin/mksub.py" "$T/mksub.real"
+cat > "$T/root/bin/mksub.py" <<PY
+import runpy, sys, time
+if sys.argv[1:2] == ["fetch"]:
+    open("$T/fetching", "w").close()
+    time.sleep(3)
+    sys.exit("mksub: error: no network in the sandbox")
+sys.argv[0] = "$T/mksub.real"
+runpy.run_path("$T/mksub.real", run_name="__main__")
+PY
+run_cli sub-refresh-auto >/dev/null 2>&1 &
+_rp=$!; _i=0
+while [ ! -e "$T/fetching" ] && [ "$_i" -lt 200 ]; do _i=$((_i + 1)); sleep 0.05; done
+[ -e "$T/fetching" ] && [ ! -d "$T/root/.lock" ]
+wait "$_rp" || true
+cp "$T/mksub.real" "$T/root/bin/mksub.py"
+grep -q '^fail [0-9]* no network in the sandbox$' "$T/root/etc/subscription/2/status"
+[ -s "$T/root/etc/subscription/2/catalog.json" ]
+grep -q '@1.0.0.1:' "$T/root/etc/link.txt"
+[ ! -e "$T/root/.lock" ] || exit 1
+[ ! -e "$T/root/.transactions/active" ] || exit 1
 
 [ ! -e "$STATE/stale-lock" ] || { echo "lock recorded a dead owner" >&2; exit 1; }
 echo lifecycle-ok

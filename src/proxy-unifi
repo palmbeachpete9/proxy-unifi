@@ -35,12 +35,13 @@ MKSB="$BIN_DIR/mksingbox.py"
 MKSUB="$BIN_DIR/mksub.py"
 MKAWG="$BIN_DIR/mkawg.py"
 SAFEEXEC="$BIN_DIR/safeexec.py"
-SUB_DIR="$ETC_DIR/subscription"
-SUB_URL_FILE="$SUB_DIR/url.txt"             # subscription URL (mode 600)
-SUB_CATALOG="$SUB_DIR/catalog.json"         # cached parsed nodes
+SUB_DIR="$ETC_DIR/subscription"             # one folder per subscription: 1/, 2/, ...
 SUB_HWID_FILE="$SUB_DIR/hwid"               # stable per-install device id
 SUB_SELECTED="$SUB_DIR/selected"            # id of the node currently activated
-SUB_SELECTED_META="$SUB_DIR/selected.json"  # stable selection metadata for refresh matching
+SUB_SELECTED_META="$SUB_DIR/selected.json"  # selection metadata (+ "sub") for refresh matching
+SUB_MAX=20
+MKFALLBACK="$BIN_DIR/mkfallback.py"
+FB_POOL="$ETC_DIR/fallback.json"            # the fallback pool (mkfallback.py)
 AWG_DIR="$ETC_DIR/awg"
 AWG_PROFILES_DIR="$AWG_DIR/profiles"
 AWG_SELECTED="$AWG_DIR/selected"            # UUID of the active AWG profile
@@ -478,7 +479,7 @@ restore_runtime_state() {
             systemctl stop "$SERVICE_NAME" 2>/dev/null || true
         fi
     fi
-    if [ -s "$SUB_URL_FILE" ]; then
+    if sub_any; then
         ( load_settings; write_refresh_timer ) 2>/dev/null || true
     fi
     if [ -f "$_state/timer-enabled" ]; then
@@ -1325,7 +1326,7 @@ write_refresh_timer() {
 Description=Refresh proxy-unifi subscription catalog
 After=network-online.target
 Wants=network-online.target
-ConditionPathExists=$SUB_URL_FILE
+ConditionPathExistsGlob=$SUB_DIR/*/url.txt
 
 [Service]
 Type=oneshot
@@ -1352,7 +1353,7 @@ EOF
 }
 
 enable_refresh_timer() {
-    [ -s "$SUB_URL_FILE" ] || return 0
+    sub_any || return 0
     write_refresh_timer || return 1
     systemctl enable --now "${SERVICE_NAME}-refresh.timer" >/dev/null 2>&1
 }
@@ -1992,7 +1993,8 @@ install_service() {
     else
         systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || fatal "could not enable service autostart"
     fi
-    if [ -s "$SUB_URL_FILE" ]; then
+    sub_migrate
+    if sub_any; then
         enable_refresh_timer || fatal "could not enable subscription refresh timer"
     else
         write_refresh_timer || true
@@ -3236,6 +3238,7 @@ cmd_menu() {
     # Repair an interrupted transaction before displaying any persisted state,
     # but release the lock before waiting for the user's first selection.
     ( locked_call true ) || fatal "could not recover interrupted state"
+    ( locked_call sub_migrate ) || fatal "could not move the subscription to its new layout"
     set +e
     while true; do
         clear 2>/dev/null || true
@@ -3599,42 +3602,174 @@ menu_awg() {
     esac
 }
 
-# Interactive subscription submenu (wraps the cmd_sub actions).
+# Interactive subscriptions submenu.
 menu_sub() {
-    if [ -s "$SUB_URL_FILE" ]; then sub_status; echo; fi
-    echo "Subscription:"
-    echo "  1. Add or replace subscription URL"
-    echo "  2. List nodes"
-    echo "  3. Select node"
-    echo "  4. Refresh"
-    echo "  5. Set automatic refresh interval"
-    echo "  6. Set provider compatibility User-Agent"
-    echo "  7. Remove"
-    echo "  0. Back"
+    load_settings
+    echo "Subscriptions:"
+    if sub_any; then sub_summary; else echo "  (none yet: add one with 3)"; fi
+    _an="$(sub_active_line)"
+    [ -z "$_an" ] || echo "Active node: $_an"
+    echo
+    echo " 1. Choose active node"
+    echo " 2. Show a subscription's nodes"
+    echo " 3. Add a subscription"
+    echo " 4. Remove a subscription"
+    echo " 5. Rename a subscription"
+    echo " 6. Refresh all now"
+    echo " 7. Refresh interval (every ${SUB_REFRESH_HOURS}h)"
+    echo " 8. User-Agent"
+    echo " 0. Back"
     printf 'Choice: '
     read -r _s || true
     echo
     case "${_s:-0}" in
-        1) printf 'Subscription URL (https): '; read -r _u || true
-           if [ -n "${_u:-}" ]; then locked_call sub_add "$_u"; else c_ylw "Cancelled."; fi ;;
-        2) sub_list ;;
-        3) sub_list; echo; printf 'Node number to select: '; read -r _n || true
-           if [ -n "${_n:-}" ]; then locked_call sub_select "$_n"; else c_ylw "Cancelled."; fi ;;
-        4) locked_call sub_refresh ;;
-        5) printf 'Refresh interval in hours [%s]: ' "$SUB_REFRESH_HOURS"; read -r _h || true
+        1) _id="$(sub_choose)" || return 0
+           sub_list "$_id"; echo; printf 'Node number to select: '; read -r _n || true
+           if [ -n "${_n:-}" ]; then locked_call sub_select "$_id" "$_n"; else c_ylw "Cancelled."; fi ;;
+        2) _id="$(sub_choose)" || return 0
+           sub_list "$_id" ;;
+        3) printf 'Subscription URL (https): '; read -r _u || true
+           [ -n "${_u:-}" ] || { c_ylw "Cancelled."; return 0; }
+           printf 'Name (Enter = from the provider): '; read -r _nm || true
+           locked_call sub_add "$_u" "${_nm:-}" ;;
+        4) _id="$(sub_choose)" || return 0
+           printf 'Remove subscription %s? [y/N]: ' "$_id"; read -r _c || true
+           if [ "${_c:-}" = "y" ]; then locked_call sub_remove "$_id"; else c_ylw "Cancelled."; fi ;;
+        5) _id="$(sub_choose)" || return 0
+           printf 'New name: '; read -r _nm || true
+           if [ -n "${_nm:-}" ]; then locked_call sub_rename "$_id" "$_nm"; else c_ylw "Unchanged."; fi ;;
+        6) sub_refresh_all ;;
+        7) printf 'Refresh interval in hours [%s]: ' "$SUB_REFRESH_HOURS"; read -r _h || true
            if [ -n "${_h:-}" ]; then locked_call sub_set_interval "$_h"; else c_ylw "Unchanged."; fi ;;
-        6) printf 'User-Agent [%s]: ' "$SUB_USER_AGENT"; read -r _ua || true
-           if [ -n "${_ua:-}" ]; then locked_call sub_set_user_agent "$_ua"; else c_ylw "Unchanged."; fi ;;
-        7) printf 'Remove the subscription? [y/N]: '; read -r _c || true
-           if [ "${_c:-}" = "y" ]; then locked_call sub_remove; else c_ylw "Cancelled."; fi ;;
+        8) printf 'Subscription number, or d for the default (now %s): ' "$SUB_USER_AGENT"; read -r _w || true
+           case "${_w:-}" in
+               "") c_ylw "Cancelled." ;;
+               d|D) printf 'Default User-Agent [%s]: ' "$SUB_USER_AGENT"; read -r _ua || true
+                    if [ -n "${_ua:-}" ]; then locked_call sub_set_user_agent "$_ua"; else c_ylw "Unchanged."; fi ;;
+               *) sub_valid_id "$_w" || { c_red "no subscription $_w"; return 0; }
+                  printf 'User-Agent for subscription %s [%s] (Enter = the default): ' "$_w" "$(sub_ua "$_w")"
+                  read -r _ua || true
+                  locked_call sub_set_ua "$_w" "${_ua:-}" ;;
+           esac ;;
         0|"") : ;;
         *) c_red "invalid choice" ;;
     esac
 }
 
 # --------------------------------------------------------------------------
-# Subscriptions (link lists and validated Xray JSON pools; scheduled refresh)
+# Subscriptions (link lists and validated Xray JSON pools; scheduled refresh).
+# Each lives in $SUB_DIR/<id>/ (url.txt, catalog.json, name, optional ua,
+# status); ids are stable, so removing one never renumbers the others.
 # --------------------------------------------------------------------------
+sub_valid_id() { _uint "${1:-}" && [ "$1" -ge 1 ] && [ "$1" -le 999 ] && [ -s "$SUB_DIR/$1/url.txt" ]; }
+sub_ids() {
+    for _sd in "$SUB_DIR"/*/; do
+        _sd="${_sd%/}"; _sd="${_sd##*/}"
+        if sub_valid_id "$_sd"; then echo "$_sd"; fi
+    done | sort -n
+}
+sub_any() { [ -n "$(sub_ids)" ]; }
+sub_ua() { if [ -s "$SUB_DIR/$1/ua" ]; then cat "$SUB_DIR/$1/ua"; else printf '%s' "$SUB_USER_AGENT"; fi; }
+sub_summary() { py "$MKSUB" subs --dir "$SUB_DIR" 2>/dev/null | cut -f2-; }
+sub_status_write() { printf '%s' "$2" | atomic_write "$SUB_DIR/$1/status" 600; }
+
+# The subscription the active node came from ("" for none).
+sub_selected_sub() {
+    [ -s "$SUB_SELECTED_META" ] || return 0
+    py -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("sub", ""))' \
+        "$SUB_SELECTED_META" 2>/dev/null || true
+}
+
+# "[name] label (scheme)" of the active subscription node.
+sub_active_line() {
+    [ -s "$SUB_SELECTED_META" ] || return 0
+    PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py - "$BIN_DIR" "$SUB_SELECTED_META" "$SUB_DIR" <<'PYEOF' 2>/dev/null || true
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+import mksub
+meta = json.load(open(sys.argv[2], encoding="utf-8"))
+sub = str(meta.get("sub", ""))
+try:
+    with open(os.path.join(sys.argv[3], sub, "name"), encoding="utf-8") as fh:
+        name = fh.read(512).strip() if sub.isdigit() else ""
+except OSError:
+    name = ""
+print("[%s] %s (%s)" % (mksub.clean(name, 24) or "?", mksub.clean(meta.get("label", ""), 36) or "(no label)",
+                        mksub.clean(meta.get("scheme", ""), 12)))
+PYEOF
+}
+
+# Record which subscription a selection metadata file came from.
+sub_meta_add_sub() {   # <meta file> <subscription id>
+    py - "$1" "$2" <<'PYEOF'
+import json, os, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    meta = json.load(fh)
+meta["sub"] = sys.argv[2]
+with open(path + ".tmp", "w", encoding="utf-8") as fh:
+    fh.write(json.dumps(meta, ensure_ascii=True, sort_keys=True) + "\n")
+os.chmod(path + ".tmp", 0o600)
+os.replace(path + ".tmp", path)
+PYEOF
+}
+
+# The provider's title, else the URL's host.
+sub_name_default() {
+    py - "$SUB_DIR/$1" <<'PYEOF' 2>/dev/null || echo subscription
+import json, os, sys
+from urllib.parse import urlsplit
+folder = sys.argv[1]
+try:
+    with open(os.path.join(folder, "catalog.json"), encoding="utf-8") as fh:
+        title = json.load(fh).get("meta", {}).get("title", "")
+except (OSError, ValueError, AttributeError):
+    title = ""
+if not title:
+    try:
+        with open(os.path.join(folder, "url.txt"), encoding="utf-8") as fh:
+            title = urlsplit(fh.read().strip()).hostname or ""
+    except (OSError, ValueError):
+        title = ""
+print(title or "subscription")
+PYEOF
+}
+
+_sub_check_name() {
+    [ "${#1}" -le 64 ] || fatal "a name is at most 64 characters"
+    if LC_ALL=C printf '%s' "$1" | grep -q '[[:cntrl:]]'; then fatal "a name cannot contain control characters"; fi
+}
+
+# The single-subscription layout of earlier versions becomes subscription 1.
+sub_migrate() {
+    [ -s "$SUB_DIR/url.txt" ] || return 0
+    txn_begin
+    { mkdir -p "$SUB_DIR/1" && chmod 700 "$SUB_DIR" "$SUB_DIR/1"; } || fatal "could not migrate the subscription"
+    mv "$SUB_DIR/url.txt" "$SUB_DIR/1/url.txt" || fatal "could not migrate the subscription"
+    if [ -f "$SUB_DIR/catalog.json" ]; then
+        mv "$SUB_DIR/catalog.json" "$SUB_DIR/1/catalog.json" || fatal "could not migrate the subscription"
+    fi
+    sub_name_default 1 | atomic_write "$SUB_DIR/1/name" 600 || fatal "could not migrate the subscription"
+    if [ -s "$SUB_SELECTED_META" ]; then
+        sub_meta_add_sub "$SUB_SELECTED_META" 1 || fatal "could not migrate the subscription selection"
+    fi
+    txn_commit
+}
+
+# Choose a subscription (skipped when there is only one); prints its id.
+# Prompts go to stderr: callers capture the id.
+sub_choose() {
+    _ids="$(sub_ids)"
+    [ -n "$_ids" ] || { c_ylw "No subscriptions yet: add one first." >&2; return 1; }
+    if [ "$(printf '%s\n' "$_ids" | wc -l | tr -d ' ')" = 1 ]; then echo "$_ids"; return 0; fi
+    sub_summary >&2
+    printf 'Subscription number: ' >&2
+    read -r _sc || true
+    [ -n "${_sc:-}" ] || { c_ylw "Cancelled." >&2; return 1; }
+    sub_valid_id "$_sc" || { c_red "no subscription $_sc" >&2; return 1; }
+    echo "$_sc"
+}
+
 sub_hwid() {
     # stable random UUID per install; NOT derived from any hardware identifier
     if [ ! -s "$SUB_HWID_FILE" ]; then
@@ -3647,12 +3782,13 @@ sub_hwid() {
     cat "$SUB_HWID_FILE"
 }
 
-# Fetch a given URL into a candidate catalog file (does NOT touch stored state).
+# Fetch a URL into a candidate catalog file (does NOT touch stored state).
 # Secrets (URL, HWID) are passed via mode-600 files, never on the command line.
-# Temp files live in the per-command private run directory.
-# Args: <url> <dest-catalog-file>. Returns 0 and writes dest on success.
+# Temp files live in the per-command private run directory. On failure the
+# provider's or parser's message is left in SUB_FETCH_ERROR.
+# Args: <url> <dest-catalog-file> <user-agent>. Returns 0 and writes dest on success.
 sub_fetch_to() {
-    _f_url="$1"; _f_dest="$2"
+    _f_url="$1"; _f_dest="$2"; SUB_FETCH_ERROR=""
     mkdir -p "$SUB_DIR" || { err "could not create $SUB_DIR"; return 1; }
     chmod 700 "$SUB_DIR" 2>/dev/null || true
     ensure_run_dir
@@ -3661,19 +3797,21 @@ sub_fetch_to() {
     printf '%s' "$_f_url" | atomic_write "$_f_urlf" 600 \
         || { err "could not stage URL"; return 1; }
     sub_hwid >/dev/null || { err "could not prepare HWID"; return 1; }
-    if py "$MKSUB" fetch --url-file "$_f_urlf" --hwid-file "$SUB_HWID_FILE" --ua "$SUB_USER_AGENT" \
+    if py "$MKSUB" fetch --url-file "$_f_urlf" --hwid-file "$SUB_HWID_FILE" --ua "$3" \
             > "$_f_cat" 2>"$_f_err" && [ -s "$_f_cat" ]; then
         chmod 600 "$_f_cat"
         if mv -f "$_f_cat" "$_f_dest"; then
             rm -rf "$_fetch_dir"
             return 0
         fi
-        err "could not write catalog"
+        SUB_FETCH_ERROR="could not write catalog"
     else
         _f_message=""
         IFS= read -r _f_message < "$_f_err" || true
-        err "${_f_message#mksub: error: }"
+        SUB_FETCH_ERROR="${_f_message#mksub: error: }"
+        SUB_FETCH_ERROR="${SUB_FETCH_ERROR:-fetch failed}"
     fi
+    err "$SUB_FETCH_ERROR"
     rm -rf "$_fetch_dir"
     return 1
 }
@@ -3681,48 +3819,53 @@ sub_fetch_to() {
 sub_add() {
     [ -n "${1:-}" ] || fatal "a subscription URL is required"
     case "$1" in https://*) : ;; *) fatal "subscription URL must start with https://" ;; esac
-    mkdir -p "$SUB_DIR"; chmod 700 "$SUB_DIR"
-    txn_begin
+    [ -z "${2:-}" ] || _sub_check_name "$2"
+    [ "$(sub_ids | wc -l | tr -d ' ')" -lt "$SUB_MAX" ] || fatal "at most $SUB_MAX subscriptions"
+    _new=1
+    for _x in $(sub_ids); do _new=$((_x + 1)); done
+    [ "$_new" -le 999 ] || fatal "no free subscription number"
     c_grn "Fetching subscription..."
-    # Fetch to a candidate catalog FIRST; only commit the URL + catalog (and clear
-    # any previous selection) once we have a valid non-empty result. A failed add
-    # therefore never replaces a working subscription with a broken one.
+    # Fetch to a candidate catalog FIRST: a failed add stores nothing.
     ensure_run_dir; _cand="$RUN_DIR/new-catalog.json"
-    if ! sub_fetch_to "$1" "$_cand"; then
-        rm -f "$_cand"
-        fatal "subscription not added (fetch/parse failed)"
-    fi
-    # commit URL + catalog only after a valid candidate exists; check every write
-    printf '%s' "$1" | atomic_write "$SUB_URL_FILE" 600 || fatal "could not store subscription URL"
-    atomic_write "$SUB_CATALOG" 600 < "$_cand" || fatal "could not store catalog"
-    rm -f "$SUB_SELECTED" "$SUB_SELECTED_META"
+    sub_fetch_to "$1" "$_cand" "$SUB_USER_AGENT" || fatal "subscription not added (fetch/parse failed)"
+    txn_begin
+    { mkdir -p "$SUB_DIR/$_new" && chmod 700 "$SUB_DIR" "$SUB_DIR/$_new"; } || fatal "could not store the subscription"
+    printf '%s' "$1" | atomic_write "$SUB_DIR/$_new/url.txt" 600 || fatal "could not store subscription URL"
+    atomic_write "$SUB_DIR/$_new/catalog.json" 600 < "$_cand" || fatal "could not store catalog"
+    sub_status_write "$_new" "ok $(date +%s)" || fatal "could not store the subscription"
+    if [ -n "${2:-}" ]; then printf '%s' "$2"; else sub_name_default "$_new"; fi \
+        | atomic_write "$SUB_DIR/$_new/name" 600 || fatal "could not store the subscription name"
     enable_refresh_timer || fatal "subscription stored, but automatic refresh timer could not be enabled"
     txn_commit
-    c_grn "Subscription added."
-    sub_list
+    c_grn "Subscription $_new added."
+    sub_list "$_new"
 }
 
-sub_list() {
-    [ -f "$SUB_CATALOG" ] || fatal "no subscription catalog yet (menu -> Manage a multi-server subscription -> Refresh)"
-    _sel="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
-    PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKSUB" render --file "$SUB_CATALOG" --selected "$_sel"
+sub_list() {   # <subscription id>
+    _lc="$SUB_DIR/$1/catalog.json"
+    [ -f "$_lc" ] || fatal "subscription $1 has no nodes yet (refresh it)"
+    _sel=""
+    [ "$(sub_selected_sub)" != "$1" ] || _sel="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
+    PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKSUB" render --file "$_lc" --selected "$_sel" \
+        --pool "$FB_POOL" --sub "$1"
 }
 
-sub_select() {
-    [ -n "${1:-}" ] || fatal "a node number is required"
-    case "$1" in ""|*[!0-9]*) fatal "select takes a node NUMBER from the subscription list";; esac
-    [ -f "$SUB_CATALOG" ] || fatal "no catalog yet (refresh the subscription first)"
+sub_select() {   # <subscription id> <node number>
+    sub_valid_id "${1:-}" || fatal "no subscription ${1:-}"
+    case "${2:-}" in ""|*[!0-9]*) fatal "select takes a node NUMBER from the subscription list";; esac
+    _scat="$SUB_DIR/$1/catalog.json"
+    [ -f "$_scat" ] || fatal "no catalog yet (refresh the subscription first)"
     txn_begin
     ensure_run_dir
     _meta="$RUN_DIR/selection.json"
     _payload="$RUN_DIR/selection.payload"
-    _row="$(py "$MKSUB" extract --file "$SUB_CATALOG" --index "$1" \
+    _row="$(py "$MKSUB" extract --file "$_scat" --index "$2" \
         --meta-file "$_meta" --payload-file "$_payload" 2>/dev/null)" \
-        || fatal "no node #$1 in the subscription"
+        || fatal "no node #$2 in subscription $1"
     _id="${_row%%"$TAB"*}"; _row="${_row#*"$TAB"}"
     _ok="${_row%%"$TAB"*}"; _row="${_row#*"$TAB"}"
     _reason="${_row%%"$TAB"*}"; _kind="${_row#*"$TAB"}"
-    [ "$_ok" = "1" ] || fatal "node #$1 is unsupported${_reason:+ ($_reason)}"
+    [ "$_ok" = "1" ] || fatal "node #$2 is unsupported${_reason:+ ($_reason)}"
     [ -z "$_reason" ] || c_ylw "Provider profile warning: $_reason"
     if [ "$_kind" = "pool" ]; then
         # JSON balancer/pool profile: extract its raw JSON and import via the
@@ -3735,42 +3878,46 @@ sub_select() {
             || fatal "selected node payload is empty"
         _FROM_SUB=1 _QUIET=1 cmd_import "$_link"
     fi
+    # A node chosen by hand takes over from the fallback watchdog.
+    [ "${_KEEP_FALLBACK:-0}" = 1 ] || fallback_detach
     # record the selection only after a successful import; check the write
-    mkdir -p "$SUB_DIR" || fatal "could not record selection"
+    sub_meta_add_sub "$_meta" "$1" || fatal "could not record selection metadata"
     printf '%s' "$_id" | atomic_write "$SUB_SELECTED" 600 || fatal "could not record selection marker"
     atomic_write "$SUB_SELECTED_META" 600 < "$_meta" || fatal "could not record selection metadata"
     txn_commit
-    [ "${_QUIET:-0}" = 1 ] || c_grn "Selected subscription node #$1 (id $_id)."
+    [ "${_QUIET:-0}" = 1 ] || c_grn "Selected node #$2 of subscription $1."
 }
 
-sub_refresh() {
-    [ -s "$SUB_URL_FILE" ] || fatal "no subscription configured"
-    ensure_run_dir; _candidate="$RUN_DIR/refreshed-catalog.json"
-    sub_fetch_to "$(cat "$SUB_URL_FILE")" "$_candidate" \
-        || { err "refresh failed; keeping the current catalog and tunnel"; return 1; }
+# Install a freshly fetched catalog (under the lock), then follow the active
+# node and the fallback pool entries of this subscription to it.
+sub_install() {   # <subscription id> <candidate catalog>
+    sub_valid_id "$1" || fatal "no subscription $1"
     txn_begin
-    atomic_write "$SUB_CATALOG" 600 < "$_candidate" || fatal "could not install refreshed catalog"
-    [ "${_AUTO_REFRESH:-0}" = 1 ] || c_grn "Catalog refreshed."
+    atomic_write "$SUB_DIR/$1/catalog.json" 600 < "$2" || fatal "could not install refreshed catalog"
+    sub_status_write "$1" "ok $(date +%s)" || fatal "could not record the refresh"
+    if [ -s "$FB_POOL" ]; then
+        py "$MKFALLBACK" rematch --pool "$FB_POOL" --sub "$1" --catalog "$SUB_DIR/$1/catalog.json" \
+            || fatal "could not update the fallback pool"
+    fi
     _sel="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
-    if [ -z "$_sel" ] || [ ! -s "$SUB_SELECTED_META" ]; then
+    if [ -z "$_sel" ] || [ "$(sub_selected_sub)" != "$1" ]; then
         txn_commit
-        [ "${_AUTO_REFRESH:-0}" = 1 ] || sub_list
         return 0
     fi
+    ensure_run_dir
     _new_meta="$RUN_DIR/refreshed-selection.json"
     _match_err="$RUN_DIR/refreshed-selection.err"
-    if _match="$(py "$MKSUB" match --file "$SUB_CATALOG" --selection-file "$SUB_SELECTED_META" \
+    if _match="$(py "$MKSUB" match --file "$SUB_DIR/$1/catalog.json" --selection-file "$SUB_SELECTED_META" \
         --active-link-file "$OUTBOUND_LINK" --meta-file "$_new_meta" 2>"$_match_err")"; then
         _new_index="${_match%%"$TAB"*}"; _match_rest="${_match#*"$TAB"}"
         _new_id="${_match_rest%%"$TAB"*}"
         if [ "$_new_id" = "$_sel" ]; then
-            atomic_write "$SUB_SELECTED_META" 600 < "$_new_meta" \
+            { sub_meta_add_sub "$_new_meta" "$1" && atomic_write "$SUB_SELECTED_META" 600 < "$_new_meta"; } \
                 || fatal "could not store refreshed selection metadata"
             txn_commit
-            [ "${_AUTO_REFRESH:-0}" = 1 ] || info "selected node is unchanged."
         else
-            _QUIET=1 sub_select "$_new_index"
-            info "selected node changed; validated and applied refreshed provider configuration."
+            _KEEP_FALLBACK=1 _QUIET=1 sub_select "$1" "$_new_index"
+            info "subscription $1: the active node changed; validated and applied its new configuration."
         fi
     else
         _match_rc=$?
@@ -3780,8 +3927,38 @@ sub_refresh() {
             fatal "could not match selected subscription node${_match_msg:+ (${_match_msg#mksub: error: })}"
         fi
         txn_commit
-        c_ylw "Selected node was removed or refresh matching was ambiguous; active tunnel kept unchanged."
+        c_ylw "Subscription $1: the active node was removed or matching was ambiguous; tunnel kept unchanged."
     fi
+}
+
+sub_mark_failed() {   # <subscription id> <reason>
+    sub_valid_id "$1" || return 0
+    sub_status_write "$1" "fail $(date +%s) $(printf '%s' "$2" | tr -d '\n' | cut -c1-120)"
+}
+
+# Refresh every subscription. Downloads run without the CLI lock (a slow
+# provider must not hold up the menu or the fallback watchdog); only installing
+# each result takes it. One failing subscription keeps its nodes and does not
+# stop the others.
+sub_refresh_all() {
+    _rf_ids="$(sub_ids)"
+    [ -n "$_rf_ids" ] || { [ "${_AUTO_REFRESH:-0}" = 1 ] || c_ylw "No subscriptions to refresh."; return 0; }
+    _rf_rc=0
+    for _rf in $_rf_ids; do
+        ensure_run_dir; _rf_cand="$RUN_DIR/refresh-$_rf.json"
+        if sub_fetch_to "$(cat "$SUB_DIR/$_rf/url.txt")" "$_rf_cand" "$(sub_ua "$_rf")"; then
+            if ( locked_call sub_install "$_rf" "$_rf_cand" ); then
+                [ "${_AUTO_REFRESH:-0}" = 1 ] || c_grn "Subscription $_rf refreshed."
+            else
+                _rf_rc=1
+            fi
+        else
+            ( locked_call sub_mark_failed "$_rf" "$SUB_FETCH_ERROR" ) || true
+            _rf_rc=1
+            [ "${_AUTO_REFRESH:-0}" = 1 ] || c_ylw "Subscription $_rf: refresh failed; its nodes are kept."
+        fi
+    done
+    return "$_rf_rc"
 }
 
 sub_set_interval() {
@@ -3795,7 +3972,7 @@ sub_set_interval() {
     c_grn "Automatic refresh interval set to ${SUB_REFRESH_HOURS}h."
 }
 
-sub_set_user_agent() {
+_sub_check_ua() {
     py - "$1" <<'PYEOF' || fatal "User-Agent must contain printable ASCII only and cannot include quotes or backslashes"
 import sys
 value = sys.argv[1]
@@ -3804,48 +3981,59 @@ if not value or len(value) > 120:
 if any(ord(ch) < 0x20 or ord(ch) > 0x7e or ch in '"\\' for ch in value):
     raise SystemExit(1)
 PYEOF
+}
+
+sub_set_user_agent() {
+    _sub_check_ua "$1"
     txn_begin
     SUB_USER_AGENT="$1"; save_settings
     txn_commit
-    c_grn "Subscription User-Agent updated. Refresh to test provider compatibility."
+    c_grn "Default subscription User-Agent updated. Refresh to test provider compatibility."
 }
 
-sub_remove() {
+sub_set_ua() {   # <subscription id> [user-agent]: empty uses the default again
+    sub_valid_id "$1" || fatal "no subscription $1"
+    [ -z "${2:-}" ] || _sub_check_ua "$2"
     txn_begin
-    disable_refresh_timer
-    rm -f "$SUB_URL_FILE" "$SUB_CATALOG" "$SUB_SELECTED" "$SUB_SELECTED_META"
+    if [ -n "${2:-}" ]; then
+        printf '%s' "$2" | atomic_write "$SUB_DIR/$1/ua" 600 || fatal "could not store the User-Agent"
+    else
+        rm -f "$SUB_DIR/$1/ua" || fatal "could not clear the User-Agent"
+    fi
     txn_commit
-    c_ylw "Subscription removed (HWID kept). The active tunnel is unchanged."
-    info "To also stop proxying, use the menu (Stop) or import a different link."
+    c_grn "Subscription $1 now uses the User-Agent '$(sub_ua "$1")'. Refresh to test it."
 }
 
-sub_status() {
-    if [ ! -s "$SUB_URL_FILE" ]; then echo "subscription: (none)"; return; fi
-    echo "subscription: configured"
-    if [ -f "$SUB_CATALOG" ]; then
-        py - "$BIN_DIR" "$SUB_CATALOG" <<'PYEOF' 2>/dev/null || true
-import sys
-sys.path.insert(0, sys.argv[1])
-import mksub
-try:
-    c = mksub._load(sys.argv[2])  # current verdicts, not those saved with the catalog
-except SystemExit:
-    print("nodes:        (saved by an older version; refresh from the subscription menu)")
-    sys.exit(0)
-m = c.get("meta", {})
-print("nodes:        %d (%d supported)" % (len(c["nodes"]), sum(n["recognized"] for n in c["nodes"])))
-if "interval_hours" in m: print("provider hint: refresh every %sh" % m["interval_hours"])
-if "userinfo" in m: print("userinfo:     %s" % m["userinfo"])
-PYEOF
-    else
-        echo "nodes:        (not fetched yet; refresh from the subscription menu)"
-    fi
-    _sel="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
-    echo "selected:     ${_sel:-(none)}"
-    echo "hwid:         $([ -s "$SUB_HWID_FILE" ] && echo set || echo unset)"
-    echo "auto refresh: every ${SUB_REFRESH_HOURS}h"
-    echo "user-agent:   $SUB_USER_AGENT"
+sub_rename() {   # <subscription id> <name>
+    sub_valid_id "$1" || fatal "no subscription $1"
+    _sub_check_name "$2"
+    txn_begin
+    printf '%s' "$2" | atomic_write "$SUB_DIR/$1/name" 600 || fatal "could not store the name"
+    txn_commit
+    c_grn "Subscription $1 renamed."
 }
+
+sub_remove() {   # <subscription id>
+    sub_valid_id "$1" || fatal "no subscription $1"
+    txn_begin
+    rm -rf "${SUB_DIR:?}/$1" || fatal "could not remove subscription $1"
+    if [ "$(sub_selected_sub)" = "$1" ]; then rm -f "$SUB_SELECTED" "$SUB_SELECTED_META"; fi
+    if [ -s "$FB_POOL" ]; then
+        _left="$(py "$MKFALLBACK" drop-sub --pool "$FB_POOL" --sub "$1")" \
+            || fatal "could not update the fallback pool"
+        if [ "${FALLBACK:-off}" = on ] && [ "${_left:-0}" -lt 2 ]; then
+            fallback_set off
+            c_ylw "Fallback turned off: fewer than 2 pool nodes remain."
+        fi
+    fi
+    sub_any || disable_refresh_timer
+    txn_commit
+    c_ylw "Subscription $1 removed (HWID kept). The active tunnel is unchanged."
+}
+
+# Until the fallback watchdog exists these keep the subscription code complete.
+fallback_detach() { :; }
+fallback_set() { :; }
 
 
 cmd_uninstall() {
@@ -3902,6 +4090,8 @@ cmd="${1:-}"
 if [ $# -ge 1 ]; then shift; fi
 case "$cmd" in
     ""|status|logs|ping|bench|-h|--help|help|_fw-lock|_fw-unlock|_ingress-up|_ingress-down) : ;;
+    # Takes the lock only to install each downloaded catalog.
+    sub-refresh-auto) need_root ;;
     *) need_root; acquire_lock; recover_transaction ;;
 esac
 load_settings
@@ -3929,7 +4119,10 @@ case "$cmd" in
     install-service) install_service ;;
     boot-recover)    boot_recover ;;
     _fw-reconcile)   fw_reconcile ;;
-    sub-refresh-auto) _AUTO_REFRESH=1 sub_refresh ;;
+    sub-refresh-auto)
+        _AUTO_REFRESH=1
+        ( locked_call sub_migrate ) || exit 1
+        sub_refresh_all ;;
     _fw-lock)        fw_lock ;;
     _fw-unlock)      fw_unlock ;;
     _ingress-up|_ingress-down)

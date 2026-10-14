@@ -1235,7 +1235,8 @@ def cmd_subs(args):
     for sid in ids:
         name = clean(read(sid, "name"), LABEL_MAX) or "(unnamed)"
         try:
-            count = "%d nodes" % len(_load(os.path.join(args.dir, str(sid), "catalog.json"))["nodes"])
+            nodes = len(_load(os.path.join(args.dir, str(sid), "catalog.json"))["nodes"])
+            count = "%d node%s" % (nodes, "" if nodes == 1 else "s")
         except SystemExit:
             count = "not fetched"
         status = read(sid, "status").split(" ", 2)
