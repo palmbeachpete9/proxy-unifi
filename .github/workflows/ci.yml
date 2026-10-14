@@ -1,8 +1,18 @@
 name: ci
 
+# Every push runs the quick checks: static, parsers, and the real cores. The
+# slow ones (the sandboxed CLI lifecycle, and the kernel ingress lab where the
+# branch has one) are deferred to pull requests, a nightly run of both branches,
+# and "Run workflow" on demand. Documentation-only changes run nothing.
 on:
   push:
+    branches: [main, experimental]
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
   pull_request:
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,27 +23,35 @@ concurrency:
 
 jobs:
   test:
-    name: Python ${{ matrix.python-version }} (${{ matrix.mode }})
+    name: >-
+      Python ${{ matrix.python-version }}
+      (${{ matrix.python-version == '3.9' && 'gateway compatibility' || 'current runtime and cores' }})${{
+      matrix.ref && format(' on {0}', matrix.ref) || '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - python-version: "3.9"
-            mode: gateway compatibility
-            args: ""
-          - python-version: "3.14"
-            mode: current runtime and cores
-            args: "--download"
+        python-version: ["3.9", "3.14"]
+        # The schedule runs on the default branch: test both branches from there.
+        ref: ${{ fromJSON(github.event_name == 'schedule' && '["main", "experimental"]' || '[""]') }}
+    env:
+      FULL: ${{ github.event_name != 'push' && matrix.python-version == '3.14' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ matrix.ref }}
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install static tools
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - name: Run static, parser, core, and network tests
-        run: tests/run.sh ${{ matrix.args }}
+      # shellcheck ships with the runner; the ingress lab also needs wg.
+      - name: Install WireGuard tools
+        if: env.FULL == 'true'
+        run: sudo apt-get update && sudo apt-get install -y wireguard-tools
+      - name: Run the tests
+        env:
+          PROXY_UNIFI_QUICK: ${{ env.FULL != 'true' && '1' || '' }}
+          # The kernel WireGuard ingress lab needs root; the full run allows sudo.
+          PROXY_UNIFI_LAB: ${{ env.FULL == 'true' && '1' || '' }}
+        run: tests/run.sh ${{ matrix.python-version == '3.14' && '--download' || '' }}
