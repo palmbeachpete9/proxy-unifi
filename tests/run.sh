@@ -2129,7 +2129,7 @@ print(json.dumps(c))' "http://127.0.0.1:$_wp/slow" > "$_d/race-core.json"
     {
         cat <<SH
 XRAY='$XR'; MKXRAY='$SRC/mkxray.py'; SAFEEXEC='$SRC/safeexec.py'
-OUTBOUND_LINK='$_pd/link'; RUN_DIR='$_pd'; PING_TIMEOUT=5
+OUTBOUND_LINK='$_pd/link'; RUN_DIR='$_pd'; PING_TIMEOUT=5; INGRESS_ACTIVE='$_pd/none'
 SH
         cat <<'SH'
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -2145,6 +2145,7 @@ SH
         sed -n '/^py_bin() {/,/^}/p; /^_free_port() {/,/^}/p; /^_ping_cleanup() {/,/^}/p' "$SRC/proxy-unifi"
         sed -n '/^_socket_listening() {/,/^tcp_socket_listening()/p; /^_probe_start() {/,/^}/p' "$SRC/proxy-unifi"
         sed -n '/^_ms_from_seconds() {/,/^}/p; /^ping_proxy() {/,/^}/p' "$SRC/proxy-unifi"
+        sed -n '/^service_healthy() {/,/^}/p; /^socket_owned_by_pid() {/,/^}/p; /^ingress_active() {/p' "$SRC/proxy-unifi"
     } > "$_pd/lib.sh"
     {
         cat "$_pd/lib.sh"
@@ -2170,17 +2171,33 @@ SH
     # shellcheck disable=SC2016 # $1 expands inside the child shell.
     _dead="$(sh -c '. "$1"; ping_proxy head' sh "$_pd/lib.sh" 2>&1)"
     _lo=lo; [ "$(uname)" != Darwin ] || _lo=lo0
-    # shellcheck disable=SC2016 # $1-$2 expand inside the child shell.
-    _live="$(sh -c '. "$1"; _if="$2"; unifi_client_if() { echo "$_if"; }; service_healthy() { :; }; ping_proxy get' \
-        sh "$_pd/lib.sh" "$_lo" 2>&1)"
+    # A stand-in for the running core holds the WireGuard port; the ping must
+    # find it healthy and leave it running.
+    python3 -c 'import socket, sys, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", 0))
+open(sys.argv[1] + ".tmp", "w").write(str(s.getsockname()[1]))
+__import__("os").rename(sys.argv[1] + ".tmp", sys.argv[1])
+time.sleep(120)' "$_pd/core.port" &
+    _core=$!; _i=0
+    while [ ! -s "$_pd/core.port" ] && [ "$_i" -lt 100 ]; do
+        _i=$((_i + 1)); sleep 0.05 2>/dev/null || sleep 1
+    done
+    # shellcheck disable=SC2016 # $1-$4 expand inside the child shell.
+    _live="$(sh -c '. "$1"; _if="$2"; WG_PORT="$3"; _core="$4"
+unifi_client_if() { echo "$_if"; }
+systemctl() { printf "ActiveState=active\nMainPID=%s\n" "$_core"; }
+ping_proxy get' sh "$_pd/lib.sh" "$_lo" "$(cat "$_pd/core.port" 2>/dev/null)" "$_core" 2>&1)"
+    _alive=0; kill -0 "$_core" 2>/dev/null && _alive=1
     unset PING_URL
-    kill "$_web" 2>/dev/null; wait "$_web" 2>/dev/null
+    kill "$_web" "$_core" 2>/dev/null; wait "$_web" "$_core" 2>/dev/null
     if ! have ss; then printf '  skip proxy ping (ss not installed)\n'
     elif printf '%s\n' "$_dead" | grep -q '^via proxy (HEAD): failed (test core): .' \
          && ! printf '%s\n' "$_dead" | grep -q timeout \
-         && printf '%s\n' "$_live" | grep -Eq '^via proxy \(GET\): [0-9]+ ms  \(HTTP 200, live tunnel '"$_lo"'\)$'
-    then ok "proxy ping: a dead server's error, and the live tunnel"
-    else bad "proxy ping: a dead server's error, and the live tunnel (got: $_dead / $_live)"; fi
+         && printf '%s\n' "$_live" | grep -Eq '^via proxy \(GET\): [0-9]+ ms  \(HTTP 200, live tunnel '"$_lo"'\)$' \
+         && [ "$_alive" = 1 ]
+    then ok "proxy ping: a dead server's error, and the live tunnel leaves the core running"
+    else bad "proxy ping: a dead server's error, and the live tunnel leaves the core running (got: $_dead / $_live / core alive $_alive)"; fi
     rm -rf "$_pd"
 
     # Traced so a failure's tail names the step that broke (set -e stops there).

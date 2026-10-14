@@ -2393,10 +2393,10 @@ _socket_listening() {
 socket_listening() { _socket_listening -lun "$1"; }
 tcp_socket_listening() { _socket_listening -ltn "$1"; }
 
+# No globals: callers such as ping keep their own _port and _pid (a probe core to stop).
 socket_owned_by_pid() {   # <port> <pid> [ss flags, default UDP]
-    _port="$1"; _pid="$2"
     have ss || return 1
-    ss "${3:--lunp}" 2>/dev/null | awk -v port="$_port" -v pid="$_pid" '
+    ss "${3:--lunp}" 2>/dev/null | awk -v port="$1" -v pid="$2" '
             $0 ~ (":" port "([[:space:]]|$)") && $0 ~ ("pid=" pid "([,)]|$)") { found=1 }
             END { exit(found ? 0 : 1) }'
 }
