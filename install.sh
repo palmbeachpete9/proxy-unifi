@@ -72,7 +72,7 @@ restore_service_state() {
 restore_promotion() {
     [ -f "$PROMOTION_MARKER" ] || return 0
     _restore_rc=0
-    for _r in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py \
+    for _r in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkfallback.py proxylib.py safeexec.py \
               xray sing-box amnezia-box geoip.dat geosite.dat; do
         if [ -f "$PROMOTION_BACKUP/$_r.absent" ]; then rm -f "$BIN_DIR/$_r" || _restore_rc=1
         # Copy then rename: a running core cannot be overwritten in place (ETXTBSY).
@@ -245,7 +245,7 @@ import sys
 import tarfile
 
 archive_path, outdir = sys.argv[1], sys.argv[2]
-needed = set("proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py "
+needed = set("proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkfallback.py proxylib.py "
              "safeexec.py on_boot.sh".split())
 found = set()
 limit = 2 * 1024 * 1024
@@ -384,7 +384,7 @@ _install_files_locked() {
         prepare_source_bundle \
             || echo "project source archive unavailable; falling back to per-file downloads" >&2
     fi
-    for f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py on_boot.sh; do
+    for f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkfallback.py proxylib.py safeexec.py on_boot.sh; do
         fetch "$f" "$_stage/$f" 0755 || { echo "fetch failed: $f" >&2; return 1; }
         [ -s "$_stage/$f" ] || { echo "empty file fetched: $f" >&2; return 1; }
     done
@@ -394,7 +394,7 @@ _install_files_locked() {
     "$PYTHON" -m py_compile "$_stage"/*.py || return 1
     snapshot_service_state
     _backup="$PROMOTION_BACKUP"; mkdir -p "$_backup"
-    for f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py \
+    for f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkfallback.py proxylib.py safeexec.py \
              xray sing-box amnezia-box geoip.dat geosite.dat; do
         if [ -e "$BIN_DIR/$f" ]; then cp -p "$BIN_DIR/$f" "$_backup/$f" || return 1
         else : > "$_backup/$f.absent"; fi
@@ -403,7 +403,7 @@ _install_files_locked() {
     else : > "$_backup/on_boot.sh.absent"; fi
     : > "$PROMOTION_MARKER"
     # promote atomically
-    for f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py; do
+    for f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkfallback.py proxylib.py safeexec.py; do
         if ! mv -f "$_stage/$f" "$BIN_DIR/$f" || ! chmod 0755 "$BIN_DIR/$f"; then
             return 1
         fi

@@ -19,7 +19,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
-for f in mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py; do
+for f in mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkfallback.py proxylib.py safeexec.py; do
     cp "$REPO/src/$f" "$T/root/bin/$f"
 done
 cp "$XRAY_SRC" "$T/root/bin/xray"

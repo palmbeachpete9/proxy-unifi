@@ -138,7 +138,7 @@ PY
         then ok "systemd verifies unifi-common boot unit"; else bad "systemd verifies unifi-common boot unit"; fi
     fi
     rm -rf "$_ud"
-    if python3 -m py_compile "$SRC"/mkxray.py "$SRC"/mksingbox.py "$SRC"/mksub.py "$SRC"/mkawg.py "$SRC"/mkjson.py "$SRC"/proxylib.py "$SRC"/safeexec.py 2>/dev/null
+    if python3 -m py_compile "$SRC"/mkxray.py "$SRC"/mksingbox.py "$SRC"/mksub.py "$SRC"/mkawg.py "$SRC"/mkjson.py "$SRC"/mkfallback.py "$SRC"/proxylib.py "$SRC"/safeexec.py 2>/dev/null
     then ok "python compile"; else bad "python compile"; fi
     rm -rf "$SRC/__pycache__"
     if grep -Fq "sys.version_info < (3, 9)" "$ROOT/install.sh" \
@@ -318,7 +318,7 @@ SH
     # assets from one retained promotion backup.
     _id="$(mktemp -d)"
     mkdir -p "$_id/live" "$_id/backup"
-    for _f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py \
+    for _f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkfallback.py proxylib.py safeexec.py \
               xray sing-box amnezia-box geoip.dat geosite.dat; do
         printf old > "$_id/backup/$_f"; printf new > "$_id/live/$_f"
     done
@@ -387,7 +387,7 @@ SH
 
     _bd="$(mktemp -d)"
     mkdir -p "$_bd/archive-root/src" "$_bd/work"
-    for _f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py on_boot.sh; do
+    for _f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkfallback.py proxylib.py safeexec.py on_boot.sh; do
         printf 'bundle:%s\n' "$_f" > "$_bd/archive-root/src/$_f"
     done
     python3 - "$_bd/source.tgz" "$_bd/archive-root" <<'PY'
@@ -1279,6 +1279,56 @@ with tempfile.TemporaryDirectory() as tmp:
     lines = out.getvalue().splitlines()
     assert len(lines) == 1 and lines[0].startswith("1\t"), lines
     assert "Provider A" in lines[0] and "2 nodes" in lines[0] and "refresh failed" in lines[0], lines
+PY
+
+    # The fallback pool: ordered subscription nodes, no duplicates or unsupported
+    # ones, refresh re-matching that marks vanished nodes missing, mode 600.
+    py_case "mkfallback: pool add/order/remove/rematch/drop" "$SRC" <<'PY'
+import json, os, subprocess, sys, tempfile
+src = sys.argv[1]; sys.path.insert(0, src)
+import mksub
+def cli(*args):
+    return subprocess.run([sys.executable, os.path.join(src, "mkfallback.py")] + list(args),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+links = "\n".join(["vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.example.com:443?security=tls&type=tcp#DE",
+                   "trojan://secret@b.example.com:443?security=tls#NL",
+                   "vless://b831381d-6324-4d53-ad4f-8cda48b30811@0.0.0.0:443?security=tls&type=tcp#bad"]).encode()
+with tempfile.TemporaryDirectory() as tmp:
+    catf, pool = os.path.join(tmp, "catalog.json"), os.path.join(tmp, "fallback.json")
+    cat = mksub.process_body(links); json.dump(cat, open(catf, "w"))
+    assert cli("add", "--pool", pool, "--sub", "1", "--catalog", catf, "--index", "2").returncode == 0
+    r = cli("add", "--pool", pool, "--sub", "1", "--catalog", catf, "--index", "1", "--position", "1")
+    assert r.returncode == 0, r.stderr
+    dup = cli("add", "--pool", pool, "--sub", "1", "--catalog", catf, "--index", "1")
+    assert dup.returncode != 0 and "already in the pool" in dup.stderr, dup.stderr
+    bad = cli("add", "--pool", pool, "--sub", "1", "--catalog", catf, "--index", "3")
+    assert bad.returncode != 0 and "not supported" in bad.stderr, bad.stderr
+    assert cli("add", "--pool", pool, "--sub", "1", "--catalog", catf, "--index", "9").returncode != 0
+    assert cli("add", "--pool", pool, "--sub", "x", "--catalog", catf, "--index", "1").returncode != 0
+    assert oct(os.stat(pool).st_mode & 0o777) == "0o600"
+    assert [n["meta"]["label"] for n in json.load(open(pool))["nodes"]] == ["DE", "NL"]
+    assert cli("order", "--pool", pool, "2", "1").returncode == 0
+    assert [n["meta"]["label"] for n in json.load(open(pool))["nodes"]] == ["NL", "DE"]
+    assert cli("order", "--pool", pool, "1", "1").returncode != 0
+    # NL disappears from the catalog -> missing; comes back -> matched again
+    json.dump(dict(cat, nodes=[cat["nodes"][0]]), open(catf, "w"))
+    assert cli("rematch", "--pool", pool, "--sub", "1", "--catalog", catf).returncode == 0
+    assert [n["missing"] for n in json.load(open(pool))["nodes"]] == [True, False]
+    assert cli("count", "--pool", pool).stdout.split() == ["1", "2"]
+    json.dump(cat, open(catf, "w"))
+    assert cli("rematch", "--pool", pool, "--sub", "1", "--catalog", catf).returncode == 0
+    assert [n["missing"] for n in json.load(open(pool))["nodes"]] == [False, False]
+    # another subscription's refresh leaves these entries alone
+    json.dump(dict(cat, nodes=[]), open(catf, "w"))
+    assert cli("rematch", "--pool", pool, "--sub", "2", "--catalog", catf).returncode == 0
+    assert [n["missing"] for n in json.load(open(pool))["nodes"]] == [False, False]
+    r = cli("remove", "--pool", pool, "--position", "1")
+    assert r.returncode == 0 and r.stdout == "", r
+    assert cli("remove", "--pool", pool, "--position", "5").returncode != 0
+    assert cli("drop-sub", "--pool", pool, "--sub", "1").stdout.strip() == "0"
+    json.dump({"schema": 1, "nodes": [{"sub": "x", "meta": {}}]}, open(pool, "w"))
+    assert cli("count", "--pool", pool).returncode != 0          # malformed file is refused
+    assert cli("count", "--pool", os.path.join(tmp, "absent")).stdout.split() == ["0", "0"]
 PY
 
     # mkawg: AWG 1.5-3.1 parser, bridge generator, profile catalog, and UI safety.
