@@ -307,6 +307,16 @@ def build_stream(q, security, net, host):
     return stream
 
 
+def _vnext_outbound(protocol, host, port, user, q, stream):
+    settings = {"vnext": [{"address": host, "port": port, "users": [user]}]}
+    packet_encoding = qg(q, "packetEncoding")
+    if packet_encoding:
+        if packet_encoding not in ("none", "packet", "xudp"):
+            die("unsupported packetEncoding '%s'" % packet_encoding)
+        settings["packetEncoding"] = packet_encoding
+    return {"tag": "proxy", "protocol": protocol, "settings": settings, "streamSettings": stream}
+
+
 def parse_vless(link):
     u = safe_urlsplit(link)
     uuid = unquote(u.username or "")
@@ -329,19 +339,7 @@ def parse_vless(link):
     security = qg(q, "security", default="none") or "none"
     stream = build_stream(q, security, net, host)
 
-    settings = {"vnext": [{"address": host, "port": port, "users": [user]}]}
-    packet_encoding = qg(q, "packetEncoding")
-    if packet_encoding:
-        if packet_encoding not in ("none", "packet", "xudp"):
-            die("unsupported packetEncoding '%s'" % packet_encoding)
-        settings["packetEncoding"] = packet_encoding
-    outbound = {
-        "tag": "proxy",
-        "protocol": "vless",
-        "settings": settings,
-        "streamSettings": stream,
-    }
-    return outbound, host, port
+    return _vnext_outbound("vless", host, port, user, q, stream), host, port
 
 
 def parse_trojan(link):
@@ -420,19 +418,7 @@ def _vmess_outbound(host, port, uid, aid, scy, security, net, q):
         die("vmess link is missing the UUID")
     stream = build_stream(q, security, net, host)
     user = {"id": uid, "alterId": aid, "security": scy or "auto"}
-    settings = {"vnext": [{"address": host, "port": port, "users": [user]}]}
-    packet_encoding = qg(q, "packetEncoding")
-    if packet_encoding:
-        if packet_encoding not in ("none", "packet", "xudp"):
-            die("unsupported packetEncoding '%s'" % packet_encoding)
-        settings["packetEncoding"] = packet_encoding
-    outbound = {
-        "tag": "proxy",
-        "protocol": "vmess",
-        "settings": settings,
-        "streamSettings": stream,
-    }
-    return outbound, host, port
+    return _vnext_outbound("vmess", host, port, user, q, stream), host, port
 
 
 def parse_vmess(link):
