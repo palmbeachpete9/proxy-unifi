@@ -109,6 +109,11 @@ if [ -s "$D/pid" ]; then
 fi
 SH
 
+cat > "$T/mock-bin/journalctl" <<'SH'
+#!/bin/sh
+echo "journalctl $*"
+SH
+
 cat > "$T/mock-bin/chown" <<'SH'
 #!/bin/sh
 exit 0
@@ -630,6 +635,9 @@ printf '3\n1\n2\n2\n1\n\n2\ny\ny\n\n0\n' | menu_input > "$T/fb-wizard.out" 2>&1
 grep -q '^FALLBACK="on"' "$T/root/etc/settings.env"
 [ -f "$STATE/enabled_proxy-unifi-fallback_timer" ]
 grep -q '@1.0.0.1:' "$T/root/etc/link.txt"
+# The watchdog's switches and errors reach the journal and 'proxy logs'.
+grep -q '^SyslogLevel=notice$' "$T/proxy-unifi-fallback.service"
+run_cli logs -n 5 | grep -q -- '-u proxy-unifi -u proxy-unifi-fallback -n 5'
 printf '0\n' | menu_input > "$T/menu-on.out" 2>&1
 grep -q 'Fallback:   on, active #1 of 2' "$T/menu-on.out"
 # choosing a node by hand asks first: "n" changes nothing, "y" turns fallback

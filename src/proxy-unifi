@@ -2422,7 +2422,8 @@ current_protocol() {
     esac
 }
 
-cmd_logs()    { shift || true; journalctl -u "$SERVICE_NAME" "$@"; }
+# The core's journal, with the fallback watchdog's switches between its lines.
+cmd_logs()    { shift || true; journalctl -u "$SERVICE_NAME" -u "$FB_SERVICE_NAME" "$@"; }
 cmd_start()   { ingress_retry; systemctl start "$SERVICE_NAME"; }
 cmd_stop()    { systemctl stop "$SERVICE_NAME"; }
 cmd_restart() { ingress_retry; systemctl restart "$SERVICE_NAME"; }
@@ -4401,7 +4402,9 @@ After=network-online.target
 Type=oneshot
 ExecStart=$BIN_DIR/proxy-unifi fallback-check
 Nice=10
-# No "started/finished" pair every interval in the journal; switches log at notice.
+# No "started/finished" pair every interval in the journal. The run's own output
+# (switches, errors) is logged at notice, so it stays.
+SyslogLevel=notice
 LogLevelMax=notice
 EOF
     atomic_write "$FB_TIMER_FILE" 644 <<EOF || return 1
