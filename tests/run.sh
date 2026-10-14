@@ -12,6 +12,7 @@
 # Usage:
 #   tests/run.sh             # static + parser tests (+ engine tests if cached)
 #   tests/run.sh --download  # also fetch xray/sing-box into tests/.cache first
+#   PROXY_UNIFI_QUICK=1 tests/run.sh ...  # skip the slow end-to-end runs (CI on every push)
 #
 # Exit non-zero if any test fails. POSIX sh.
 # NOTE: no 'set -e' — individual tests are expected to fail without aborting the run.
@@ -2497,14 +2498,18 @@ echo "$_rc $_code"' sh "$_pd/lib.sh" "$_pd/node.json" 2>&1)"
     else bad "proxy ping: a dead server's error, the live tunnel leaves the core running, a pool node's own test core (got: $_dead / $_live / core alive $_alive / node $_node)"; fi
     rm -rf "$_pd"
 
+    if [ "${PROXY_UNIFI_QUICK:-}" = 1 ]; then
+        printf '  skip sandboxed CLI lifecycle (deferred: PROXY_UNIFI_QUICK=1)\n'
     # Traced so a failure's tail names the step that broke (set -e stops there).
-    if sh -x "$ROOT/tests/lifecycle.sh" "$XR" >"$_d.lifecycle" 2>&1; then ok "sandboxed CLI lifecycle + rollback"
+    elif sh -x "$ROOT/tests/lifecycle.sh" "$XR" >"$_d.lifecycle" 2>&1; then ok "sandboxed CLI lifecycle + rollback"
     else bad "sandboxed CLI lifecycle + rollback"; tail -n 20 "$_d.lifecycle"; fi
     rm -f "$_d.lifecycle"
 
     # Kernel WireGuard ingress end to end changes the host's network, so it
     # runs only as root, or with sudo where PROXY_UNIFI_LAB=1 allows it (CI).
-    if [ "$(id -u)" = 0 ]; then
+    if [ "${PROXY_UNIFI_QUICK:-}" = 1 ]; then
+        _lab="INFO deferred: PROXY_UNIFI_QUICK=1"; _lab_rc=77
+    elif [ "$(id -u)" = 0 ]; then
         _lab="$(sh "$ROOT/tests/ingress-lab.sh" "$XR" 2>&1)"; _lab_rc=$?
     elif [ "${PROXY_UNIFI_LAB:-}" = 1 ] && sudo -n true 2>/dev/null; then
         _lab="$(sudo -n sh "$ROOT/tests/ingress-lab.sh" "$XR" 2>&1)"; _lab_rc=$?
