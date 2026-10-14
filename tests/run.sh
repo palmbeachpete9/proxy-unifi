@@ -1331,6 +1331,105 @@ with tempfile.TemporaryDirectory() as tmp:
     assert cli("count", "--pool", os.path.join(tmp, "absent")).stdout.split() == ["0", "0"]
 PY
 
+    # The watchdog's decisions for one run, with scripted check results: offline
+    # only after FB_DOWN failures, the first candidate that answers, staying put
+    # when none does, returning only after FB_UP good checks, and never leaving a
+    # working node for one while a higher-priority one is recovering too.
+    py_case "mkfallback: watchdog decisions" "$SRC" <<'PY'
+import os, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import mkfallback as fb
+def entry(i):
+    return {"sub": "1", "meta": {"id": ("%x" % i) * 64, "label": "n%d" % i, "kind": "link",
+                                 "scheme": "vless", "server": "s"}, "missing": False}
+pool = [entry(i) for i in (1, 2, 3)]
+def key(i):
+    return "1:" + ("%x" % (i + 1)) * 64
+def world(up, applied):
+    def probe(i, kind):
+        return (True, 50, "") if up[i] else (False, 0, "timeout")
+    def apply(i, reason):
+        applied.append((i, reason))
+        return (True, "")
+    return probe, apply
+cfg = {"down": 3, "up": 2, "ret": True}
+active = ("1", pool[0]["meta"]["id"])
+on3 = ("1", pool[2]["meta"]["id"])
+# offline only after 3 failed runs, then the first candidate that answers (#2 is down too)
+state, applied = fb.load_state("/nonexistent"), []
+probe, apply = world([False, False, True], applied)
+for _ in range(2):
+    fb.run_once(pool, state, active, cfg, probe, apply, 0)
+assert applied == [] and state["nodes"][key(0)]["fails"] == 2, (applied, state)
+fb.run_once(pool, state, active, cfg, probe, apply, 0)
+assert [a[0] for a in applied] == [2] and "#1" in applied[0][1], applied
+# everything down: stay, and say so
+state, applied = fb.load_state("/nonexistent"), []
+probe, apply = world([False, False, False], applied)
+for _ in range(3):
+    fb.run_once(pool, state, active, cfg, probe, apply, 0)
+assert applied == [] and "no pool node online" in state["note"], state
+# return: on #3, #1 back; one return check per run in turn (#1, #2, #1): back after 2 good checks of #1
+state, applied = fb.load_state("/nonexistent"), []
+probe, apply = world([True, False, True], applied)
+for _ in range(3):
+    fb.run_once(pool, state, on3, cfg, probe, apply, 0)
+assert [a[0] for a in applied] == [0], (applied, state)
+# a recovering higher entry holds back a lower one that is already online
+state, applied = fb.load_state("/nonexistent"), []
+state["nodes"][key(0)] = {"fails": 0, "oks": 1, "at": 0, "ms": 0, "err": ""}
+state["nodes"][key(1)] = {"fails": 0, "oks": 5, "at": 0, "ms": 0, "err": ""}
+state["rot"] = 1                                  # this run's return check is #2
+probe, apply = world([True, True, True], applied)
+fb.run_once(pool, state, on3, cfg, probe, apply, 0)
+assert applied == [], applied
+# no return when FB_RETURN is off
+state, applied = fb.load_state("/nonexistent"), []
+probe, apply = world([True, True, True], applied)
+for _ in range(5):
+    fb.run_once(pool, state, on3, dict(cfg, ret=False), probe, apply, 0)
+assert applied == [], applied
+# the live check fails but the node answers through a test core: no failure, tunnel flagged
+state, applied, kinds = fb.load_state("/nonexistent"), [], []
+def probe_live_down(i, kind):
+    kinds.append(kind)
+    return (kind == "core", 9, "" if kind == "core" else "timeout")
+for _ in range(4):
+    fb.run_once(pool, state, active, cfg, probe_live_down, lambda i, r: (applied.append(i), (True, ""))[1], 0)
+assert applied == [] and state["tunnel"] == "failing" and state["nodes"][key(0)]["fails"] == 0, state
+assert kinds[:2] == ["live", "core"], kinds
+# no UniFi client interface: the test core decides, and nothing is flagged
+state = fb.load_state("/nonexistent")
+fb.run_once(pool, state, active, cfg, lambda i, k: (k == "core", 9, "nolive" if k == "live" else ""),
+            lambda i, r: (True, ""), 0)
+assert state["tunnel"] == "ok", state
+# the active node is not in the pool: the highest-priority entry that answers, right away
+state, applied = fb.load_state("/nonexistent"), []
+probe, apply = world([False, True, True], applied)
+fb.run_once(pool, state, ("9", "f" * 64), cfg, probe, apply, 0)
+assert [a[0] for a in applied] == [1], applied
+# a switch that cannot be applied counts as offline and the next candidate is tried
+state, applied = fb.load_state("/nonexistent"), []
+def apply_fail_first(i, reason):
+    applied.append(i)
+    return (i != 1, "test failed")
+probe, _ = world([False, True, True], [])
+for _ in range(3):
+    fb.run_once(pool, state, active, cfg, probe, apply_fail_first, 0)
+assert applied == [1, 2], applied
+# a missing entry is skipped; fewer than 2 usable entries means no run at all
+state, applied = fb.load_state("/nonexistent"), []
+gone = [entry(1), dict(entry(2), missing=True)]
+probe, apply = world([False, True], applied)
+for _ in range(3):
+    fb.run_once(gone, state, ("1", gone[0]["meta"]["id"]), cfg, probe, apply, 0)
+assert applied == [] and state["nodes"] == {}, state
+with tempfile.TemporaryDirectory() as tmp:
+    bad = os.path.join(tmp, "s")
+    open(bad, "w").write("{oops")
+    assert fb.load_state(bad)["nodes"] == {}
+PY
+
     # mkawg: AWG 1.5-3.1 parser, bridge generator, profile catalog, and UI safety.
     py_case "mkawg parser and UI corpus" "$SRC" <<'PY'
 import base64
