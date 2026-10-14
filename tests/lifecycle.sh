@@ -195,8 +195,8 @@ hash_file() {
 
 run_cli install-service >/dev/null
 
-# Main CLI layout remains a fixed-width, complete menu, with AWG directly after
-# subscriptions and before the Xray JSON block.
+# Main CLI layout remains a fixed-width, complete menu: subscriptions, then the
+# fallback pool, then AWG, before the Xray JSON block.
 printf '0\n' | menu_input > "$T/menu.out"
 python3 - "$T/menu.out" <<'PY'
 import re,sys,unicodedata
@@ -209,11 +209,12 @@ def width(line):
                for ch in line)
 assert rows and all(width(line)==53 for line in rows), [(width(x),x) for x in rows]
 positions=[plain.index(label) for label in
-           ("Manage a multi-server subscription", "Manage AmneziaWG profiles",
-            "Import an Xray JSON profile")]
+           (" 2. Subscriptions", " 3. Fallback pool", " 4. Manage AmneziaWG profiles",
+            " 5. Import an Xray JSON profile")]
 assert positions == sorted(positions), positions
 numbers=[int(x) for x in re.findall(r"│\s+([0-9]+)\. ", plain)]
-assert numbers[:22] == list(range(22)), numbers[:22]
+assert numbers == list(range(23)), numbers
+assert "[0-22]" in plain and "Fallback:   off" in plain
 PY
 
 LINK='vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.1.1.1:443?security=none&type=tcp#test'
@@ -243,21 +244,21 @@ printf '1\n%s\n\n0\n' "${LINK%#test}&unknownSemantic=x#bad" | menu_input >/dev/n
 
 # Settings maintenance must not start a service that was deliberately stopped.
 run_cli stop >/dev/null
-printf '8\n1\n51822\n\n0\n' | menu_input >/dev/null
+printf '9\n1\n51822\n\n0\n' | menu_input >/dev/null
 if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
 grep -q '"port": 51822' "$T/root/etc/config.json"
 
 # The ingress setting switches the unit between both paths and rejects others.
-printf '8\n4\nuserspace\n\n0\n' | menu_input >/dev/null
+printf '9\n4\nuserspace\n\n0\n' | menu_input >/dev/null
 grep -q '^INGRESS="userspace"$' "$T/root/etc/settings.env"
 grep -q '^ExecStart=.*/xray run -config [^ ]*/config.json$' "$T/proxy-unifi.service"
 grep -q '^ExecStartPre=-+.*/proxy-unifi _ingress-down$' "$T/proxy-unifi.service"
 grep -q '^AmbientCapabilities=$' "$T/proxy-unifi.service"
 run_cli status | grep -q '^ingress:   userspace (Xray WireGuard, as configured)$'
-printf '8\n4\nfast\n\n0\n' | menu_input > "$T/ingress.out" 2>&1
+printf '9\n4\nfast\n\n0\n' | menu_input > "$T/ingress.out" 2>&1
 grep -q 'ingress must be kernel|userspace' "$T/ingress.out"
 grep -q '^INGRESS="userspace"$' "$T/root/etc/settings.env"
-printf '8\n4\nkernel\n\n0\n' | menu_input >/dev/null
+printf '9\n4\nkernel\n\n0\n' | menu_input >/dev/null
 grep -q '^INGRESS="kernel"$' "$T/root/etc/settings.env"
 grep -q '^ExecStartPre=+.*/proxy-unifi _ingress-up$' "$T/proxy-unifi.service"
 if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
@@ -265,7 +266,7 @@ if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
 # LAN route mode is a persisted on/off setting, from the menu and the CLI, also
 # while the service runs.
 run_cli start >/dev/null
-printf '8\n5\non\n\n0\n' | menu_input >/dev/null
+printf '9\n5\non\n\n0\n' | menu_input >/dev/null
 grep -q '^LAN_ROUTE="on"$' "$T/root/etc/settings.env"
 run_cli status | grep -q '^lan route: on, inactive until kernel WireGuard ingress runs$'
 if run_cli set lan-route maybe >/dev/null 2>&1; then exit 1; fi
@@ -324,7 +325,7 @@ printf '1\n%s\n\n0\n' "$BAD_SS2022_LINK" | menu_input >/dev/null 2>&1
 cat > "$T/profile.json" <<'EOF'
 {"inbounds":[{"tag":"socks","protocol":"socks","listen":"127.0.0.1","port":10808,"settings":{"udp":true}},{"tag":"http","protocol":"http","listen":"127.0.0.1","port":10809}],"outbounds":[{"protocol":"freedom","tag":"proxy"},{"protocol":"freedom","tag":"proxy-2"},{"protocol":"blackhole","tag":"block"}],"routing":{"balancers":[{"tag":"B","selector":["proxy"],"strategy":{"type":"leastPing"},"fallbackTag":"block"}],"rules":[{"type":"field","inboundTag":["http"],"outboundTag":"block"},{"type":"field","inboundTag":["socks","http"],"network":"tcp,udp","balancerTag":"B"}]},"burstObservatory":{"subjectSelector":["proxy"],"pingConfig":{"destination":"https://www.gstatic.com/generate_204","interval":"1m","timeout":"3s"}}}
 EOF
-printf '4\n%s\n\n0\n' "$T/profile.json" | menu_input > "$T/pool-import.out" 2>&1
+printf '5\n%s\n\n0\n' "$T/profile.json" | menu_input > "$T/pool-import.out" 2>&1
 [ "$(cat "$T/root/etc/engine")" = xraypool ]
 grep -q "^ExecStart=.*/xray run -config .*/pool/01-provider.json -config .*/pool/99-overlay.json -config $T/run/ingress.json\$" \
     "$T/proxy-unifi.service"
@@ -362,7 +363,7 @@ python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["sub"] == "1"' 
 [ ! -e "$T/root/.transactions/active" ] || exit 1
 OLD_KEY="$(cat "$T/root/etc/wg/wg_private.key")"
 OLD_OVERLAY="$(hash_file "$T/root/etc/pool/99-overlay.json")"
-printf '7\ny\n\n0\n' | menu_input >/dev/null
+printf '8\ny\n\n0\n' | menu_input >/dev/null
 [ "$(cat "$T/root/etc/engine")" = xraypool ]
 [ "$(cat "$T/root/etc/wg/wg_private.key")" != "$OLD_KEY" ]
 [ "$(hash_file "$T/root/etc/pool/99-overlay.json")" != "$OLD_OVERLAY" ]
@@ -392,13 +393,13 @@ run_cli boot-recover >/dev/null
 # Switching cores must preserve the existing UniFi-facing WireGuard identity.
 WG_PRIVATE_HASH="$(hash_file "$T/root/etc/wg/wg_private.key")"
 UNIFI_PUBLIC_HASH="$(hash_file "$T/root/etc/wg/unifi_public.key")"
-printf '3\n1\n🇩🇪 Москва 🛜\n\n0\n' | menu_input > "$T/awg-create.out"
+printf '4\n1\n🇩🇪 Москва 🛜\n\n0\n' | menu_input > "$T/awg-create.out"
 grep -q 'Saved AmneziaWG profile: \[DE\] Москва Wi-Fi' "$T/awg-create.out"
 [ "$(find "$T/root/etc/awg/profiles" -name '*.conf' -type f | wc -l | tr -d ' ')" = 1 ]
 [ ! -e "$T/root/etc/awg/selected" ]
 [ "$(cat "$T/root/etc/engine")" = xraypool ]
 
-printf '3\n2\n\n0\n' | menu_input > "$T/awg-list.out"
+printf '4\n2\n\n0\n' | menu_input > "$T/awg-list.out"
 grep -q '\[ \] AWG 1.5' "$T/awg-list.out"
 grep -q '\[DE\] Москва Wi-Fi' "$T/awg-list.out"
 if grep -q 'ð' "$T/awg-list.out"; then exit 1; fi
@@ -422,7 +423,7 @@ PY
 
 # The profile catalog reflows instead of wrapping columns on a narrow terminal.
 COLUMNS=60 menu_input > "$T/awg-list-narrow.out" <<'EOF'
-3
+4
 2
 
 0
@@ -443,7 +444,7 @@ assert any(line.startswith("     endpoint: ") for line in rows), rows
 assert rows and all(width(line) <= 60 for line in rows), rows
 PY
 
-printf '3\n3\n1\n\n0\n' | menu_input > "$T/awg-select.out"
+printf '4\n3\n1\n\n0\n' | menu_input > "$T/awg-select.out"
 [ "$(cat "$T/root/etc/engine")" = awg ]
 [ -s "$T/root/etc/awg/selected" ]
 grep -q '^ExecStart=.*/amnezia-box run -c .*/config.json$' "$T/proxy-unifi.service"
@@ -459,13 +460,13 @@ PY
 [ "$(hash_file "$T/root/etc/wg/unifi_public.key")" = "$UNIFI_PUBLIC_HASH" ]
 run_cli status > "$T/awg-status.out"
 grep -q '^engine:    awg$' "$T/awg-status.out"
-printf '5\n\n0\n' | menu_input > "$T/awg-details.out"
+printf '6\n\n0\n' | menu_input > "$T/awg-details.out"
 grep -q '^Protocol:       AmneziaWG 1.5$' "$T/awg-details.out"
 if grep -q "$PRIVATE" "$T/awg-details.out"; then exit 1; fi
 if grep -q "$PUBLIC" "$T/awg-details.out"; then exit 1; fi
 
 # Deleting the active profile is fail-closed and leaves no stale generated state.
-printf '3\n6\n1\ny\n\n0\n' | menu_input >/dev/null
+printf '4\n6\n1\ny\n\n0\n' | menu_input >/dev/null
 [ ! -e "$T/root/etc/awg/selected" ]
 [ ! -e "$T/root/etc/config.json" ]
 [ ! -e "$T/root/etc/engine" ]
@@ -476,18 +477,18 @@ if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
 # different authoritative engine. Simulate damaged legacy state around edit and
 # delete operations and verify the active Xray tunnel remains byte-for-byte intact.
 printf '1\n%s\n\n0\n' "$LINK" | menu_input >/dev/null
-printf '3\n1\nStale marker test\n\n0\n' | menu_input >/dev/null
+printf '4\n1\nStale marker test\n\n0\n' | menu_input >/dev/null
 STALE_CONF="$(find "$T/root/etc/awg/profiles" -name '*.conf' -type f -print -quit)"
 STALE_ID="$(basename "$STALE_CONF" .conf)"
 STALE_CONFIG_HASH="$(hash_file "$T/root/etc/config.json")"
 printf '%s' "$STALE_ID" > "$T/root/etc/awg/selected"
-printf '3\n4\n1\n\n0\n' | menu_input >/dev/null
+printf '4\n4\n1\n\n0\n' | menu_input >/dev/null
 [ "$(cat "$T/root/etc/engine")" = xray ]
 [ "$(hash_file "$T/root/etc/config.json")" = "$STALE_CONFIG_HASH" ]
 [ ! -e "$T/root/etc/awg/selected" ]
 run_cli status 2>/dev/null | grep -q '^service:   active'
 printf '%s' "$STALE_ID" > "$T/root/etc/awg/selected"
-printf '3\n6\n1\ny\n\n0\n' | menu_input >/dev/null
+printf '4\n6\n1\ny\n\n0\n' | menu_input >/dev/null
 [ "$(cat "$T/root/etc/engine")" = xray ]
 [ "$(hash_file "$T/root/etc/config.json")" = "$STALE_CONFIG_HASH" ]
 [ ! -e "$T/root/etc/awg/selected" ]
@@ -499,10 +500,10 @@ BAD_ID=33333333-3333-4333-8333-333333333333
 printf '%s\n' '[Interface]' 'PrivateKey = invalid' > "$T/root/etc/awg/profiles/$BAD_ID.conf"
 printf '%s' 'Broken profile' > "$T/root/etc/awg/profiles/$BAD_ID.name"
 chmod 600 "$T/root/etc/awg/profiles/$BAD_ID.conf" "$T/root/etc/awg/profiles/$BAD_ID.name"
-printf '3\n4\n1\n\n0\n' | menu_input >/dev/null
+printf '4\n4\n1\n\n0\n' | menu_input >/dev/null
 python3 "$T/root/bin/mkawg.py" validate \
     --file "$T/root/etc/awg/profiles/$BAD_ID.conf" >/dev/null
-printf '3\n6\n1\ny\n\n0\n' | menu_input >/dev/null
+printf '4\n6\n1\ny\n\n0\n' | menu_input >/dev/null
 [ ! -e "$T/root/etc/awg/profiles/$BAD_ID.conf" ]
 [ ! -e "$T/root/etc/awg/profiles/$BAD_ID.name" ]
 [ ! -e "$T/root/.transactions/active" ] || exit 1
@@ -613,11 +614,62 @@ run_cli fallback-check >/dev/null
 grep -q '@1.0.0.1:' "$T/root/etc/link.txt"
 # importing a link by hand turns fallback off and keeps the pool
 run_cli status | grep -q '^fallback:  on, active #1 of 2'
-printf '1\n%s\n\n0\n' "$LINK" | menu_input >/dev/null 2>&1
+printf '1\ny\n%s\n\n0\n' "$LINK" | menu_input >/dev/null 2>&1
 grep -q '^FALLBACK="off"' "$T/root/etc/settings.env"
 [ -s "$T/root/etc/fallback.json" ]
 run_cli status | grep -q '^fallback:  off'
 [ ! -e "$T/root/.lock" ] || exit 1
+
+# The fallback menu and its wizard: 2 nodes (two-b, then two-a), keep the
+# order, Balanced, return to higher priority, turn it on. Turning on applies
+# the highest-priority node that answers.
+printf '3\n0\n' | menu_input > "$T/fb-menu.out" 2>&1
+grep -q '^Fallback: off — balanced (every 20 s' "$T/fb-menu.out"
+grep -q '^ 8. Turn fallback on/off$' "$T/fb-menu.out"
+printf '3\n1\n2\n2\n1\n\n2\ny\ny\n\n0\n' | menu_input > "$T/fb-wizard.out" 2>&1
+grep -q '^FALLBACK="on"' "$T/root/etc/settings.env"
+[ -f "$STATE/enabled_proxy-unifi-fallback_timer" ]
+grep -q '@1.0.0.1:' "$T/root/etc/link.txt"
+printf '0\n' | menu_input > "$T/menu-on.out" 2>&1
+grep -q 'Fallback:   on, active #1 of 2' "$T/menu-on.out"
+# choosing a node by hand asks first: "n" changes nothing, "y" turns fallback
+# off and keeps the pool
+printf '2\n1\nn\n\n0\n' | menu_input >/dev/null 2>&1
+grep -q '^FALLBACK="on"' "$T/root/etc/settings.env"
+grep -q '@1.0.0.1:' "$T/root/etc/link.txt"
+printf '2\n1\ny\n1\n\n0\n' | menu_input >/dev/null 2>&1
+grep -q '^FALLBACK="off"' "$T/root/etc/settings.env"
+grep -q '@1.1.1.1:' "$T/root/etc/link.txt"
+[ ! -f "$STATE/enabled_proxy-unifi-fallback_timer" ]
+[ -s "$T/root/etc/fallback.json" ]
+# empty or invalid answers never save a half-built pool
+cp "$T/root/etc/fallback.json" "$T/pool.before"
+printf '3\n1\nx\n\n\n0\n' | menu_input >/dev/null 2>&1
+printf '3\n1\n2\n2\n9\n\n\n0\n' | menu_input >/dev/null 2>&1
+cmp "$T/pool.before" "$T/root/etc/fallback.json"
+# reorder, remove, add, timing, return, test
+printf '3\n4\n2 1\n\n0\n' | menu_input >/dev/null 2>&1
+python3 -c 'import json,sys; n=json.load(open(sys.argv[1]))["nodes"]; assert [e["meta"]["label"] for e in n]==["two-a","two-b"], n' "$T/root/etc/fallback.json"
+printf '3\n3\n2\n\n0\n' | menu_input >/dev/null 2>&1
+python3 -c 'import json,sys; n=json.load(open(sys.argv[1]))["nodes"]; assert [e["meta"]["label"] for e in n]==["two-a"], n' "$T/root/etc/fallback.json"
+printf '3\n2\n1\n2\n\n0\n' | menu_input >/dev/null 2>&1
+python3 -c 'import json,sys; n=json.load(open(sys.argv[1]))["nodes"]; assert [e["meta"]["label"] for e in n]==["two-b","two-a"], n' "$T/root/etc/fallback.json"
+printf '3\n5\n1\n\n0\n' | menu_input >/dev/null 2>&1
+grep -q '^FB_INTERVAL="10"' "$T/root/etc/settings.env" && grep -q '^FB_UP="3"' "$T/root/etc/settings.env"
+printf '3\n5\n4\n700\n30\n2\n4\n8\n\n0\n' | menu_input >/dev/null 2>&1      # custom; 700 is re-asked
+grep -q '^FB_INTERVAL="30"' "$T/root/etc/settings.env" && grep -q '^FB_TIMEOUT="8"' "$T/root/etc/settings.env"
+printf '3\n6\n\n0\n' | menu_input >/dev/null 2>&1
+grep -q '^FB_RETURN="off"' "$T/root/etc/settings.env"
+printf '3\n7\n\n0\n' | menu_input > "$T/fb-test.out" 2>&1
+[ "$(grep -c 'online' "$T/fb-test.out")" -ge 2 ]
+# turning on from the menu; removing a node while on leaves one: fallback turns off
+printf '3\n8\n\n0\n' | menu_input >/dev/null 2>&1
+grep -q '^FALLBACK="on"' "$T/root/etc/settings.env"
+printf '3\n3\n1\n\n0\n' | menu_input > "$T/fb-remove.out" 2>&1
+grep -q '^FALLBACK="off"' "$T/root/etc/settings.env"
+grep -q 'fewer than 2 pool nodes' "$T/fb-remove.out"
+[ ! -e "$T/root/.lock" ] || exit 1
+[ ! -e "$T/root/.transactions/active" ] || exit 1
 
 [ ! -e "$STATE/stale-lock" ] || { echo "lock recorded a dead owner" >&2; exit 1; }
 echo lifecycle-ok

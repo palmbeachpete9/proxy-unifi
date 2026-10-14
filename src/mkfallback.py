@@ -206,7 +206,7 @@ def _switch_to_first_online(pool, state, order, frm, probe, apply, now, reason, 
         done, why = apply(i, reason)
         if done:
             state["note"], state["tunnel"] = "", "ok"
-            log.append("switch %s -> #%d (%s)" % (frm, i + 1, reason))
+            log.append("switch %s#%d (%s)" % ("%s -> " % frm if frm else "to ", i + 1, reason))
             return True
         _record(state, pool[i], False, 0, "could not apply: %s" % why, now)
     if not state["note"]:
@@ -230,8 +230,8 @@ def run_once(pool, state, active, cfg, probe, apply, now):
     apos = next((i for i in usable
                  if active and (pool[i]["sub"], pool[i]["meta"]["id"]) == tuple(active)), None)
     if apos is None:
-        _switch_to_first_online(pool, state, usable, "-", probe, apply, now,
-                                "the active node is not in the pool", log)
+        _switch_to_first_online(pool, state, usable, "", probe, apply, now,
+                                "fallback took over: the active node was not in the pool", log)
         return log
     ok, ms, err = probe(apos, "live")
     if ok:

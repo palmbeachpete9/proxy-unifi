@@ -3203,39 +3203,47 @@ print_menu() {
     ml "  0. Exit menu"
     printf '├%s┤\n' "$HR"
     ml "  1. Manage a single-server proxy link"
-    ml "  2. Manage a multi-server subscription"
+    ml "  2. Subscriptions"
+    ml "  3. Fallback pool"
     printf '├%s┤\n' "$HR"
-    ml "  3. Manage AmneziaWG profiles"
+    ml "  4. Manage AmneziaWG profiles"
     printf '├%s┤\n' "$HR"
-    ml "  4. Import an Xray JSON profile (from a file)"
-    ml "  5. Show current server & config"
+    ml "  5. Import an Xray JSON profile (from a file)"
+    ml "  6. Show current server & config"
     printf '├%s┤\n' "$HR"
-    ml "  6. Show UniFi WireGuard VPN Client config"
-    ml "  7. Regenerate WireGuard keys"
-    ml "  8. Change WireGuard settings"
+    ml "  7. Show UniFi WireGuard VPN Client config"
+    ml "  8. Regenerate WireGuard keys"
+    ml "  9. Change WireGuard settings"
     printf '├%s┤\n' "$HR"
-    ml "  9. Ping test"
-    ml " 10. Change test algorithm"
+    ml " 10. Ping test"
+    ml " 11. Change test algorithm"
     printf '├%s┤\n' "$HR"
-    ml " 11. Start"
-    ml " 12. Stop"
-    ml " 13. Restart"
-    ml " 14. Check status"
-    ml " 15. View logs"
+    ml " 12. Start"
+    ml " 13. Stop"
+    ml " 14. Restart"
+    ml " 15. Check status"
+    ml " 16. View logs"
     printf '├%s┤\n' "$HR"
-    ml " 16. Enable autostart"
-    ml " 17. Disable autostart"
+    ml " 17. Enable autostart"
+    ml " 18. Disable autostart"
     printf '├%s┤\n' "$HR"
-    ml " 18. Update proxy cores"
-    ml " 19. Update geo files"
-    ml " 20. Version info"
-    ml " 21. Uninstall"
+    ml " 19. Update proxy cores"
+    ml " 20. Update geo files"
+    ml " 21. Version info"
+    ml " 22. Uninstall"
     printf '└%s┘\n' "$HR"
     printf '\n'
     printf 'Service:    %s\n' "$svc_d"
     printf 'Autostart:  %s\n' "$auto_d"
     printf 'Listener:   udp %s (%s)\n' "$(wg_endpoint)" "$lst"
     printf 'Server:     %s\n' "$(current_server)"
+    if [ "$FALLBACK" = on ]; then
+        _fs="$(py "$MKFALLBACK" status --pool "$FB_POOL" --state "$FB_STATE" --last "$FB_LAST" \
+            --selected "$SUB_SELECTED_META" --subs-dir "$SUB_DIR" 2>/dev/null)" || _fs="the pool cannot be read"
+        printf 'Fallback:   on, %s\n' "${_fs%% (*}"
+    else
+        printf 'Fallback:   off\n'
+    fi
 }
 
 # State-aware service controls used by the menu (idempotent feedback).
@@ -3304,40 +3312,42 @@ cmd_menu() {
     while true; do
         clear 2>/dev/null || true
         print_menu
-        printf '\nPlease enter your selection [0-21]: '
+        printf '\nPlease enter your selection [0-22]: '
         read -r sel || exit 0
         echo
         case "$sel" in
             0)  exit 0 ;;
-            1)  ( printf 'Paste proxy link (vless/vmess/trojan/ss/hysteria2/tuic): '; read -r _l || true
+            1)  ( fallback_confirm_manual || exit 0
+                  printf 'Paste proxy link (vless/vmess/trojan/ss/hysteria2/tuic): '; read -r _l || true
                   if [ -n "${_l:-}" ]; then locked_call cmd_import "$_l"; else c_ylw "No link entered."; fi ) ;;
             2)  ( menu_sub ) ;;
-            3)  ( menu_awg ) ;;
-            4)  ( menu_import_json ) ;;
-            5)  ( cmd_config ) ;;
-            6)  ( cmd_wg_config ) ;;
-            7)  ( printf 'Regenerate keys? This breaks the current UniFi VPN Client until you re-paste the new config. [y/N]: '
+            3)  ( menu_fallback ) ;;
+            4)  ( menu_awg ) ;;
+            5)  ( menu_import_json ) ;;
+            6)  ( cmd_config ) ;;
+            7)  ( cmd_wg_config ) ;;
+            8)  ( printf 'Regenerate keys? This breaks the current UniFi VPN Client until you re-paste the new config. [y/N]: '
                   read -r _c || true
                   if [ "${_c:-}" = "y" ]; then locked_call cmd_regen_keys; else c_ylw "Cancelled."; fi ) ;;
-            8)  ( menu_wg_settings ) ;;
-            9)  ( cmd_ping ) ;;
-            10) ( menu_set_ping ) ;;
-            11) ( locked_call menu_start ) ;;
-            12) ( locked_call menu_stop ) ;;
-            13) ( locked_call menu_restart ) ;;
-            14) ( cmd_status ) ;;
-            15) ( printf 'Lines to show [100]: '; read -r _n || true
+            9)  ( menu_wg_settings ) ;;
+            10) ( cmd_ping ) ;;
+            11) ( menu_set_ping ) ;;
+            12) ( locked_call menu_start ) ;;
+            13) ( locked_call menu_stop ) ;;
+            14) ( locked_call menu_restart ) ;;
+            15) ( cmd_status ) ;;
+            16) ( printf 'Lines to show [100]: '; read -r _n || true
                   case "${_n:-}" in ""|*[!0-9]*) _n=100 ;; esac
                   cmd_logs logs -n "$_n" --no-pager ) ;;
-            16) ( locked_call menu_enable ) ;;
-            17) ( locked_call menu_disable ) ;;
-            18) ( locked_call cmd_update ) ;;
-            19) ( locked_call cmd_geo_update ) ;;
-            20) ( if [ -x "$XRAY" ]; then core_version "$XRAY"; else c_ylw "xray-core: not installed"; fi
+            17) ( locked_call menu_enable ) ;;
+            18) ( locked_call menu_disable ) ;;
+            19) ( locked_call cmd_update ) ;;
+            20) ( locked_call cmd_geo_update ) ;;
+            21) ( if [ -x "$XRAY" ]; then core_version "$XRAY"; else c_ylw "xray-core: not installed"; fi
                   if [ -x "$SBIN" ]; then core_version "$SBIN"; else c_ylw "sing-box: not installed"; fi
                   if [ -x "$ABIN" ]; then core_version "$ABIN"; else c_ylw "AmneziaWG core: not installed"; fi
                   echo "proxy-unifi CLI 1.0.0" ) ;;
-            21) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
+            22) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
                 if [ "${_c:-}" = "y" ]; then ( locked_call cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
             *)  c_red "Invalid selection." ;;
         esac
@@ -3380,6 +3390,7 @@ menu_wg_settings() {
 
 # Import a full Xray JSON profile (balancer / auto-select pool) from a file path.
 menu_import_json() {
+    fallback_confirm_manual || return 0
     echo "Provide the Xray JSON profile. Place the file on the gateway (e.g. via"
     echo "scp) and enter its path, or paste the JSON and end with a line of just EOF."
     printf 'File path (blank to paste instead): '
@@ -3648,7 +3659,9 @@ menu_awg() {
     case "${_awg_choice:-0}" in
         1) menu_awg_create ;;
         2) awg_list ;;
-        3) if awg_choose 'Profile number to select: '; then locked_call awg_select "$AWG_CHOICE_ID"; fi ;;
+        3) if fallback_confirm_manual && awg_choose 'Profile number to select: '; then
+               locked_call awg_select "$AWG_CHOICE_ID"
+           fi ;;
         4) menu_awg_edit ;;
         5) if awg_choose 'Profile number to rename: ' allow; then
                printf 'New display name: '; read -r _awg_name || true
@@ -3662,6 +3675,260 @@ menu_awg() {
         0|"") : ;;
         *) c_red "invalid choice" ;;
     esac
+}
+
+# --------------------------------------------------------------------------
+# Fallback pool menu
+# --------------------------------------------------------------------------
+# Asked before a node is chosen by hand while the watchdog runs.
+fallback_confirm_manual() {
+    load_settings
+    [ "$FALLBACK" = on ] || return 0
+    printf 'Fallback is on; choosing a node yourself turns it off. Continue? [y/N]: '
+    read -r _fc || true
+    [ "${_fc:-}" = y ] && return 0
+    c_ylw "Cancelled."
+    return 1
+}
+
+fallback_timing_text() {
+    case "$FB_INTERVAL/$FB_DOWN/$FB_UP/$FB_TIMEOUT" in
+        10/3/3/5) _tn=fast ;; 20/3/5/5) _tn=balanced ;; 60/3/5/5) _tn=relaxed ;; *) _tn=custom ;;
+    esac
+    printf '%s (every %s s, offline after %s failed checks, online after %s good ones, %s s per check)' \
+        "$_tn" "$FB_INTERVAL" "$FB_DOWN" "$FB_UP" "$FB_TIMEOUT"
+}
+
+fallback_show() {   # [a draft pool: shown without the live pool's results]
+    if [ -n "${1:-}" ]; then set -- "$1" "$RUN_DIR/none" "$RUN_DIR/none"
+    else set -- "$FB_POOL" "$FB_STATE" "$FB_LAST"; fi
+    PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKFALLBACK" show --pool "$1" --state "$2" --last "$3" \
+        --selected "$SUB_SELECTED_META" --subs-dir "$SUB_DIR" \
+        || c_red "The pool cannot be read; set up a new one with 1."
+}
+
+menu_fallback() {
+    load_settings
+    if [ "$FALLBACK" = on ]; then _fo="ON"; else _fo="off"; fi
+    if [ "$FB_RETURN" = on ]; then _fr="returns to higher priority"; else _fr="stays on the node it switched to"; fi
+    echo "Fallback: $_fo — $(fallback_timing_text), $_fr"
+    fallback_show
+    echo
+    echo " 1. Set up a new pool (wizard)"
+    echo " 2. Add a node"
+    echo " 3. Remove a node"
+    echo " 4. Change priority order"
+    echo " 5. Timing"
+    echo " 6. Return to higher priority: $FB_RETURN"
+    echo " 7. Test all pool nodes now"
+    echo " 8. Turn fallback on/off"
+    echo " 0. Back"
+    printf 'Choice: '
+    read -r _s || true
+    echo
+    case "${_s:-0}" in
+        1) fallback_wizard ;;
+        2) fallback_menu_add ;;
+        3) printf 'Position to remove: '; read -r _fp || true
+           if [ -n "${_fp:-}" ]; then locked_call fallback_remove "$_fp"; else c_ylw "Cancelled."; fi ;;
+        4) printf 'New order (e.g. 2 1 3): '; read -r _fo || true
+           # shellcheck disable=SC2086 # each position is its own argument
+           if [ -n "${_fo:-}" ]; then locked_call fallback_order $_fo; else c_ylw "Unchanged."; fi ;;
+        5) if fallback_ask_timing; then locked_call fallback_set_timing "$_ti" "$_td" "$_tu" "$_tt"; fi ;;
+        6) locked_call fallback_toggle_return ;;
+        7) fallback_test ;;
+        8) if [ "$FALLBACK" = on ]; then locked_call fallback_switch off; else fallback_turn_on; fi ;;
+        0|"") : ;;
+        *) c_red "invalid choice" ;;
+    esac
+}
+
+# Ask for a number in a range until one is given; sets _fa.
+_fallback_ask() {   # <prompt> <min> <max> [default]
+    while :; do
+        printf '%s (%s-%s)%s: ' "$1" "$2" "$3" "${4:+ [$4]}"
+        read -r _fa || return 1
+        _fa="${_fa:-${4:-}}"
+        [ -n "$_fa" ] || return 1
+        if _in_range "$_fa" "$2" "$3"; then return 0; fi
+        c_red "Enter a number from $2 to $3."
+    done
+}
+
+# Choose timing; sets _ti _td _tu _tt (interval, offline after, online after, timeout).
+fallback_ask_timing() {
+    echo "Timing (when a node counts as offline and back online):"
+    echo " 1. Fast      check every 10 s, offline after 3 failed checks (~30 s), online after 3 good ones"
+    echo " 2. Balanced  check every 20 s, offline after 3 failed checks (~1 min), online after 5 good ones"
+    echo " 3. Relaxed   check every 60 s, offline after 3 failed checks (~3 min), online after 5 good ones"
+    echo " 4. Custom"
+    printf 'Choice [Enter = 2]: '
+    read -r _tc || true
+    _tt=5
+    case "${_tc:-2}" in
+        1) _ti=10; _td=3; _tu=3 ;;
+        2) _ti=20; _td=3; _tu=5 ;;
+        3) _ti=60; _td=3; _tu=5 ;;
+        4) _fallback_ask "Check every N seconds" 5 600 "$FB_INTERVAL" || return 1; _ti="$_fa"
+           _fallback_ask "Offline after N failed checks in a row" 1 20 "$FB_DOWN" || return 1; _td="$_fa"
+           _fallback_ask "Back online after N good checks in a row" 1 50 "$FB_UP" || return 1; _tu="$_fa"
+           _fallback_ask "Seconds per check" 2 30 "$FB_TIMEOUT" || return 1; _tt="$_fa" ;;
+        *) c_red "invalid choice"; return 1 ;;
+    esac
+}
+
+# Pick a node into a pool file; 1 when the user cancels.
+fallback_pick_node() {   # <pool file> <position>
+    while :; do
+        _fid="$(sub_choose)" || return 1
+        sub_list "$_fid" "$1"
+        printf 'Node number (Enter = cancel): '
+        read -r _fn || true
+        [ -n "${_fn:-}" ] || return 1
+        case "$_fn" in *[!0-9]*) c_red "Enter the node's number."; continue ;; esac
+        if py "$MKFALLBACK" add --pool "$1" --sub "$_fid" --catalog "$SUB_DIR/$_fid/catalog.json" \
+                --index "$_fn" --position "$2"; then
+            return 0
+        fi
+    done
+}
+
+# Nothing is saved until the last answer; an empty answer cancels.
+fallback_wizard() {
+    sub_any || { c_ylw "Add a subscription first (main menu 2)."; return 0; }
+    ensure_run_dir
+    _draft="$RUN_DIR/fallback.draft"; rm -f "$_draft"
+    _fallback_ask "How many nodes in the pool?" 2 10 || { c_ylw "Cancelled; the pool is unchanged."; return 0; }
+    _cnt="$_fa"; _slot=1
+    while [ "$_slot" -le "$_cnt" ]; do
+        echo; c_bold "Priority $_slot of $_cnt:"
+        fallback_pick_node "$_draft" "$_slot" || { c_ylw "Cancelled; the pool is unchanged."; return 0; }
+        _slot=$((_slot + 1))
+    done
+    echo; fallback_show "$_draft"
+    while :; do
+        printf 'New order (e.g. 1 3 2), Enter to keep: '
+        read -r _ord || true
+        [ -n "${_ord:-}" ] || break
+        # shellcheck disable=SC2086 # each position is its own argument
+        if py "$MKFALLBACK" order --pool "$_draft" $_ord; then break; fi
+    done
+    fallback_ask_timing || { c_ylw "Cancelled; the pool is unchanged."; return 0; }
+    printf 'Return to a higher-priority node when it is back online? [Y/n]: '
+    read -r _fret || true
+    case "${_fret:-y}" in n|N) _fret=off ;; *) _fret=on ;; esac
+    printf 'Turn fallback on now? [Y/n]: '
+    read -r _fon || true
+    locked_call fallback_install "$_draft" "$_ti" "$_td" "$_tu" "$_tt" "$_fret" || return 0
+    case "${_fon:-y}" in
+        n|N) locked_call fallback_switch off; c_grn "Pool saved. Turn fallback on with 8 when you want it." ;;
+        *) fallback_turn_on ;;
+    esac
+}
+
+fallback_menu_add() {
+    sub_any || { c_ylw "Add a subscription first (main menu 2)."; return 0; }
+    ensure_run_dir
+    _draft="$RUN_DIR/fallback.draft"; rm -f "$_draft"
+    if [ -s "$FB_POOL" ]; then cp "$FB_POOL" "$_draft" || return 0; fi
+    _fcount="$(py "$MKFALLBACK" count --pool "$_draft" | cut -d' ' -f2)" || return 0
+    _fallback_ask "Position in the pool" 1 "$((_fcount + 1))" "$((_fcount + 1))" || { c_ylw "Cancelled."; return 0; }
+    _fpos="$_fa"
+    fallback_pick_node "$_draft" "$_fpos" || { c_ylw "Cancelled."; return 0; }
+    locked_call fallback_save_pool "$_draft"
+}
+
+fallback_test() {
+    [ -s "$FB_POOL" ] || { c_ylw "The pool is empty: set one up with 1."; return 0; }
+    echo "Checking every pool node through its own test core..."
+    mkdir -p "$INGRESS_RUN"
+    PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKFALLBACK" test --pool "$FB_POOL" --state "$FB_STATE" \
+        --subs-dir "$SUB_DIR" --cli "$BIN_DIR/proxy-unifi" --timeout "$FB_TIMEOUT"
+}
+
+# Check every node, turn the watchdog on, and run it once right away: it
+# applies the highest-priority node that answers.
+fallback_turn_on() {
+    _fusable="$(py "$MKFALLBACK" count --pool "$FB_POOL" 2>/dev/null | cut -d' ' -f1)"
+    [ "${_fusable:-0}" -ge 2 ] || { c_red "The pool needs at least 2 nodes (set one up with 1)."; return 0; }
+    fallback_test
+    locked_call fallback_switch on || return 0
+    # The journal's priority prefix means nothing on a terminal.
+    fallback_check | sed 's/^<5>fallback: /  /'
+    c_grn "Fallback is on."
+}
+
+# --- the locked halves of the menu actions (each in its own transaction) ---
+_fallback_timing_ok() {   # <interval> <down> <up> <timeout>
+    _in_range "$1" 5 600 && _in_range "$2" 1 20 && _in_range "$3" 1 50 && _in_range "$4" 2 30
+}
+
+fallback_install() {   # <draft> <interval> <down> <up> <timeout> <return on|off>
+    _fallback_timing_ok "$2" "$3" "$4" "$5" || fatal "timing values are out of range"
+    case "$6" in on|off) : ;; *) fatal "return must be on or off" ;; esac
+    py "$MKFALLBACK" count --pool "$1" >/dev/null || fatal "the new pool is malformed"
+    txn_begin
+    atomic_write "$FB_POOL" 600 < "$1" || fatal "could not save the pool"
+    FB_INTERVAL="$2"; FB_DOWN="$3"; FB_UP="$4"; FB_TIMEOUT="$5"; FB_RETURN="$6"
+    save_settings
+    if [ "$FALLBACK" = on ]; then write_fallback_timer || fatal "could not update the fallback timer"; fi
+    txn_commit
+}
+
+fallback_save_pool() {   # <draft>
+    py "$MKFALLBACK" count --pool "$1" >/dev/null || fatal "the new pool is malformed"
+    txn_begin
+    atomic_write "$FB_POOL" 600 < "$1" || fatal "could not save the pool"
+    txn_commit
+    c_grn "Pool saved."
+}
+
+fallback_remove() {   # <position>
+    _uint "${1:-}" || fatal "enter a position number"
+    txn_begin
+    py "$MKFALLBACK" remove --pool "$FB_POOL" --position "$1" || fatal "the pool is unchanged"
+    _fusable="$(py "$MKFALLBACK" count --pool "$FB_POOL" | cut -d' ' -f1)"
+    if [ "$FALLBACK" = on ] && [ "${_fusable:-0}" -lt 2 ]; then
+        fallback_set off
+        c_ylw "Fallback turned off: fewer than 2 pool nodes remain."
+    fi
+    txn_commit
+    c_grn "Removed position $1."
+}
+
+fallback_order() {   # <position>...
+    txn_begin
+    py "$MKFALLBACK" order --pool "$FB_POOL" "$@" || fatal "the order is unchanged"
+    txn_commit
+    c_grn "Priority order updated."
+}
+
+fallback_set_timing() {   # <interval> <down> <up> <timeout>
+    _fallback_timing_ok "$1" "$2" "$3" "$4" || fatal "timing values are out of range"
+    txn_begin
+    FB_INTERVAL="$1"; FB_DOWN="$2"; FB_UP="$3"; FB_TIMEOUT="$4"
+    save_settings
+    if [ "$FALLBACK" = on ]; then
+        write_fallback_timer || fatal "could not update the fallback timer"
+        systemctl restart "$FB_SERVICE_NAME.timer" >/dev/null 2>&1 || fatal "could not restart the fallback timer"
+    fi
+    txn_commit
+    c_grn "Timing: $(fallback_timing_text)."
+}
+
+fallback_toggle_return() {
+    txn_begin
+    if [ "$FB_RETURN" = on ]; then FB_RETURN=off; else FB_RETURN=on; fi
+    save_settings
+    txn_commit
+    c_grn "Return to higher priority: $FB_RETURN."
+}
+
+fallback_switch() {   # on|off
+    txn_begin
+    fallback_set "$1"
+    txn_commit
+    [ "$1" = on ] || c_ylw "Fallback is off. The pool is kept."
 }
 
 # Interactive subscriptions submenu.
@@ -3685,7 +3952,8 @@ menu_sub() {
     read -r _s || true
     echo
     case "${_s:-0}" in
-        1) _id="$(sub_choose)" || return 0
+        1) fallback_confirm_manual || return 0
+           _id="$(sub_choose)" || return 0
            sub_list "$_id"; echo; printf 'Node number to select: '; read -r _n || true
            if [ -n "${_n:-}" ]; then locked_call sub_select "$_id" "$_n"; else c_ylw "Cancelled."; fi ;;
         2) _id="$(sub_choose)" || return 0
@@ -3903,13 +4171,13 @@ sub_add() {
     sub_list "$_new"
 }
 
-sub_list() {   # <subscription id>
+sub_list() {   # <subscription id> [pool file whose priorities to show]
     _lc="$SUB_DIR/$1/catalog.json"
     [ -f "$_lc" ] || fatal "subscription $1 has no nodes yet (refresh it)"
     _sel=""
     [ "$(sub_selected_sub)" != "$1" ] || _sel="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
     PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKSUB" render --file "$_lc" --selected "$_sel" \
-        --pool "$FB_POOL" --sub "$1"
+        --pool "${2:-$FB_POOL}" --sub "$1"
 }
 
 sub_select() {   # <subscription id> <node number>
