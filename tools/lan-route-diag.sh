@@ -52,20 +52,22 @@ except (OSError, ValueError) as error:
 PY
 
 [ -n "$PC" ] || { echo; echo "(pass the PC's IP address to also watch its traffic)"; exit 0; }
+W="$(mktemp -d)" || exit 1
+trap 'rm -rf "$W"' EXIT
 snap() {
-    iptables -L FORWARD -v -x -n | awk '/pu-lr0/ { printf "forward %s %s; ", ($0 ~ /ctdir/ ? "replies" : "dropped"), $1 }'
+    iptables -L FORWARD -v -x -n | awk '/pu-lr0/ && $3 == "DROP" { d += $1 } END { printf "pair drops %d; ", d }'
     nstat -az TcpRetransSegs TcpExtTCPTimeouts 2>/dev/null | awk 'NR > 1 { printf "%s %s; ", $1, $2 }'; echo
 }
 say "watching $PC for 30 s: browse or run a speed test on the PC NOW"
-snap > /tmp/lrd.before
+snap > "$W"/lrd.before
 sizes() { timeout 30 tcpdump -ni "$1" -Q "$2" -q "dst host $PC and not port 53" 2>/dev/null \
     | awk '{ n++; l = $NF + 0; if (l > m) m = l } END { printf "%d packets, largest %d bytes\n", n, m }'; }
-sizes pu-lr0 in > /tmp/lrd.in & sizes "$LANDEV" out > /tmp/lrd.out &
+sizes pu-lr0 in > "$W"/lrd.in & sizes "$LANDEV" out > "$W"/lrd.out &
 timeout 30 tcpdump -nvi "$LANDEV" -c 12 "host $PC and tcp[tcpflags] & tcp-syn != 0" 2>/dev/null \
-    | grep -oE '[0-9.]+ > [0-9.]+|mss [0-9]+' | paste - - > /tmp/lrd.syn
+    | grep -oE '[0-9.]+ > [0-9.]+|mss [0-9]+' | paste - - > "$W"/lrd.syn
 wait
-snap > /tmp/lrd.after
-echo "to the PC from the pair (pu-lr0 in):  $(cat /tmp/lrd.in)"
-echo "to the PC on the LAN ($LANDEV out):      $(cat /tmp/lrd.out)"
-echo "connection setups (address > address, MSS):"; sed 's/^/  /' /tmp/lrd.syn
-echo "before: $(cat /tmp/lrd.before)"; echo "after:  $(cat /tmp/lrd.after)"
+snap > "$W"/lrd.after
+echo "to the PC from the pair (pu-lr0 in):  $(cat "$W"/lrd.in)"
+echo "to the PC on the LAN ($LANDEV out):      $(cat "$W"/lrd.out)"
+echo "connection setups (address > address, MSS):"; sed 's/^/  /' "$W"/lrd.syn
+echo "before: $(cat "$W"/lrd.before)"; echo "after:  $(cat "$W"/lrd.after)"
