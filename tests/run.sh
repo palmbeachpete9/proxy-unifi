@@ -12,6 +12,7 @@
 # Usage:
 #   tests/run.sh             # static + parser tests (+ engine tests if cached)
 #   tests/run.sh --download  # also fetch xray/sing-box into tests/.cache first
+#   PROXY_UNIFI_QUICK=1 tests/run.sh ...  # skip the slow end-to-end runs (CI on every push)
 #
 # Exit non-zero if any test fails. POSIX sh.
 # NOTE: no 'set -e' — individual tests are expected to fail without aborting the run.
@@ -1682,8 +1683,10 @@ print(json.dumps(c))' "http://127.0.0.1:$_wp/slow" > "$_d/race-core.json"
     else bad "ping's pool core answers before the balancer's health check (got: $_code)"; fi
     rm -rf "$_d"
 
+    if [ "${PROXY_UNIFI_QUICK:-}" = 1 ]; then
+        printf '  skip sandboxed CLI lifecycle (deferred: PROXY_UNIFI_QUICK=1)\n'
     # Traced so a failure's tail names the step that broke (set -e stops there).
-    if sh -x "$ROOT/tests/lifecycle.sh" "$XR" >"$_d.lifecycle" 2>&1; then ok "sandboxed CLI lifecycle + rollback"
+    elif sh -x "$ROOT/tests/lifecycle.sh" "$XR" >"$_d.lifecycle" 2>&1; then ok "sandboxed CLI lifecycle + rollback"
     else bad "sandboxed CLI lifecycle + rollback"; tail -n 20 "$_d.lifecycle"; fi
     rm -f "$_d.lifecycle"
 }
