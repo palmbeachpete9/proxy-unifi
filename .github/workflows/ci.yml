@@ -17,8 +17,10 @@ on:
 permissions:
   contents: read
 
+# A newer push replaces an older push's run, but never a full run (nightly,
+# pull request, or on demand) of the same branch.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
