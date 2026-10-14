@@ -160,6 +160,24 @@ def _primary_inbound(cfg):
     die("profile has no SOCKS inbound that the WireGuard overlay can reproduce")
 
 
+def _primary_tag(ib):
+    return str(ib.get("tag", "") or "socks") if isinstance(ib, dict) else "socks"
+
+
+def _rule_applies(rule, primary_tag):
+    """Whether a routing rule can match traffic from the primary inbound, the
+    only one the overlay keeps. Rules naming only other inbounds (the HTTP or
+    DNS entry points a provider's app also opens) never matched it, so they
+    are dropped; rules naming it among others still apply."""
+    refs = rule.get("inboundTag")
+    if refs is None:
+        return True
+    refs = [refs] if isinstance(refs, str) else refs
+    if not isinstance(refs, list) or not all(isinstance(tag, str) for tag in refs):
+        die("routing inboundTag must be a string or array of strings")
+    return primary_tag in refs
+
+
 def _balancer_info(cfg):
     """(member_count, strategy_type, balancer_tag) for a balancer profile, or
     (0, '', '') if there is no balancer (a plain multi-outbound profile)."""
@@ -217,7 +235,7 @@ def validate_profile(cfg):
         tag = inbound.get("tag")
         if tag not in (None, ""):
             _safe_text(tag, "inbound tag")
-    primary_tag = str(ib.get("tag", "") or "socks")
+    primary_tag = _primary_tag(ib)
     routing = cfg.get("routing", {})
     if routing is not None and not isinstance(routing, dict):
         die("profile routing must be an object")
@@ -225,19 +243,13 @@ def validate_profile(cfg):
     rules = routing.get("rules", [])
     if not isinstance(rules, list):
         die("profile routing.rules must be an array")
+    if not all(isinstance(r, dict) for r in rules):
+        die("profile has a malformed routing rule")
+    rules = [r for r in rules if _rule_applies(r, primary_tag)]
     for r in rules:
-        if not isinstance(r, dict):
-            die("profile has a malformed routing rule")
         if r.get("user") or r.get("source") or r.get("sourcePort"):
             die("profile routing depends on source/user identity, which a "
                 "WireGuard entry cannot reproduce; not supported")
-        refs = r.get("inboundTag")
-        if refs is not None:
-            refs = [refs] if isinstance(refs, str) else refs
-            if not isinstance(refs, list) or not all(isinstance(tag, str) for tag in refs):
-                die("routing inboundTag must be a string or array of strings")
-            if any(tag != primary_tag for tag in refs):
-                die("profile routing references an inbound removed by the WireGuard overlay")
 
     balancers = routing.get("balancers", [])
     if balancers is not None and not isinstance(balancers, list):
@@ -406,13 +418,19 @@ def sanitize_provider(cfg):
     # Only top-level keys and the log object are changed, so a shallow copy
     # avoids duplicating every outbound/balancer in a potentially large profile.
     out = dict(cfg)
+    routing = out.get("routing")
+    if isinstance(routing, dict) and isinstance(routing.get("rules"), list):
+        primary_tag = _primary_tag(_primary_inbound(cfg)[1])
+        out["routing"] = dict(routing, rules=[r for r in routing["rules"]
+                                              if _rule_applies(r, primary_tag)])
     # SECURITY: the provider's local entry inbound is replaced by our loopback
     # WireGuard inbound (the overlay supplies it, carrying the primary tag). Drop
     # ALL provider inbounds so a hostile/compromised profile cannot smuggle extra
     # listeners -- an open socks/http relay or a dokodemo-door to the LAN /
     # cloud-metadata -- that the by-tag overlay merge would otherwise leave running
-    # as root. Routing rules key off balancerTag/outboundTag, not the dropped
-    # inbounds, so balancer/observatory resolution is unaffected.
+    # as root. Rules for those inbounds go with them (see _rule_applies); the
+    # rest key off balancerTag/outboundTag, so balancer/observatory resolution
+    # is unaffected.
     out.pop("inbounds", None)
     # Strip service blocks that can open control surfaces or outbound bridges even
     # without an inbound (api/stats/metrics/policy control planes; reverse tunnels).
@@ -479,7 +497,7 @@ def cmd_overlay(args):
         die("WireGuard keepalive is out of range")
     if args.loglevel not in ("debug", "info", "warning", "error", "none"):
         die("invalid loglevel")
-    primary_tag = str(ib.get("tag", "") or "socks") if isinstance(ib, dict) else "socks"
+    primary_tag = _primary_tag(ib)
     sniffing = ib.get("sniffing") if isinstance(ib, dict) else None
     provider = sanitize_provider(cfg)
     overlay = build_overlay(args, primary_tag, sniffing)
@@ -527,7 +545,7 @@ def cmd_socksconfig(args):
     so 'via proxy' latency can be measured for a pool the same way as a link."""
     cfg = _load(args.profile)
     _, ib = validate_profile(cfg)
-    primary_tag = str(ib.get("tag", "") or "socks") if isinstance(ib, dict) else "socks"
+    primary_tag = _primary_tag(ib)
     sniffing = ib.get("sniffing") if isinstance(ib, dict) else None
     out = sanitize_provider(cfg)
     inbound = {"tag": primary_tag, "listen": "127.0.0.1", "port": args.socks_port,
