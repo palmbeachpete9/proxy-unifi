@@ -1190,14 +1190,33 @@ try:
     mkjson.validate_profile(unsafe); raise AssertionError("accepted provider local file")
 except SystemExit:
     pass
-# rules tied to a removed secondary inbound must not silently change semantics
-removed = json.loads(json.dumps(prof))
-removed["inbounds"].append({"tag":"http","protocol":"http"})
-removed["routing"]["rules"].append({"type":"field","inboundTag":["http"],"outboundTag":"proxy"})
-try:
-    mkjson.validate_profile(removed); raise AssertionError("accepted removed inbound dependency")
-except SystemExit:
-    pass
+# Provider apps open more inbounds (HTTP, DNS, API). Rules naming only those
+# never matched SOCKS traffic: they are dropped, even ones that would fail
+# validation; rules naming SOCKS among others still apply.
+multi = json.loads(json.dumps(prof))
+multi["inbounds"] += [{"tag":"http","protocol":"http"}, {"tag":"dns-in","protocol":"dokodemo-door"}]
+both = {"type":"field","inboundTag":["socks","http"],"domain":["geosite:private"],"outboundTag":"direct"}
+multi["routing"]["rules"] = [both,
+    {"type":"field","inboundTag":["http"],"outboundTag":"direct"},
+    {"type":"field","inboundTag":"api","outboundTag":"api"},
+    {"type":"field","inboundTag":["dns-in"],"source":["10.0.0.0/8"],"outboundTag":"direct"}] \
+    + multi["routing"]["rules"]
+mkjson.validate_profile(multi)
+assert mkjson.sanitize_provider(multi)["routing"]["rules"] == [both] + prof["routing"]["rules"]
+assert len(multi["routing"]["rules"]) == 5  # source profile stays immutable
+import mksub
+ok, warning = mksub._classify_profile(multi)[:2]
+assert ok and warning == "provider routing permits direct bypass", (ok, warning)
+multi["routing"]["rules"].pop(0)
+assert mksub._classify_profile(multi)[:2] == (True, ""), "a dropped rule caused a bypass warning"
+# ...but a rule that applies to SOCKS keeps every check
+for applies in ({"type":"field","inboundTag":["socks","http"],"source":["10.0.0.0/8"],"outboundTag":"direct"},
+                {"type":"field","inboundTag":"socks","outboundTag":"api"}):
+    bad = json.loads(json.dumps(multi)); bad["routing"]["rules"].append(applies)
+    try:
+        mkjson.validate_profile(bad); raise AssertionError("accepted %r" % applies)
+    except SystemExit:
+        pass
 # references to missing graph nodes must not survive into an ambiguously routed profile
 missing = json.loads(json.dumps(prof))
 missing["routing"]["rules"][0]["balancerTag"] = "missing"

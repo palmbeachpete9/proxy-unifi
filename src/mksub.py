@@ -40,7 +40,7 @@ from proxylib import (die, display_width, dispatch_subcommand, is_non_public_hos
                       terminal_emoji_fallback,
                       nested_too_deep, xray_outbound_servers,
                       shadowsocks_method_password, shadowsocks_engine)
-from mkjson import validate_profile
+from mkjson import sanitize_provider, validate_profile
 # Network-only modules (ssl, http.client, socket, time, urljoin) are
 # imported lazily inside fetch_url()/_https_get()/_public_ips(); the hot local
 # subcommands (render/extract/match) never touch the
@@ -554,7 +554,8 @@ def _classify_profile(prof):
         return False, reason or "profile is not supported by the WireGuard overlay", 0, "", []
     outs = prof["outbounds"]
     servers = [host for outbound in outs for host, _port in xray_outbound_servers(outbound)]
-    routing = prof.get("routing") or {}
+    # The rules that remain once the overlay keeps only the primary inbound.
+    routing = sanitize_provider(prof).get("routing") or {}
     bals = routing.get("balancers") or []
     tags = [str(outbound.get("tag", "")) for outbound in outs]
     members, strategies = 0, []
