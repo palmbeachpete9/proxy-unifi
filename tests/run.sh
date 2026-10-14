@@ -1430,6 +1430,32 @@ with tempfile.TemporaryDirectory() as tmp:
     assert fb.load_state(bad)["nodes"] == {}
 PY
 
+    # A switch the CLI refuses as stale (the user acted during the run) ends the
+    # run: no other candidate is tried and no switch is recorded.
+    py_case "mkfallback: a stale switch ends the run" "$SRC" <<'PY'
+import json, os, subprocess, sys, tempfile
+src = sys.argv[1]; sys.path.insert(0, src)
+import mkfallback as fb
+with tempfile.TemporaryDirectory() as tmp:
+    pool = os.path.join(tmp, "fallback.json")
+    fb.save_pool(pool, [{"sub": "1", "meta": {"id": c * 64, "label": c, "kind": "link", "scheme": "vless",
+                                             "server": "s"}, "missing": False} for c in "ab"])
+    cli = os.path.join(tmp, "cli")
+    with open(cli, "w") as fh:
+        fh.write('#!/bin/sh\ncase "$1" in _fallback-probe) echo "ok 9" ;;\n'
+                 '_fallback-apply) echo x >> "%s/applies"; echo "the active node changed"; exit 3 ;; esac\n' % tmp)
+    os.chmod(cli, 0o755)
+    out = subprocess.run([sys.executable, os.path.join(src, "mkfallback.py"), "run", "--pool", pool,
+                          "--state", os.path.join(tmp, "state"), "--last", os.path.join(tmp, "last"),
+                          "--selected", os.path.join(tmp, "none.json"), "--cli", cli, "--down", "3",
+                          "--up", "5", "--return", "on", "--timeout", "5"],
+                         stdout=subprocess.PIPE, universal_newlines=True)
+    assert out.returncode == 0 and "skipped" in out.stdout, out
+    assert open(os.path.join(tmp, "applies")).read().count("x") == 1
+    assert not os.path.exists(os.path.join(tmp, "last"))
+    assert json.load(open(os.path.join(tmp, "state")))["note"] == ""
+PY
+
     # mkawg: AWG 1.5-3.1 parser, bridge generator, profile catalog, and UI safety.
     py_case "mkawg parser and UI corpus" "$SRC" <<'PY'
 import base64
@@ -2327,7 +2353,7 @@ print(json.dumps(c))' "http://127.0.0.1:$_wp/slow" > "$_d/race-core.json"
     printf 'vless://b831381d-6324-4d53-ad4f-8cda48b30811@127.0.0.1:9?security=none&type=tcp#probe' > "$_pd/link"
     {
         cat <<SH
-XRAY='$XR'; MKXRAY='$SRC/mkxray.py'; SAFEEXEC='$SRC/safeexec.py'
+XRAY='$XR'; MKXRAY='$SRC/mkxray.py'; MKJSON='$SRC/mkjson.py'; SAFEEXEC='$SRC/safeexec.py'
 OUTBOUND_LINK='$_pd/link'; RUN_DIR='$_pd'; PING_TIMEOUT=5; INGRESS_ACTIVE='$_pd/none'
 SH
         cat <<'SH'
@@ -2343,7 +2369,7 @@ chown() { :; }   # the CLI hands the run dir to root; CI does not run as root
 SH
         sed -n '/^py_bin() {/,/^}/p; /^_free_port() {/,/^}/p; /^_ping_cleanup() {/,/^}/p' "$SRC/proxy-unifi"
         sed -n '/^_socket_listening() {/,/^tcp_socket_listening()/p; /^_probe_start() {/,/^}/p' "$SRC/proxy-unifi"
-        sed -n '/^_ms_from_seconds() {/,/^}/p; /^ping_proxy() {/,/^}/p' "$SRC/proxy-unifi"
+        sed -n '/^_ms_from_seconds() {/,/^}/p; /^ping_proxy() {/,/^}/p; /^_http_probe() {/,/^}/p' "$SRC/proxy-unifi"
         sed -n '/^service_healthy() {/,/^}/p; /^socket_owned_by_pid() {/,/^}/p; /^ingress_active() {/p' "$SRC/proxy-unifi"
     } > "$_pd/lib.sh"
     {
@@ -2388,15 +2414,23 @@ unifi_client_if() { echo "$_if"; }
 systemctl() { printf "ActiveState=active\nMainPID=%s\n" "$_core"; }
 ping_proxy get' sh "$_pd/lib.sh" "$_lo" "$(cat "$_pd/core.port" 2>/dev/null)" "$_core" 2>&1)"
     _alive=0; kill -0 "$_core" 2>/dev/null && _alive=1
+    # The fallback watchdog checks a pool node that is not active through a
+    # test core built for that node.
+    printf '%s' '{"inbounds":[{"tag":"socks","protocol":"socks","listen":"127.0.0.1","port":10808}],"outbounds":[{"protocol":"freedom","tag":"proxy"}]}' \
+        > "$_pd/node.json"
+    # shellcheck disable=SC2016 # $1-$2 expand inside the child shell.
+    _node="$(sh -c '. "$1"; _probe_start 30 256 xraypool "$2" || exit 1
+_http_probe -X GET --proxy "${_proxy_scheme}://127.0.0.1:${_port}" "$PING_URL"; _ping_cleanup
+echo "$_rc $_code"' sh "$_pd/lib.sh" "$_pd/node.json" 2>&1)"
     unset PING_URL
     kill "$_web" "$_core" 2>/dev/null; wait "$_web" "$_core" 2>/dev/null
     if ! have ss; then printf '  skip proxy ping (ss not installed)\n'
     elif printf '%s\n' "$_dead" | grep -q '^via proxy (HEAD): failed (test core): .' \
          && ! printf '%s\n' "$_dead" | grep -q timeout \
          && printf '%s\n' "$_live" | grep -Eq '^via proxy \(GET\): [0-9]+ ms  \(HTTP 200, live tunnel '"$_lo"'\)$' \
-         && [ "$_alive" = 1 ]
-    then ok "proxy ping: a dead server's error, and the live tunnel leaves the core running"
-    else bad "proxy ping: a dead server's error, and the live tunnel leaves the core running (got: $_dead / $_live / core alive $_alive)"; fi
+         && [ "$_alive" = 1 ] && [ "$_node" = "0 200" ]
+    then ok "proxy ping: a dead server's error, the live tunnel leaves the core running, a pool node's own test core"
+    else bad "proxy ping: a dead server's error, the live tunnel leaves the core running, a pool node's own test core (got: $_dead / $_live / core alive $_alive / node $_node)"; fi
     rm -rf "$_pd"
 
     # Traced so a failure's tail names the step that broke (set -e stops there).

@@ -116,6 +116,8 @@ PING_MODE="get"
 PING_URL="https://www.gstatic.com/generate_204"
 PING_TIMEOUT="5"
 SUB_REFRESH_HOURS="6"
+FALLBACK="off"                    # on: the watchdog switches pool nodes (see "Fallback pool")
+FB_TIMEOUT="5"                    # seconds per check
 SUB_USER_AGENT_DEFAULT="Happ/2.0"
 SUB_USER_AGENT_LEGACY_DEFAULT="proxy-unifi/1.1"
 SUB_USER_AGENT="$SUB_USER_AGENT_DEFAULT"
@@ -2727,9 +2729,11 @@ _ping_cleanup() {
 # Start a throwaway core that exposes the active outbound on a free loopback
 # SOCKS port, under the service account and the safe validator's limits. Sets
 # _port, _proxy_scheme, _pid and _cfg; the caller stops it with _ping_cleanup.
-# $1 = safeexec time budget (seconds), $2 = resident-memory limit (MB)
+# $1 = safeexec time budget (seconds), $2 = resident-memory limit (MB); for a
+# node other than the active one, $3 = its engine (xray, singbox or xraypool)
+# and $4 = its link or profile file.
 _probe_start() {
-    _probe_budget="$1"; _probe_mem="$2"; _e="$(current_engine)"
+    _probe_budget="$1"; _probe_mem="$2"; _e="${3:-$(current_engine)}"; _src="${4:-}"
     _proxy_scheme="socks5h"
     _port="$(_free_port)"
     ensure_run_dir
@@ -2738,8 +2742,8 @@ _probe_start() {
         # balancer/pool: expose the provider's outbounds through a local SOCKS
         # inbound so we measure latency through the same balancer xray uses live.
         [ -x "$XRAY" ] || { err "xray binary not installed"; _ping_cleanup; return 1; }
-        [ -f "$POOL_SRC" ] || { err "no pool profile on disk"; _ping_cleanup; return 1; }
-        py "$MKJSON" socksconfig --profile "$POOL_SRC" --socks-port "$_port" > "$_cfg" 2>/dev/null \
+        [ -f "${_src:-$POOL_SRC}" ] || { err "no pool profile on disk"; _ping_cleanup; return 1; }
+        py "$MKJSON" socksconfig --profile "${_src:-$POOL_SRC}" --socks-port "$_port" > "$_cfg" 2>/dev/null \
             || { err "could not build test config"; _ping_cleanup; return 1; }
         set -- "$XRAY" run -config "$_cfg" -format json
     elif [ "$_e" = "awg" ]; then
@@ -2755,12 +2759,12 @@ _probe_start() {
         set -- "$ABIN" run -c "$_cfg"
     elif [ "$_e" = "singbox" ]; then
         [ -x "$SBIN" ] || { err "sing-box not installed"; _ping_cleanup; return 1; }
-        py "$MKSB" --link-file "$OUTBOUND_LINK" --socks-port "$_port" > "$_cfg" 2>/dev/null \
+        py "$MKSB" --link-file "${_src:-$OUTBOUND_LINK}" --socks-port "$_port" > "$_cfg" 2>/dev/null \
             || { err "could not build test config"; _ping_cleanup; return 1; }
         set -- "$SBIN" run -c "$_cfg"
     else
         [ -x "$XRAY" ] || { err "xray binary not installed"; _ping_cleanup; return 1; }
-        py "$MKXRAY" --link-file "$OUTBOUND_LINK" --socks-port "$_port" > "$_cfg" 2>/dev/null \
+        py "$MKXRAY" --link-file "${_src:-$OUTBOUND_LINK}" --socks-port "$_port" > "$_cfg" 2>/dev/null \
             || { err "could not build test config"; _ping_cleanup; return 1; }
         set -- "$XRAY" run -config "$_cfg" -format json
     fi
@@ -2800,21 +2804,32 @@ ping_proxy() {   # $1 = get|head
         _probe_start "$((PING_TIMEOUT + 15))" 256 || return 1
         set -- "$@" --proxy "${_proxy_scheme}://127.0.0.1:${_port}"
     fi
-    # LC_ALL=C so curl prints time_total with a '.' decimal regardless of locale
-    _out="$(LC_ALL=C curl -sS -o /dev/null -w '%{http_code} %{time_total}\n' --max-time "$PING_TIMEOUT" \
-             "$@" "$PING_URL" 2>&1)" && _rc=0 || _rc=$?
+    _http_probe "$@" "$PING_URL"
     _ping_cleanup
     if [ "$_rc" = 28 ]; then c_red "${_label}: timeout (>${PING_TIMEOUT}s, ${_via})"; return 1; fi
-    if [ "$_rc" != 0 ]; then
-        _why="$(printf '%s\n' "$_out" | sed -n 's/^curl: ([0-9]*) //p' | head -n 1)"
-        c_red "${_label}: failed (${_via}): ${_why:-curl exit $_rc}"; return 1
-    fi
-    _out="$(printf '%s\n' "$_out" | tail -n 1)"
-    _code="${_out%% *}"; _ms="$(_ms_from_seconds "${_out##* }")"
+    if [ "$_rc" != 0 ]; then c_red "${_label}: failed (${_via}): ${_why}"; return 1; fi
     case "$_code" in
         204|200) c_grn "${_label}: ${_ms} ms  (HTTP ${_code}, ${_via})" ;;
         *)       c_ylw "${_label}: ${_ms} ms  (HTTP ${_code}, ${_via})" ;;
     esac
+}
+
+# Run curl for a probe (arguments: curl's, ending with the URL). Sets _rc, and
+# _code and _ms on success or _why (curl's error, or the timeout) on failure.
+_http_probe() {
+    # LC_ALL=C so curl prints time_total with a '.' decimal regardless of locale
+    _out="$(LC_ALL=C curl -sS -o /dev/null -w '%{http_code} %{time_total}\n' --max-time "$PING_TIMEOUT" \
+             "$@" 2>&1)" && _rc=0 || _rc=$?
+    _code=""; _ms=""; _why=""
+    if [ "$_rc" = 0 ]; then
+        _out="$(printf '%s\n' "$_out" | tail -n 1)"
+        _code="${_out%% *}"; _ms="$(_ms_from_seconds "${_out##* }")"
+    elif [ "$_rc" = 28 ]; then
+        _why="timeout (>${PING_TIMEOUT}s)"
+    else
+        _why="$(printf '%s\n' "$_out" | sed -n 's/^curl: ([0-9]*) //p' | head -n 1)"
+        _why="${_why:-curl exit $_rc}"
+    fi
 }
 
 # host<TAB>port of the server to probe directly: the link's server, or (in pool
@@ -4031,9 +4046,59 @@ sub_remove() {   # <subscription id>
     c_ylw "Subscription $1 removed (HWID kept). The active tunnel is unchanged."
 }
 
-# Until the fallback watchdog exists these keep the subscription code complete.
+# --------------------------------------------------------------------------
+# Fallback pool: one node's check and one switch, called back by mkfallback.py
+# while it runs the watchdog.
+# --------------------------------------------------------------------------
+# Prints "ok MS" or "fail ERROR". live: through the UniFi VPN client into the
+# running core ("fail nolive" without one); core: through a test core built for
+# that node alone.
+_fallback_probe() {   # <subscription id> <node id> <live|core>
+    sub_valid_id "${1:-}" || { echo "fail no such subscription"; return 0; }
+    PING_TIMEOUT="$FB_TIMEOUT"
+    if [ "${3:-}" = live ]; then
+        _wgif="$(unifi_client_if)"
+        if [ -z "$_wgif" ] || ! service_healthy; then echo "fail nolive"; return 0; fi
+        _http_probe -X GET -4 --noproxy '*' --interface "$_wgif" "$PING_URL"
+    else
+        ensure_run_dir
+        _row="$(py "$MKSUB" extract --file "$SUB_DIR/$1/catalog.json" --id "${2:-}" \
+            --meta-file "$RUN_DIR/fb.meta" --payload-file "$RUN_DIR/fb.payload" 2>/dev/null)" \
+            || { echo "fail missing from subscription"; return 0; }
+        case "$_row" in *"${TAB}1${TAB}"*) : ;; *) echo "fail not supported"; return 0 ;; esac
+        if [ "${_row##*"$TAB"}" = pool ]; then _fe=xraypool
+        else _fe="$(engine_for_link_file "$RUN_DIR/fb.payload")"; fi
+        _probe_start "$((FB_TIMEOUT + 15))" 256 "$_fe" "$RUN_DIR/fb.payload" 2>/dev/null \
+            || { echo "fail test core did not start"; return 0; }
+        _http_probe -X GET --proxy "${_proxy_scheme}://127.0.0.1:${_port}" "$PING_URL"
+        _ping_cleanup
+    fi
+    if [ "$_rc" = 0 ]; then echo "ok $_ms"; else echo "fail $_why"; fi
+}
+
+# Until the watchdog's settings exist these keep the subscription code complete.
 fallback_detach() { :; }
 fallback_set() { :; }
+
+# One watchdog switch, under the lock. A decision that went stale while the
+# run was checking (fallback turned off, the active node changed) exits 3.
+_fallback_apply() {   # <subscription id> <node id> <expected active node id, or -> <reason>
+    sub_valid_id "${1:-}" || fatal "no subscription ${1:-}"
+    case "${2:-}" in ""|*[!0-9a-f]*) fatal "invalid node id" ;; esac
+    [ "${#2}" = 64 ] || fatal "invalid node id"
+    [ "$FALLBACK" = on ] || { echo "fallback is off"; exit 3; }
+    _cur="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
+    [ "${_cur:--}" = "${3:-}" ] || { echo "the active node changed; not switching"; exit 3; }
+    _n="$(py - "$BIN_DIR" "$SUB_DIR/$1/catalog.json" "$2" <<'PYEOF' 2>/dev/null
+import sys
+sys.path.insert(0, sys.argv[1])
+import mksub
+print(next(n["n"] for n in mksub._load(sys.argv[2])["nodes"] if n["id"] == sys.argv[3]))
+PYEOF
+)" || fatal "the node is no longer in subscription $1"
+    _KEEP_FALLBACK=1 _QUIET=1 sub_select "$1" "$_n"
+    echo "switched"
+}
 
 
 cmd_uninstall() {
@@ -4092,6 +4157,8 @@ case "$cmd" in
     ""|status|logs|ping|bench|-h|--help|help|_fw-lock|_fw-unlock|_ingress-up|_ingress-down) : ;;
     # Takes the lock only to install each downloaded catalog.
     sub-refresh-auto) need_root ;;
+    # Read-only, and called while the watchdog decides: never waits for the lock.
+    _fallback-probe) need_root ;;
     *) need_root; acquire_lock; recover_transaction ;;
 esac
 load_settings
@@ -4119,6 +4186,8 @@ case "$cmd" in
     install-service) install_service ;;
     boot-recover)    boot_recover ;;
     _fw-reconcile)   fw_reconcile ;;
+    _fallback-probe) _fallback_probe "${1:-}" "${2:-}" "${3:-}" ;;
+    _fallback-apply) _fallback_apply "${1:-}" "${2:-}" "${3:-}" "${4:-}" ;;
     sub-refresh-auto)
         _AUTO_REFRESH=1
         ( locked_call sub_migrate ) || exit 1

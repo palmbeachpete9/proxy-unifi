@@ -274,6 +274,10 @@ def run_once(pool, state, active, cfg, probe, apply, now):
 
 
 # ---- CLI around the watchdog ---------------------------------------------
+class Stale(Exception):
+    """The CLI refused a switch: the user changed things while the run checked."""
+
+
 def _active(path):
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -310,7 +314,10 @@ def _cli_apply(cli, entry, expected, reason):
     except (OSError, subprocess.SubprocessError):
         return False, "switch did not finish"
     lines = [line for line in done.stdout.splitlines() if line.strip()]
-    return done.returncode == 0, (lines[-1][:80] if lines else "exit %d" % done.returncode)
+    why = lines[-1][:80] if lines else "exit %d" % done.returncode
+    if done.returncode == 3:
+        raise Stale(why)
+    return done.returncode == 0, why
 
 
 def _when(epoch):
@@ -338,10 +345,13 @@ def cmd_run(args):
     active = _active(args.selected)
     cfg = {"down": args.down, "up": args.up, "ret": args.ret == "on"}
     now = int(time.time())
-    log = run_once(pool, state, active, cfg,
-                   lambda i, kind: _cli_probe(args.cli, pool[i], kind, args.timeout),
-                   lambda i, reason: _cli_apply(args.cli, pool[i], active[1] if active else "", reason),
-                   now)
+    try:
+        log = run_once(pool, state, active, cfg,
+                       lambda i, kind: _cli_probe(args.cli, pool[i], kind, args.timeout),
+                       lambda i, reason: _cli_apply(args.cli, pool[i], active[1] if active else "", reason),
+                       now)
+    except Stale as e:
+        log = ["skipped: %s" % e]
     _write_json(args.state, state)
     for line in log:
         if line.startswith("switch "):
