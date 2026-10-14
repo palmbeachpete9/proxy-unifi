@@ -196,8 +196,12 @@ servers. Native TCP and UDP forwarding remain enabled by the core defaults.
 
 ## Subscriptions and JSON pools
 
-The subscription menu accepts HTTPS subscriptions containing plain-text or
-base64-encoded share links, plus Xray JSON client profiles with routing balancers.
+The Subscriptions menu keeps up to 20 HTTPS subscriptions at once, each with its
+own number, name (the provider's title, or the URL's host; you can rename it)
+and, if a provider needs one, its own User-Agent. To choose the active node you
+pick the subscription first, then the node (with a single subscription the first
+step is skipped). Subscriptions contain plain-text or base64-encoded share links,
+plus Xray JSON client profiles with routing balancers.
 Node names remain Unicode, including Cyrillic and emoji. Selecting a node applies
 it through the same validated import path as a single share link.
 Clash YAML, SIP008, sing-box JSON, WireGuard, AnyTLS, Naive, and SSH subscription
@@ -206,9 +210,12 @@ formats are not currently parsed.
 Each installation creates a random persistent device UUID and sends it as
 `x-hwid` to the subscription origin. The header is not forwarded across a
 cross-origin redirect. The default User-Agent is `Happ/2.0` and can be
-changed from the subscription menu for provider compatibility. A persistent
-systemd timer refreshes the catalog at the configured interval; if a selected
-node disappears or matches ambiguously, the active tunnel is kept unchanged.
+changed from the Subscriptions menu, for all subscriptions or for one. A
+persistent systemd timer refreshes every subscription in the background at the
+configured interval; one failing provider keeps its nodes and does not stop the
+others, and downloads never block the menu or the fallback watchdog. If a
+selected node disappears or matches ambiguously, the active tunnel is kept
+unchanged.
 
 Provider JSON is not executed byte-for-byte. proxy-unifi validates target
 addresses, routing references, balancers, observatories, DNS, and resource
@@ -216,6 +223,34 @@ limits; removes provider listeners and control surfaces; and inserts its own
 WireGuard inbound. Provider outbounds, routing rules, balancer strategies,
 health probes, and failover tags otherwise remain intact. Profiles that cannot
 be projected safely are rejected before xray-core is started.
+
+## Fallback pool
+
+Main menu 3 sets up a pool of 2-10 nodes, from any of your subscriptions, in
+priority order. While fallback is on, a watchdog checks the active node through
+the tunnel at a set interval. When it fails a set number of checks in a row it
+counts as offline, and the tunnel moves to the next node in priority order that
+answers right now. With "return to higher priority" on, the tunnel goes back to a
+better node once it has passed a set number of checks in a row.
+
+The wizard asks for the number of nodes, each node (subscription, then node),
+their order, and the timing:
+
+| Preset | Check every | Offline after | Back online after |
+|---|---|---|---|
+| Fast | 10 s | 3 failed checks (~30 s) | 3 good checks |
+| Balanced (default) | 20 s | 3 failed checks (~1 min) | 5 good checks |
+| Relaxed | 60 s | 3 failed checks (~3 min) | 5 good checks |
+
+Custom timing sets each value (and the seconds per check) yourself. A switch
+applies the node like choosing it by hand, so open connections are reset; with
+Xray nodes on kernel ingress that takes about 1-3 s, while sing-box nodes
+(Hysteria2, TUIC) make the UniFi VPN Client reconnect, up to ~15 s. Choosing a
+node yourself (a link, a subscription node, a JSON or AmneziaWG profile) asks
+first and then turns fallback off; the pool is kept. If the problem is between
+UniFi and the core rather than the node, the watchdog does not switch and
+`proxy status` says so. Every switch is logged (`proxy logs`) and shown as "Last
+switch" in the menu.
 
 ## AmneziaWG profiles
 
@@ -264,7 +299,7 @@ Run `proxy` for the interactive menu, or use the direct commands:
 | `proxy update` | Updates xray, installed sing-box/AWG cores, and bundled geo files |
 | `proxy geo-update` | Updates the independent routing geo database |
 
-The menu covers: single links, subscriptions, AmneziaWG profiles, Xray JSON profiles, UniFi WireGuard config,
+The menu covers: single links, subscriptions, the fallback pool, AmneziaWG profiles, Xray JSON profiles, UniFi WireGuard config,
 regenerate keys, change port/MTU/DNS/ingress, ping test + protocol, enable/disable
 autostart, update cores, update geo files, and uninstall.
 
@@ -306,7 +341,7 @@ Remote installer files are pinned to one immutable GitHub commit for each run.
 Core archives and geo assets must pass their published SHA-256 checks before
 activation, and failed core/service updates restore the previous files.
 
-Re-running the installer only overwrites `bin/` (script + binaries) and the `systemd` unit. Your WireGuard keys, added proxy link, subscription catalog, AmneziaWG profiles, and client settings (DNS, MTU) persist — the UniFi WireGuard client keeps working without any changes required.
+Re-running the installer only overwrites `bin/` (script + binaries) and the `systemd` unit. Your WireGuard keys, added proxy link, subscriptions, fallback pool, AmneziaWG profiles, and client settings (DNS, MTU) persist — the UniFi WireGuard client keeps working without any changes required.
 
 ## Uninstall
 

@@ -22,6 +22,9 @@ Decided with the user:
 - Each subscription may have its own User-Agent; the HWID stays one per gateway.
 - Choosing a node by hand while fallback is on turns fallback off (after a
   prompt in the menu); the pool is kept.
+- Implementation decision: the `proxy sub ...` and `proxy fallback ...` direct
+  commands below were dropped. The menu stays the single full interface, as for
+  everything else; `proxy status` shows the fallback state.
 
 Out of scope: per-subscription refresh intervals, notifications, seamless
 (restart-free) switching, load balancing across pool nodes.
