@@ -1635,6 +1635,51 @@ EOF
 tags = [r.get("inboundTag") for r in json.load(open(sys.argv[1]))["routing"]["rules"]]
 assert tags == [["socks", "http"], None], tags' "$_d/pool/01-provider.json"
     then ok "xray balancer pool (-confdir)"; else bad "xray balancer pool (-confdir)"; fi
+    # proxy ping's pool core answers before the balancer's first health check
+    # finishes: until then leastLoad sends everything to the fallback, here a
+    # blackhole. The health check's target answers only after the ping.
+    cat > "$_d/web.py" <<'PY'
+import http.server, os, sys, time
+class Web(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/slow":
+            time.sleep(10)
+        self.send_response(204)
+        self.end_headers()
+    do_HEAD = do_GET   # Xray's health check sends HEAD
+    def log_message(self, *args):
+        pass
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Web)
+with open(sys.argv[1] + ".tmp", "w") as f: f.write(str(server.server_address[1]))
+os.rename(sys.argv[1] + ".tmp", sys.argv[1])
+server.serve_forever()
+PY
+    python3 "$_d/web.py" "$_d/web.port" >/dev/null 2>&1 &
+    _web=$!; _i=0
+    while [ ! -s "$_d/web.port" ] && [ "$_i" -lt 100 ]; do
+        _i=$((_i + 1)); sleep 0.05 2>/dev/null || sleep 1
+    done
+    _wp="$(cat "$_d/web.port" 2>/dev/null)"
+    _sp="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')"
+    cat > "$_d/race.json" <<'EOF'
+{"inbounds":[{"tag":"socks","protocol":"socks","listen":"127.0.0.1","port":10808}],"outbounds":[{"protocol":"freedom","tag":"proxy-1"},{"protocol":"freedom","tag":"proxy-2"},{"protocol":"blackhole","tag":"block"}],"routing":{"balancers":[{"tag":"B","selector":["proxy"],"strategy":{"type":"leastLoad"},"fallbackTag":"block"}],"rules":[{"type":"field","network":"tcp,udp","balancerTag":"B"}]},"burstObservatory":{"subjectSelector":["proxy"],"pingConfig":{"destination":"https://www.gstatic.com/generate_204","interval":"1m","timeout":"30s"}}}
+EOF
+    python3 "$SRC/mkjson.py" socksconfig --profile "$_d/race.json" --socks-port "$_sp" \
+        | python3 -c 'import json, sys
+c = json.load(sys.stdin)
+c["burstObservatory"]["pingConfig"]["destination"] = sys.argv[1]
+print(json.dumps(c))' "http://127.0.0.1:$_wp/slow" > "$_d/race-core.json"
+    "$XR" run -config "$_d/race-core.json" >/dev/null 2>&1 &
+    _rx=$!; _i=0
+    until python3 -c 'import socket,sys; socket.create_connection(("127.0.0.1",int(sys.argv[1])),0.2)' "$_sp" 2>/dev/null \
+          || [ "$_i" -ge 50 ]; do
+        _i=$((_i + 1)); sleep 0.1 2>/dev/null || sleep 1
+    done
+    _code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 --proxy "socks5h://127.0.0.1:$_sp" \
+        "http://127.0.0.1:$_wp/" 2>&1)"
+    kill "$_rx" "$_web" 2>/dev/null; wait "$_rx" "$_web" 2>/dev/null
+    if [ "$_code" = 204 ]; then ok "ping's pool core answers before the balancer's health check"
+    else bad "ping's pool core answers before the balancer's health check (got: $_code)"; fi
     rm -rf "$_d"
 
     # Traced so a failure's tail names the step that broke (set -e stops there).
