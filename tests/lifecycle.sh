@@ -273,12 +273,40 @@ printf '1\n%s\n\n0\n' "$BAD_SS2022_LINK" | menu_input >/dev/null 2>&1
 [ ! -e "$T/root/.transactions/active" ] || exit 1
 [ ! -e "$T/root/.lock" ] || exit 1
 
-# Pool mode must survive key regeneration and rebuild its WireGuard overlay.
+# Pool mode must survive key regeneration and rebuild its WireGuard overlay. The
+# profile, like those written for provider apps, also routes by an HTTP inbound.
 cat > "$T/profile.json" <<'EOF'
-{"inbounds":[{"tag":"socks","protocol":"socks","listen":"127.0.0.1","port":10808,"settings":{"udp":true}}],"outbounds":[{"protocol":"freedom","tag":"proxy"},{"protocol":"freedom","tag":"proxy-2"},{"protocol":"blackhole","tag":"block"}],"routing":{"balancers":[{"tag":"B","selector":["proxy"],"strategy":{"type":"leastPing"},"fallbackTag":"block"}],"rules":[{"type":"field","network":"tcp,udp","balancerTag":"B"}]},"burstObservatory":{"subjectSelector":["proxy"],"pingConfig":{"destination":"https://www.gstatic.com/generate_204","interval":"1m","timeout":"3s"}}}
+{"inbounds":[{"tag":"socks","protocol":"socks","listen":"127.0.0.1","port":10808,"settings":{"udp":true}},{"tag":"http","protocol":"http","listen":"127.0.0.1","port":10809}],"outbounds":[{"protocol":"freedom","tag":"proxy"},{"protocol":"freedom","tag":"proxy-2"},{"protocol":"blackhole","tag":"block"}],"routing":{"balancers":[{"tag":"B","selector":["proxy"],"strategy":{"type":"leastPing"},"fallbackTag":"block"}],"rules":[{"type":"field","inboundTag":["http"],"outboundTag":"block"},{"type":"field","inboundTag":["socks","http"],"network":"tcp,udp","balancerTag":"B"}]},"burstObservatory":{"subjectSelector":["proxy"],"pingConfig":{"destination":"https://www.gstatic.com/generate_204","interval":"1m","timeout":"3s"}}}
 EOF
-printf '4\n%s\n\n0\n' "$T/profile.json" | menu_input >/dev/null
+printf '4\n%s\n\n0\n' "$T/profile.json" | menu_input > "$T/pool-import.out" 2>&1
 [ "$(cat "$T/root/etc/engine")" = xraypool ]
+if grep -q 'unsupported\|cannot use kernel WireGuard ingress' "$T/pool-import.out"; then exit 1; fi
+python3 - "$T/root/etc/pool/01-provider.json" <<'PY'
+import json, sys
+rules = json.load(open(sys.argv[1]))["routing"]["rules"]
+assert [r.get("inboundTag") for r in rules] == [["socks", "http"]], rules
+PY
+# The same profile from a subscription catalog saved by an earlier version,
+# which marked it unsupported: the menu counts it and selecting it works.
+mkdir -p "$T/root/etc/subscription"; chmod 700 "$T/root/etc/subscription"
+printf 'https://sub.example/x' > "$T/root/etc/subscription/url.txt"
+python3 - "$REPO/src" "$T/profile.json" "$T/root/etc/subscription/catalog.json" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import mksub
+cat = mksub.process_body(open(sys.argv[2], "rb").read().join([b"[", b"]"]))
+cat["nodes"][0].update(recognized=False, members=0, server="profile",
+                       reason="profile routing references an inbound removed by the WireGuard overlay")
+cat["meta"]["supported"] = 0
+json.dump(cat, open(sys.argv[3], "w"))
+PY
+rm -f "$T/root/etc/engine"
+printf '2\n3\n1\n\n0\n' | menu_input > "$T/sub-select.out" 2>&1
+grep -q 'nodes: *1 (1 supported)' "$T/sub-select.out"
+if grep -q 'unsupported' "$T/sub-select.out"; then exit 1; fi
+[ "$(cat "$T/root/etc/engine")" = xraypool ]
+[ -s "$T/root/etc/subscription/selected" ]
+[ ! -e "$T/root/.transactions/active" ] || exit 1
 OLD_KEY="$(cat "$T/root/etc/wg/wg_private.key")"
 OLD_OVERLAY="$(hash_file "$T/root/etc/pool/99-overlay.json")"
 printf '7\ny\n\n0\n' | menu_input >/dev/null
