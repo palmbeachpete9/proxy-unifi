@@ -177,7 +177,6 @@ def clean(s, maxlen=FIELD_MAX):
     return "".join(rendered)
 
 
-
 def pad(text, width):
     """text padded with spaces to a display width (wide characters count as 2)."""
     return text + " " * max(0, width - sum(display_width(ch) for ch in text))
@@ -1137,10 +1136,8 @@ def _migrate_selection_scheme(old, active_link_file):
 
 def cmd_extract(args):
     cat = _load(args.file)
-    if getattr(args, "id", ""):
-        nd = next((node for node in cat.get("nodes", []) if node.get("id") == args.id), None)
-    else:
-        nd = next((node for node in cat.get("nodes", []) if node.get("n") == args.index), None)
+    key, value = ("id", args.id) if getattr(args, "id", "") else ("n", args.index)
+    nd = next((node for node in cat.get("nodes", []) if node.get(key) == value), None)
     if nd is None:
         die("no such node in the subscription")
     kind = "pool" if (nd.get("kind") == "pool" or nd.get("scheme") == "json") else "link"

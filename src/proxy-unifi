@@ -2050,10 +2050,7 @@ EOF
     # systemctl takes unit names here; a file path is not a startable unit.
     systemctl enable --now "$GUARD_SERVICE_NAME.timer" >/dev/null 2>&1 \
         || fatal "could not start firewall guard timer"
-    if [ "$FALLBACK" = on ]; then
-        write_fallback_timer || fatal "could not write the fallback timer"
-        systemctl enable --now "$FB_SERVICE_NAME.timer" >/dev/null 2>&1 || fatal "could not start the fallback timer"
-    fi
+    if [ "$FALLBACK" = on ]; then fallback_set on; fi
 }
 
 boot_recover() {
@@ -2343,9 +2340,7 @@ cmd_status() {
     fi
     echo "server:    $(current_server)"
     if [ "$FALLBACK" = on ]; then
-        echo "fallback:  on, $(PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKFALLBACK" status --pool "$FB_POOL" \
-            --state "$FB_STATE" --last "$FB_LAST" --selected "$SUB_SELECTED_META" --subs-dir "$SUB_DIR" \
-            2>/dev/null || echo "the pool cannot be read")"
+        echo "fallback:  on, $(fallback_status)"
     else
         echo "fallback:  off"
     fi
@@ -3234,9 +3229,7 @@ print_menu() {
     printf 'Listener:   udp %s (%s)\n' "$(wg_endpoint)" "$lst"
     printf 'Server:     %s\n' "$(current_server)"
     if [ "$FALLBACK" = on ]; then
-        _fs="$(py "$MKFALLBACK" status --pool "$FB_POOL" --state "$FB_STATE" --last "$FB_LAST" \
-            --selected "$SUB_SELECTED_META" --subs-dir "$SUB_DIR" 2>/dev/null)" || _fs="the pool cannot be read"
-        printf 'Fallback:   on, %s\n' "${_fs%% (*}"
+        printf 'Fallback:   on, %s\n' "$(fallback_status --short)"
     else
         printf 'Fallback:   off\n'
     fi
@@ -3882,7 +3875,7 @@ fallback_install() {   # <draft> <interval> <down> <up> <timeout> <return on|off
     atomic_write "$FB_POOL" 600 < "$1" || fatal "could not save the pool"
     FB_INTERVAL="$2"; FB_DOWN="$3"; FB_UP="$4"; FB_TIMEOUT="$5"; FB_RETURN="$6"
     save_settings
-    if [ "$FALLBACK" = on ]; then write_fallback_timer || fatal "could not update the fallback timer"; fi
+    if [ "$FALLBACK" = on ]; then fallback_set on; fi
     txn_commit
 }
 
@@ -3899,20 +3892,32 @@ fallback_remove() {   # <position>
     _uint "${1:-}" || fatal "enter a position number"
     txn_begin
     py "$MKFALLBACK" remove --pool "$FB_POOL" --position "$1" || fatal "the pool is unchanged"
-    _fusable="$(py "$MKFALLBACK" count --pool "$FB_POOL" | cut -d' ' -f1)"
-    if [ "$FALLBACK" = on ] && [ "${_fusable:-0}" -lt 2 ]; then
+    # A 1-node pool is no pool. Nodes missing after a refresh still count: they
+    # come back with the provider, and until then the watchdog says it is inactive.
+    _fleft="$(py "$MKFALLBACK" count --pool "$FB_POOL" | cut -d' ' -f2)"
+    if [ "$FALLBACK" = on ] && [ "${_fleft:-0}" -lt 2 ]; then
         fallback_set off
         c_ylw "Fallback turned off: fewer than 2 pool nodes remain."
     fi
     txn_commit
     c_grn "Removed position $1."
-    if [ "$FALLBACK" = on ]; then
-        case "$(py "$MKFALLBACK" status --pool "$FB_POOL" --state "$FB_STATE" --last "$FB_LAST" \
-                --selected "$SUB_SELECTED_META" --subs-dir "$SUB_DIR" 2>/dev/null)" in
-            "the active node is not in the pool"*)
-                c_ylw "The active node is not in the pool any more: the next check switches to the highest-priority node that answers." ;;
-        esac
-    fi
+    fallback_note_active_left
+}
+
+# fallback_status [--short]: the watchdog's one-line state.
+fallback_status() {
+    PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKFALLBACK" status "$@" --pool "$FB_POOL" --state "$FB_STATE" \
+        --last "$FB_LAST" --selected "$SUB_SELECTED_META" --subs-dir "$SUB_DIR" 2>/dev/null \
+        || echo "the pool cannot be read"
+}
+
+# Say so when the active node left the pool: the next check switches.
+fallback_note_active_left() {
+    [ "$FALLBACK" = on ] || return 0
+    case "$(fallback_status --short)" in
+        "the active node is not in the pool"*)
+            c_ylw "The active node is not in the pool any more: the next check switches to the highest-priority node that answers." ;;
+    esac
 }
 
 fallback_order() {   # <position>...
@@ -3927,10 +3932,7 @@ fallback_set_timing() {   # <interval> <down> <up> <timeout>
     txn_begin
     FB_INTERVAL="$1"; FB_DOWN="$2"; FB_UP="$3"; FB_TIMEOUT="$4"
     save_settings
-    if [ "$FALLBACK" = on ]; then
-        write_fallback_timer || fatal "could not update the fallback timer"
-        systemctl restart "$FB_SERVICE_NAME.timer" >/dev/null 2>&1 || fatal "could not restart the fallback timer"
-    fi
+    if [ "$FALLBACK" = on ]; then fallback_set on; fi
     txn_commit
     c_grn "Timing: $(fallback_timing_text)."
 }
@@ -4364,14 +4366,15 @@ sub_remove() {   # <subscription id>
     if [ -s "$FB_POOL" ]; then
         _left="$(py "$MKFALLBACK" drop-sub --pool "$FB_POOL" --sub "$1")" \
             || fatal "could not update the fallback pool"
-        if [ "${FALLBACK:-off}" = on ] && [ "${_left:-0}" -lt 2 ]; then
+        if [ "$FALLBACK" = on ] && [ "${_left:-0}" -lt 2 ]; then
             fallback_set off
             c_ylw "Fallback turned off: fewer than 2 pool nodes remain."
         fi
     fi
     sub_any || disable_refresh_timer
     txn_commit
-    c_ylw "Subscription $1 removed (HWID kept). The active tunnel is unchanged."
+    c_ylw "Subscription $1 removed (HWID kept)."
+    if [ "$FALLBACK" = on ]; then fallback_note_active_left; else info "The active tunnel is unchanged."; fi
 }
 
 # --------------------------------------------------------------------------
@@ -4440,7 +4443,9 @@ fallback_set() {   # on|off
     FALLBACK="$1"; save_settings
     if [ "$1" = on ]; then
         write_fallback_timer || fatal "could not write the fallback timer"
-        systemctl enable --now "$FB_SERVICE_NAME.timer" >/dev/null 2>&1 || fatal "could not start the fallback timer"
+        # A running timer keeps its old interval until it is restarted.
+        { systemctl enable "$FB_SERVICE_NAME.timer" && systemctl restart "$FB_SERVICE_NAME.timer"; } >/dev/null 2>&1 \
+            || fatal "could not start the fallback timer"
     else
         systemctl disable --now "$FB_SERVICE_NAME.timer" >/dev/null 2>&1 || true
     fi
@@ -4476,7 +4481,7 @@ fallback_check() {
 
 # One watchdog switch, under the lock. A decision that went stale while the
 # run was checking (fallback turned off, the active node changed) exits 3.
-_fallback_apply() {   # <subscription id> <node id> <expected active node id, or -> <reason>
+_fallback_apply() {   # <subscription id> <node id> <expected active node id, or ->
     sub_valid_id "${1:-}" || fatal "no subscription ${1:-}"
     case "${2:-}" in ""|*[!0-9a-f]*) fatal "invalid node id" ;; esac
     [ "${#2}" = 64 ] || fatal "invalid node id"
@@ -4584,7 +4589,7 @@ case "$cmd" in
     _fw-reconcile)   fw_reconcile ;;
     fallback-check)  fallback_check ;;
     _fallback-probe) _fallback_probe "${1:-}" "${2:-}" "${3:-}" ;;
-    _fallback-apply) _fallback_apply "${1:-}" "${2:-}" "${3:-}" "${4:-}" ;;
+    _fallback-apply) _fallback_apply "${1:-}" "${2:-}" "${3:-}" ;;
     sub-refresh-auto)
         _AUTO_REFRESH=1
         ( locked_call sub_migrate ) || exit 1

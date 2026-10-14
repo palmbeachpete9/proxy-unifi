@@ -69,6 +69,7 @@ for arg in "$@"; do case "$arg" in --*) : ;; *) unit="$arg" ;; esac; done
 # Real systemctl cannot start/stop a unit by its file path.
 case "$unit" in /*) echo "mock systemctl: '$unit' is a path, not a unit name" >&2; exit 1 ;; esac
 key="$(printf '%s' "$unit" | tr '/.' '__')"
+echo "$cmd $unit" >> "$D/systemctl.log"
 start_service() {
     # The CLI holds its lock here: a dead owner would let any other caller take it.
     if [ -d "$D/../root/.lock" ] && ! kill -0 "$(cat "$D/../root/.lock/pid")" 2>/dev/null; then
@@ -610,7 +611,7 @@ run_cli stop >/dev/null; run_cli fallback-check >/dev/null
 if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
 run_cli start >/dev/null
 # a stale switch is refused: the expected active node is not the real one
-if run_cli _fallback-apply 2 "$idb" "$(printf '0%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64)" test >/dev/null 2>&1; then exit 1; fi
+if run_cli _fallback-apply 2 "$idb" "$(printf '0%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64)" >/dev/null 2>&1; then exit 1; fi
 grep -q '@1.1.1.1:' "$T/root/etc/link.txt"
 # back to #1 after FB_UP=5 good checks of it (one return check per run)
 for _r in 1 2 3 4; do run_cli fallback-check >/dev/null; done
@@ -719,6 +720,47 @@ grep -q 'the next check switches to the highest-priority node that answers' "$T/
 grep -q '^FALLBACK="on"' "$T/root/etc/settings.env"
 run_cli fallback-check >/dev/null
 python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["sub"] == "3"' "$T/root/etc/subscription/selected.json"
+[ ! -e "$T/root/.lock" ] || exit 1
+
+# Removing the subscription of the active node, with fallback on and 2 pool
+# nodes left, says the next check switches (not "unchanged").
+python3 "$T/root/bin/mkfallback.py" add --pool "$T/root/etc/fallback.json" --sub 2 \
+    --catalog "$T/root/etc/subscription/2/catalog.json" --index 1
+python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["sub"] == "3"' "$T/root/etc/subscription/selected.json"
+printf '2\n4\n3\ny\n\n0\n' | menu_input > "$T/sub-remove-active.out" 2>&1
+grep -q 'the next check switches to the highest-priority node that answers' "$T/sub-remove-active.out"
+if grep -q 'active tunnel is unchanged' "$T/sub-remove-active.out"; then exit 1; fi
+grep -q '^FALLBACK="on"' "$T/root/etc/settings.env"
+# A node missing after a refresh does not count against the pool's size: removing
+# another node leaves fallback on, and the main menu says it is inactive.
+cp -Rp "$T/root/etc/subscription/2" "$T/root/etc/subscription/4"
+python3 "$T/root/bin/mkfallback.py" add --pool "$T/root/etc/fallback.json" --sub 4 \
+    --catalog "$T/root/etc/subscription/4/catalog.json" --index 1
+python3 - "$T/root/etc/fallback.json" <<'PY'
+import json, sys
+pool = json.load(open(sys.argv[1]))
+assert [(e["sub"], e["meta"]["label"]) for e in pool["nodes"]] == [("2", "two-b"), ("2", "two-a"), ("4", "two-a")], pool
+pool["nodes"][1]["missing"] = True
+json.dump(pool, open(sys.argv[1], "w"))
+PY
+printf '3\n3\n3\n\n0\n' | menu_input >/dev/null 2>&1
+grep -q '^FALLBACK="on"' "$T/root/etc/settings.env"
+printf '0\n' | menu_input > "$T/menu-inactive.out" 2>&1
+grep -q 'Fallback:   on, .*inactive: fewer than 2 pool nodes are available' "$T/menu-inactive.out"
+# A new interval while fallback is on restarts the timer, so systemd uses it.
+: > "$STATE/systemctl.log"
+printf '3\n5\n3\n\n0\n' | menu_input >/dev/null 2>&1
+grep -q '^FB_INTERVAL="60"' "$T/root/etc/settings.env"
+grep -q '^restart proxy-unifi-fallback.timer$' "$STATE/systemctl.log"
+python3 - "$T/root/etc/fallback.json" <<'PY'
+import json, sys
+pool = json.load(open(sys.argv[1]))
+pool["nodes"][1]["missing"] = False                                # back after a refresh
+json.dump(pool, open(sys.argv[1], "w"))
+PY
+: > "$STATE/systemctl.log"
+printf '3\n8\n\n3\n8\n\n0\n' | menu_input >/dev/null 2>&1      # off, then on again
+grep -q '^restart proxy-unifi-fallback.timer$' "$STATE/systemctl.log"
 [ ! -e "$T/root/.lock" ] || exit 1
 
 [ ! -e "$STATE/stale-lock" ] || { echo "lock recorded a dead owner" >&2; exit 1; }

@@ -13,11 +13,11 @@ Subcommands (every one takes --pool FILE):
   drop-sub --sub ID            rematch --sub ID --catalog F
   run   --state F --last F --selected F --cli PATH --down N --up N --return on|off --timeout N
   test  --state F --subs-dir D --cli PATH --timeout N
-  show | status  --state F --last F --selected F --subs-dir D
+  show | status [--short]  --state F --last F --selected F --subs-dir D
 
 The CLI callbacks a run uses:
   PATH _fallback-probe SUB ID live|core          -> "ok MS" or "fail ERROR"
-  PATH _fallback-apply SUB ID EXPECTED REASON    -> exit 0 once switched
+  PATH _fallback-apply SUB ID EXPECTED           -> exit 0 once switched
 
 Stdlib only (Python 3.9+).
 """
@@ -297,9 +297,9 @@ def _cli_probe(cli, entry, kind, timeout):
     return False, 0, "check did not finish"
 
 
-def _cli_apply(cli, entry, expected, reason):
+def _cli_apply(cli, entry, expected):
     try:
-        rc, out = _cli([cli, "_fallback-apply", entry["sub"], entry["meta"]["id"], expected or "-", reason], 600)
+        rc, out = _cli([cli, "_fallback-apply", entry["sub"], entry["meta"]["id"], expected or "-"], 600)
     except (OSError, subprocess.SubprocessError):
         return False, "switch did not finish"
     lines = [line for line in out.splitlines() if line.strip()]
@@ -322,7 +322,7 @@ def cmd_run(args):
     try:
         log = run_once(pool, state, active, cfg,
                        lambda i, kind: _cli_probe(args.cli, pool[i], kind, args.timeout),
-                       lambda i, reason: _cli_apply(args.cli, pool[i], active[1] if active else "", reason),
+                       lambda i, _reason: _cli_apply(args.cli, pool[i], active[1] if active else ""),
                        now)
     except Stale as e:
         log = ["skipped: %s" % e]
@@ -412,9 +412,11 @@ def cmd_status(args):
     state = load_state(args.state)
     active = _active(args.selected)
     pos = next((i for i, e in enumerate(pool, 1) if active == (e["sub"], e["meta"]["id"])), 0)
+    short = getattr(args, "short", False)
     if pos:
-        text = "active #%d of %d ([%s] %s)" % (pos, len(pool), mksub.sub_name(args.subs_dir, pool[pos - 1]["sub"], 16),
-                                              _label(pool[pos - 1]))
+        text = "active #%d of %d" % (pos, len(pool))
+        if not short:
+            text += " ([%s] %s)" % (mksub.sub_name(args.subs_dir, pool[pos - 1]["sub"], 16), _label(pool[pos - 1]))
     else:
         text = "the active node is not in the pool (%d nodes)" % len(pool)
     if _too_few(pool):
@@ -481,6 +483,7 @@ def main():
         for opt in ("--state", "--last", "--selected", "--subs-dir"):
             v.add_argument(opt, required=True)
         v.set_defaults(fn=fn)
+    sub.choices["status"].add_argument("--short", action="store_true")  # the main menu: no name
 
     dispatch_subcommand(ap)
 

@@ -1512,6 +1512,12 @@ with tempfile.TemporaryDirectory() as tmp:
         assert "fewer than 2 pool nodes" in out.getvalue(), out.getvalue()
         if cmd is fb.cmd_show:
             assert "(checked " in out.getvalue(), out.getvalue()        # two hours old: says so
+    # the main menu's short form: no name, but every warning
+    args.short = True
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        fb.cmd_status(args)
+    assert out.getvalue() == "active #1 of 2, inactive: fewer than 2 pool nodes are available\n", out.getvalue()
 PY
 
     # mkawg: AWG 1.5-3.1 parser, bridge generator, profile catalog, and UI safety.
