@@ -676,6 +676,17 @@ grep -q '^FALLBACK="on"' "$T/root/etc/settings.env"
 printf '3\n3\n1\n\n0\n' | menu_input > "$T/fb-remove.out" 2>&1
 grep -q '^FALLBACK="off"' "$T/root/etc/settings.env"
 grep -q 'fewer than 2 pool nodes' "$T/fb-remove.out"
+# An order is digits and spaces: "*" is refused with a hint, never expanded to file names.
+printf '3\n4\n*\n\n0\n' | menu_input > "$T/fb-order.out" 2>&1
+grep -q 'Enter the positions as numbers separated by spaces' "$T/fb-order.out"
+if grep -q 'invalid int value' "$T/fb-order.out"; then exit 1; fi
+# "Add a node" reports a damaged pool file before asking anything.
+cp "$T/root/etc/fallback.json" "$T/pool.good"
+printf '{"schema": 1, "nodes": [{"sub": "x"}]}' > "$T/root/etc/fallback.json"
+printf '3\n2\n\n0\n' | menu_input > "$T/fb-add-bad.out" 2>&1
+grep -q 'fallback pool file is malformed' "$T/fb-add-bad.out"
+if grep -q 'Position in the pool' "$T/fb-add-bad.out"; then exit 1; fi
+cp "$T/pool.good" "$T/root/etc/fallback.json"
 [ ! -e "$T/root/.lock" ] || exit 1
 [ ! -e "$T/root/.transactions/active" ] || exit 1
 

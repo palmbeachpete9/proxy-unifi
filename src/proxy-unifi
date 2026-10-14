@@ -3734,13 +3734,22 @@ menu_fallback() {
            if [ -n "${_fp:-}" ]; then locked_call fallback_remove "$_fp"; else c_ylw "Cancelled."; fi ;;
         4) printf 'New order (e.g. 2 1 3): '; read -r _fo || true
            # shellcheck disable=SC2086 # each position is its own argument
-           if [ -n "${_fo:-}" ]; then locked_call fallback_order $_fo; else c_ylw "Unchanged."; fi ;;
+           if [ -z "${_fo:-}" ]; then c_ylw "Unchanged."
+           elif _fallback_positions_ok "$_fo"; then locked_call fallback_order $_fo; fi ;;
         5) if fallback_ask_timing; then locked_call fallback_set_timing "$_ti" "$_td" "$_tu" "$_tt"; fi ;;
         6) locked_call fallback_toggle_return ;;
         7) fallback_test ;;
         8) if [ "$FALLBACK" = on ]; then locked_call fallback_switch off; else fallback_turn_on; fi ;;
         0|"") : ;;
         *) c_red "invalid choice" ;;
+    esac
+}
+
+# Positions as typed ("2 1 3") are split into words unquoted: only digits and
+# spaces may pass, so nothing can expand to file names.
+_fallback_positions_ok() {
+    case "$1" in
+        *[!0-9\ ]*) c_red "Enter the positions as numbers separated by spaces, e.g. 2 1 3."; return 1 ;;
     esac
 }
 
@@ -3811,6 +3820,7 @@ fallback_wizard() {
         printf 'New order (e.g. 1 3 2), Enter to keep: '
         read -r _ord || true
         [ -n "${_ord:-}" ] || break
+        _fallback_positions_ok "$_ord" || continue
         # shellcheck disable=SC2086 # each position is its own argument
         if py "$MKFALLBACK" order --pool "$_draft" $_ord; then break; fi
     done
@@ -3832,7 +3842,10 @@ fallback_menu_add() {
     ensure_run_dir
     _draft="$RUN_DIR/fallback.draft"; rm -f "$_draft"
     if [ -s "$FB_POOL" ]; then cp "$FB_POOL" "$_draft" || return 0; fi
-    _fcount="$(py "$MKFALLBACK" count --pool "$_draft" | cut -d' ' -f2)" || return 0
+    # A damaged pool file is reported now, not after the node is picked.
+    _fcount="$(py "$MKFALLBACK" count --pool "$_draft")" \
+        || { c_red "Set up a new pool with 1."; return 0; }
+    _fcount="${_fcount#* }"
     _fallback_ask "Position in the pool" 1 "$((_fcount + 1))" "$((_fcount + 1))" || { c_ylw "Cancelled."; return 0; }
     _fpos="$_fa"
     fallback_pick_node "$_draft" "$_fpos" || { c_ylw "Cancelled."; return 0; }
