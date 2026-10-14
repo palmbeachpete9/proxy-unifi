@@ -60,10 +60,6 @@ LOCK_DIR="$ROOT/.lock"
 TXN_ROOT="$ROOT/.transactions"
 TXN_MARKER="$TXN_ROOT/active"
 
-# Legacy SIP003 plugin unit (from when xray ran external plugins). Kept only so
-# uninstall / migration can clean up any leftovers on older installs.
-PLUGIN_SERVICE_NAME="proxy-unifi-plugin"
-PLUGIN_SERVICE_FILE="/etc/systemd/system/${PLUGIN_SERVICE_NAME}.service"
 
 SINGBOX_RELEASES="https://github.com/SagerNet/sing-box/releases"
 AWG_CORE_RELEASES="https://github.com/palmbeachpete9/proxy-unifi/releases"
@@ -1302,17 +1298,7 @@ fw_reconcile() {
     fi
 }
 
-# Remove any leftover SIP003 plugin unit from older (external-plugin) installs.
-cleanup_legacy_plugin() {
-    if [ -f "$PLUGIN_SERVICE_FILE" ]; then
-        systemctl disable --now "$PLUGIN_SERVICE_NAME" 2>/dev/null || true
-        rm -f "$PLUGIN_SERVICE_FILE"
-        systemctl daemon-reload 2>/dev/null || true
-    fi
-}
-
 install_service() {
-    cleanup_legacy_plugin
     install_proxy_link            # safe (D20): only (re)links our own symlink
     write_service
     # Honor the user's persisted autostart choice across reboots/firmware wipes.
@@ -2848,10 +2834,9 @@ cmd_uninstall() {
     done
     systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null \
         && fatal "service is still running; refusing to remove its unit"
-    systemctl disable --now "$PLUGIN_SERVICE_NAME" 2>/dev/null || true
     fw_unlock                       # drop the userspace-core firewall guard, if any
     disable_guard_timer
-    rm -f "$SERVICE_FILE" "$PLUGIN_SERVICE_FILE" "$REFRESH_SERVICE_FILE" "$REFRESH_TIMER_FILE" "$ONBOOT_DST"
+    rm -f "$SERVICE_FILE" "$REFRESH_SERVICE_FILE" "$REFRESH_TIMER_FILE" "$ONBOOT_DST"
     remove_proxy_link
     systemctl daemon-reload 2>/dev/null || true
     c_ylw "Removed service + boot hook. Data kept at $ROOT (delete it manually to purge keys/config)."
