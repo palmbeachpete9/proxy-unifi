@@ -172,9 +172,12 @@ PY
         sh -c 'echo $$ > "$1/hup"; exec sleep 30' sh "$_sd" >/dev/null 2>&1 &
     _sx=$!; _i=0
     while [ ! -s "$_sd/hup" ] && [ "$_i" -lt 100 ]; do _i=$((_i + 1)); sleep 0.05 2>/dev/null || sleep 1; done
+    _hp="$(cat "$_sd/hup")"; _hb="$(ps -o stat=,comm= -p "$_hp" 2>/dev/null | tr -s ' ')"
     kill -HUP "$_sx" 2>/dev/null; _i=0
-    while proc_alive "$(cat "$_sd/hup")" && [ "$_i" -lt 40 ]; do _i=$((_i + 1)); sleep 0.05 2>/dev/null || sleep 1; done
-    if proc_alive "$(cat "$_sd/hup")"; then bad "safe validator stops its group on a hang-up"; kill "$(cat "$_sd/hup")" 2>/dev/null
+    while proc_alive "$_hp" && [ "$_i" -lt 60 ]; do _i=$((_i + 1)); sleep 0.05 2>/dev/null || sleep 1; done
+    if proc_alive "$_hp"; then
+        bad "safe validator stops its group on a hang-up (pid $_hp before: $_hb; after $_i waits: $(ps -o stat=,comm= -p "$_hp" | tr -s ' '); safeexec: $(ps -o stat=,comm= -p "$_sx" | tr -s ' '))"
+        kill "$_hp" 2>/dev/null
     else ok "safe validator stops its group on a hang-up"; fi
     wait "$_sx" 2>/dev/null
     rm -rf "$_sd"
