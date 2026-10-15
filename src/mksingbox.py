@@ -71,7 +71,8 @@ def parse_ss(link):
     name = ""
     opts = ""
     if raw:
-        raw = unquote(raw)
+        # flat_query already decoded the URI query once. Remaining percent
+        # sequences belong to the plugin options (for example a WS path).
         name, opts = (raw.split(";", 1) + [""])[:2]
     engine, reason, _variant = shadowsocks_engine(method, password, name)
     if engine != "singbox":

@@ -378,7 +378,6 @@ def _ss_plugin_name(parsed):
     raw = qg(query, "plugin")
     if not raw:
         return None
-    raw = unquote(raw)
     return raw.split(";", 1)[0] if ";" in raw else raw
 
 

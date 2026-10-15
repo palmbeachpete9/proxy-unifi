@@ -323,7 +323,7 @@ def _ss_engine(parsed):
     plugin = ""
     for key, value in pairs:
         if key == "plugin" and value:
-            plugin = unquote(value).split(";", 1)[0]
+            plugin = value.split(";", 1)[0]
     method, password = shadowsocks_method_password(parsed)
     if not method or not password:
         return "", "unparseable Shadowsocks credentials", ""
