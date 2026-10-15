@@ -39,7 +39,8 @@ from urllib.parse import urlsplit, unquote, parse_qsl, urlencode, urlunsplit
 from proxylib import (die, display_width, dispatch_subcommand, is_non_public_host,
                       terminal_emoji_fallback,
                       nested_too_deep, xray_outbound_servers,
-                      shadowsocks_method_password, shadowsocks_engine)
+                      shadowsocks_method_password, shadowsocks_engine,
+                      valid_host)
 from mkjson import sanitize_provider, validate_profile
 # Network-only modules (ssl, http.client, socket, time, urljoin) are
 # imported lazily inside fetch_url()/_https_get()/_public_ips(); the hot local
@@ -190,6 +191,19 @@ def _host_port(u):
         return u.hostname, u.port
     except ValueError:
         return None, None
+
+
+def _canonical_provider_host(host):
+    """Use the activation generators' host spelling before destination policy.
+
+    Invalid rows belong in the catalog as unsupported entries; a parser error
+    must not print one error per row or abort a feed containing good neighbors.
+    """
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            return valid_host(host)
+    except SystemExit:
+        return None
 
 
 def _legacy_vmess(link, scheme):
@@ -464,6 +478,11 @@ def node_from_link(link):
         if node["recognized"] and not node["server"]:
             node["recognized"] = False
             node["reason"] = "could not parse server host/port"
+        if node["recognized"]:
+            destination = _canonical_provider_host(destination)
+            if destination is None:
+                node["recognized"] = False
+                node["reason"] = "invalid provider destination"
         # providers return a 0.0.0.0 placeholder ("App not supported" /
         # "Limit of devices reached") to unauthorized clients -- flag it clearly
         # instead of offering a dead node.
@@ -1030,6 +1049,15 @@ def _load(path):
             except ValueError:
                 die("catalog pool node has an invalid profile")
             nd.update(_pool_verdict(prof))
+        elif nd["recognized"]:
+            # Older catalogs may have checked the pre-IDNA host spelling.
+            # Recheck through the fresh parser, downgrading stale safety
+            # verdicts without changing saved identity or selection metadata.
+            current = node_from_link(nd["link"])
+            if current is None or not current.get("recognized"):
+                nd["recognized"] = False
+                nd["reason"] = (current.get("reason") if current else "") \
+                    or "node is no longer supported"
     return cat
 
 
