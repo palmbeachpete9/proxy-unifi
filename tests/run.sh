@@ -104,6 +104,12 @@ fn_src() {
 # -------------------------------------------------------------------------
 static_tests() {
     echo "== static =="
+    if _settings_test="$(python3 "$ROOT/tests/test_settings.py" 2>&1)"; then
+        ok "locked menu actions preserve current unrelated settings"
+    else
+        bad "locked menu actions preserve current unrelated settings"
+        printf '%s\n' "$_settings_test"
+    fi
     # ShellCheck is the slowest static check; run it alongside the others and
     # report it at the end of this tier.
     _sc_log=""

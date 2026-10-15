@@ -106,30 +106,34 @@ INGRESS_MTU="1500"                              # the veth pairs; the tunnel's M
 INGRESS_RT_METRIC="1"                           # wins over UniFi's own route in its client table
 HOST_MOUNT_NS="/proc/1/ns/mnt"                  # the mount namespace named netns live in
 
-# defaults (overridable via settings.env)
-WG_LISTEN="127.0.0.1"
-WG_PORT="51821"
-WG_MTU="1340"
-WG_KEEPALIVE="25"
-INGRESS="kernel"                  # kernel | userspace (see "Kernel WireGuard ingress")
-LAN_ROUTE="on"                    # on: route Policy Table traffic to Xray instead of encrypting it
-XRAY_ADDR="10.7.0.1/32"
-UNIFI_ADDR="10.7.0.2/32"
-INNER_DNS="8.8.8.8"
-LOGLEVEL="warning"
-PING_MODE="get"
-PING_URL="https://www.gstatic.com/generate_204"
-PING_TIMEOUT="5"
-SUB_REFRESH_HOURS="6"
-FALLBACK="off"                    # on: the watchdog switches pool nodes (see "Fallback pool")
-FB_INTERVAL="20"                  # seconds between watchdog runs
-FB_DOWN="3"                       # failed checks in a row before a node is offline
-FB_UP="5"                         # good checks in a row before a node is back online
-FB_TIMEOUT="5"                    # seconds per check
-FB_RETURN="on"                    # return to a higher-priority node once it is back
 SUB_USER_AGENT_DEFAULT="Happ/2.0"
 SUB_USER_AGENT_LEGACY_DEFAULT="proxy-unifi/1.1"
-SUB_USER_AGENT="$SUB_USER_AGENT_DEFAULT"
+# Reset only persisted settings. Request arguments and per-operation flags must
+# survive a reload after waiting for the mutation lock.
+settings_defaults() {
+    WG_LISTEN="127.0.0.1"
+    WG_PORT="51821"
+    WG_MTU="1340"
+    WG_KEEPALIVE="25"
+    INGRESS="kernel"              # kernel | userspace (see "Kernel WireGuard ingress")
+    LAN_ROUTE="on"                # route Policy Table traffic without encrypting it
+    XRAY_ADDR="10.7.0.1/32"
+    UNIFI_ADDR="10.7.0.2/32"
+    INNER_DNS="8.8.8.8"
+    LOGLEVEL="warning"
+    PING_MODE="get"
+    PING_URL="https://www.gstatic.com/generate_204"
+    PING_TIMEOUT="5"
+    SUB_REFRESH_HOURS="6"
+    FALLBACK="off"
+    FB_INTERVAL="20"              # seconds between watchdog runs
+    FB_DOWN="3"                   # failed checks before a node is offline
+    FB_UP="5"                     # good checks before a node is back online
+    FB_TIMEOUT="5"                # seconds per check
+    FB_RETURN="on"
+    SUB_USER_AGENT="$SUB_USER_AGENT_DEFAULT"
+}
+settings_defaults
 TAB="$(printf '\t')"
 
 # --------------------------------------------------------------------------
@@ -625,6 +629,10 @@ locked_call() {
     set -e
     acquire_lock
     recover_transaction
+    # Prompts run unlocked. Another process may have committed settings while
+    # this menu was waiting, so apply the requested delta to the current state.
+    settings_defaults
+    load_settings
     "$@"
     _locked_rc=$?
     if [ -n "$TXN_DIR" ]; then
