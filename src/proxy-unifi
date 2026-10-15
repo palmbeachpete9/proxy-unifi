@@ -4352,7 +4352,7 @@ sub_refresh_all() {
     _rf_rc=0
     for _rf in $_rf_ids; do
         ensure_run_dir; _rf_cand="$RUN_DIR/refresh-$_rf.json"
-        _rf_url="$(cat "$SUB_DIR/$_rf/url.txt")"
+        _rf_url="$(cat "$SUB_DIR/$_rf/url.txt" 2>/dev/null)" || continue   # removed meanwhile
         if sub_fetch_to "$_rf_url" "$_rf_cand" "$(sub_ua "$_rf")"; then
             if ( locked_call sub_install "$_rf" "$_rf_cand" "$_rf_url" ); then
                 [ "${_AUTO_REFRESH:-0}" = 1 ] || c_grn "Subscription $_rf refreshed."

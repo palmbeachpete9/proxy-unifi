@@ -607,6 +607,23 @@ wait "$_rp" || true
 cp "$T/mksub.real" "$T/root/bin/mksub.py"
 [ "$(hash_file "$T/root/etc/subscription/2/catalog.json")" = "$CAT2_HASH" ]
 printf 'https://two.example/s' > "$T/root/etc/subscription/2/url.txt"
+# A subscription removed while the refresh runs is skipped; the ones after it
+# are still refreshed.
+mkdir -p "$T/root/etc/subscription/3" "$T/root/etc/subscription/4"
+printf 'https://three.example/s' > "$T/root/etc/subscription/3/url.txt"
+printf 'https://four.example/s' > "$T/root/etc/subscription/4/url.txt"
+cat > "$T/root/bin/mksub.py" <<PY
+import runpy, shutil, sys
+if sys.argv[1:2] == ["fetch"]:
+    shutil.rmtree("$T/root/etc/subscription/3", ignore_errors=True)
+    sys.exit("mksub: error: no network in the sandbox")
+sys.argv[0] = "$T/mksub.real"
+runpy.run_path("$T/mksub.real", run_name="__main__")
+PY
+run_cli sub-refresh-auto >/dev/null 2>&1 || true
+cp "$T/mksub.real" "$T/root/bin/mksub.py"
+grep -q '^fail [0-9]* no network in the sandbox$' "$T/root/etc/subscription/4/status"
+rm -rf "$T/root/etc/subscription/4"
 
 # The fallback watchdog: subscription 2 holds two-a (1.1.1.1) and two-b
 # (1.0.0.1, active). The pool is built with the module directly here; the
