@@ -579,6 +579,34 @@ grep -q '^fail [0-9]* no network in the sandbox$' "$T/root/etc/subscription/2/st
 grep -q '@1.0.0.1:' "$T/root/etc/link.txt"
 [ ! -e "$T/root/.lock" ] || exit 1
 [ ! -e "$T/root/.transactions/active" ] || exit 1
+# A refresh that finishes after its subscription was replaced (same number,
+# another URL) is discarded: the new provider keeps its own nodes.
+python3 - "$REPO/src" "$T/other-catalog.json" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import mksub
+json.dump(mksub.process_body(b"trojan://p@old.example.com:443?security=tls#old-provider"), open(sys.argv[2], "w"))
+PY
+CAT2_HASH="$(hash_file "$T/root/etc/subscription/2/catalog.json")"
+rm -f "$T/fetching"
+cat > "$T/root/bin/mksub.py" <<PY
+import runpy, sys, time
+if sys.argv[1:2] == ["fetch"]:
+    open("$T/fetching", "w").close()
+    time.sleep(3)
+    sys.stdout.write(open("$T/other-catalog.json").read())
+    sys.exit(0)
+sys.argv[0] = "$T/mksub.real"
+runpy.run_path("$T/mksub.real", run_name="__main__")
+PY
+run_cli sub-refresh-auto >/dev/null 2>&1 &
+_rp=$!; _i=0
+while [ ! -e "$T/fetching" ] && [ "$_i" -lt 200 ]; do _i=$((_i + 1)); sleep 0.05; done
+printf 'https://replacement.example/s' > "$T/root/etc/subscription/2/url.txt"
+wait "$_rp" || true
+cp "$T/mksub.real" "$T/root/bin/mksub.py"
+[ "$(hash_file "$T/root/etc/subscription/2/catalog.json")" = "$CAT2_HASH" ]
+printf 'https://two.example/s' > "$T/root/etc/subscription/2/url.txt"
 
 # The fallback watchdog: subscription 2 holds two-a (1.1.1.1) and two-b
 # (1.0.0.1, active). The pool is built with the module directly here; the

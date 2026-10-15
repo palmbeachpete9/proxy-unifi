@@ -109,7 +109,8 @@ static_tests() {
     if have shellcheck; then
         _sc_log="$(mktemp)"
         shellcheck -s sh "$SRC/proxy-unifi" "$SRC/on_boot.sh" "$ROOT/install.sh" \
-            "$ROOT/tests/run.sh" "$ROOT/tests/lifecycle.sh" "$ROOT/tests/ingress-lab.sh" > "$_sc_log" 2>&1 &
+            "$ROOT/tests/run.sh" "$ROOT/tests/lifecycle.sh" "$ROOT/tests/ingress-lab.sh" \
+            "$ROOT/tools/lan-route-diag.sh" > "$_sc_log" 2>&1 &
         _sc_pid=$!
     else printf '  skip shellcheck (not installed)\n'; fi
     if have dash; then
@@ -157,6 +158,14 @@ PY
     [ -n "$_child" ] && proc_alive "$_child" && _dead=0
     if [ "$_src" = 124 ] && [ "$_dead" = 1 ]; then ok "safe validator timeout kills process group"
     else bad "safe validator timeout kills process group"; [ "$_dead" = 1 ] || kill "$_child" 2>/dev/null || true; fi
+    # A validator that exits leaves nothing behind, even a child ignoring TERM.
+    # shellcheck disable=SC2016 # $!/$1 expand inside the child shell
+    python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 30 --memory-mb 64 --fsize-mb 1 -- \
+        sh -c 'trap "" TERM; sleep 30 & echo $! > "$1/left"; exit 0' sh "$_sd" >/dev/null 2>&1
+    sleep 0.3
+    if [ -s "$_sd/left" ] && proc_alive "$(cat "$_sd/left")"; then
+        bad "safe validator leaves no process behind"; kill -9 "$(cat "$_sd/left")" 2>/dev/null
+    else ok "safe validator leaves no process behind"; fi
     # A hang-up (an SSH session closing mid-ping) stops the validator's group too.
     # shellcheck disable=SC2016 # $$/$1 expand inside the child shell
     python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 30 --memory-mb 64 --fsize-mb 1 -- \
@@ -639,7 +648,8 @@ FAILADD=1; fw_lock; FAILADD=0; fw_is_locked 51821 || exit 1
 { echo ACCEPT_WG; cat "$D/v4.input"; } > "$D/v4.n"; mv "$D/v4.n" "$D/v4.input"
 if fw_is_locked 51821; then exit 1; fi
 fw_lock && fw_is_locked 51821 || exit 1
-[ "$(head -n 1 "$D/v4.input")" = PROXY_UNIFI_WG ] && [ "$(grep -c '^PROXY_UNIFI_WG$' "$D/v4.input")" = 1 ] || exit 1
+# The old jump stays: deleting it by position could hit a rule UniFi inserted meanwhile.
+[ "$(head -n 1 "$D/v4.input")" = PROXY_UNIFI_WG ] && [ "$(grep -c '^PROXY_UNIFI_WG$' "$D/v4.input")" = 2 ] || exit 1
 { echo PROXY_UNIFI_IN; cat "$D/v4.input"; } > "$D/v4.n"; mv "$D/v4.n" "$D/v4.input"
 fw_is_locked 51821 || exit 1
 # A new port: its rule is in place before the old one goes.
@@ -1659,6 +1669,12 @@ vnext = json.loads(json.dumps(base)); vnext["outbounds"][0]["settings"]["Vnext"]
 assert rejected(vnext)
 keyfile = json.loads(json.dumps(base)); keyfile["outbounds"][0]["streamSettings"] = {"tlsSettings": {"certificates": [{"CertificateFile": "/etc/shadow"}]}}
 assert rejected(keyfile)
+longs = json.loads(json.dumps(base)); longs["inbound\u017f"] = [{"protocol": "socks", "port": 1080}]
+assert rejected(longs)                                             # Go folds the long s to "s"
+twice = json.loads(json.dumps(base))
+twice["burstObservatory"] = {"subjectSelector": ["proxy"], "probeURL": "https://www.gstatic.com/generate_204",
+                             "probeUrl": "http://127.0.0.1:9/"}
+assert rejected(twice)                                             # both spellings: we read one, Xray the other
 headers = json.loads(json.dumps(base))                             # user maps keep their own spelling
 headers["outbounds"][0]["streamSettings"] = {"network": "ws", "wsSettings": {"headers": {"Host": "a.example.com"}}}
 mkjson.validate_profile(headers)
@@ -1667,6 +1683,9 @@ bad = json.loads(json.dumps(base)); bad["remarks"] = "bad"
 bad["routing"]["balancers"] = [{"tag": "B", "selector": ["proxy"], "fallbackTag": ["direct"]}]
 good = json.loads(json.dumps(base)); good["remarks"] = "good"
 cat = mksub.process_body(json.dumps([bad, good]).encode())
+assert [n["recognized"] for n in cat["nodes"]] == [False, True], cat["nodes"]
+huge = json.dumps(base).replace('"port": 443', '"port": 1e309').replace("}", ', "remarks": "huge"}', 1)
+cat = mksub.process_body(("[" + huge + "," + json.dumps(good) + "]").encode())
 assert [n["recognized"] for n in cat["nodes"]] == [False, True], cat["nodes"]
 PY
 
