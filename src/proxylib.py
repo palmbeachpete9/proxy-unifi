@@ -20,6 +20,7 @@ import base64
 import ipaddress
 import json
 import os
+import re
 import sys
 import unicodedata
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -35,12 +36,18 @@ SS2022_MAX_KEYS = 16
 SINGBOX_SS_PLUGINS = ("obfs-local", "simple-obfs", "v2ray-plugin")
 
 
+_UNSAFE_TEXT = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+
+
 def die(msg):
     """Print 'PROG: error: MSG' to stderr and exit 2. PROG is derived from the
     invoked script name so each generator keeps its own identity in errors."""
     prog = os.path.basename(sys.argv[0]) or "proxy-unifi"
     if prog.endswith(".py"):
         prog = prog[:-3]
+    # Messages quote provider text: escape controls, so none reach the terminal.
+    msg = _UNSAFE_TEXT.sub(lambda m: "\\x%02x" % ord(m.group()) if ord(m.group()) < 0x100
+                           else "\\u%04x" % ord(m.group()), str(msg))
     sys.stderr.write("%s: error: %s\n" % (prog, msg))
     sys.exit(2)
 

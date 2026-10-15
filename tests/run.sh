@@ -103,6 +103,17 @@ PY
     [ -n "$_child" ] && proc_alive "$_child" && _dead=0
     if [ "$_src" = 124 ] && [ "$_dead" = 1 ]; then ok "safe validator timeout kills process group"
     else bad "safe validator timeout kills process group"; [ "$_dead" = 1 ] || kill "$_child" 2>/dev/null || true; fi
+    # A hang-up (an SSH session closing mid-ping) stops the validator's group too.
+    # shellcheck disable=SC2016 # $$/$1 expand inside the child shell
+    python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 30 --memory-mb 64 --fsize-mb 1 -- \
+        sh -c 'echo $$ > "$1/hup"; exec sleep 30' sh "$_sd" >/dev/null 2>&1 &
+    _sx=$!; _i=0
+    while [ ! -s "$_sd/hup" ] && [ "$_i" -lt 100 ]; do _i=$((_i + 1)); sleep 0.05 2>/dev/null || sleep 1; done
+    kill -HUP "$_sx" 2>/dev/null; _i=0
+    while proc_alive "$(cat "$_sd/hup")" && [ "$_i" -lt 40 ]; do _i=$((_i + 1)); sleep 0.05 2>/dev/null || sleep 1; done
+    if proc_alive "$(cat "$_sd/hup")"; then bad "safe validator stops its group on a hang-up"; kill "$(cat "$_sd/hup")" 2>/dev/null
+    else ok "safe validator stops its group on a hang-up"; fi
+    wait "$_sx" 2>/dev/null
     rm -rf "$_sd"
     if [ "$(uname -s)" = Linux ]; then
         python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 10 --memory-mb 64 --fsize-mb 1 -- \
@@ -116,6 +127,37 @@ PY
     else
         ok "proxy credentials and keys stay out of child argv"
     fi
+
+    # A failed AmneziaWG update must not leave an older core accepted.
+    _aw="$(mktemp -d)"
+    printf '#!/bin/sh\necho "sing-box version proxy-unifi-awg-1.0.0"\n' > "$_aw/amnezia-box"; chmod 755 "$_aw/amnezia-box"
+    {
+        echo "ABIN='$_aw/amnezia-box'; AWG_CORE_VERSION=1.1.0"
+        echo 'fatal() { exit 1; }; cmd_install_awg() { return 1; }'
+        sed -n '/^_awg_version_ok() {/,/^}/p; /^ensure_awg() {/,/^}/p' "$SRC/proxy-unifi"
+        echo 'ensure_awg'
+    } > "$_aw/e.sh"
+    if sh "$_aw/e.sh" 2>/dev/null; then bad "a failed AmneziaWG update rejects the older core"
+    else ok "a failed AmneziaWG update rejects the older core"; fi
+    rm -rf "$_aw"
+    # A rollback renders the service from the restored settings, not from the
+    # failed operation's values still in memory.
+    _rr="$(mktemp -d)"
+    {
+        echo "SETTINGS='$_rr/settings.env'; SERVICE_FILE='$_rr/unit'; SERVICE_NAME=proxy-unifi; FB_SERVICE_NAME=f"
+        cat <<'SH'
+WG_PORT=51999
+systemctl() { :; }; fw_reconcile() { :; }; write_refresh_timer() { :; }
+write_service() { echo "$WG_PORT" > "$SERVICE_FILE"; }
+SH
+        sed -n '/^_uint() {/p; /^load_settings() {/,/^}/p; /^restore_runtime_state() {/,/^}/p' "$SRC/proxy-unifi"
+        # shellcheck disable=SC2016 # expands in the generated script
+        echo 'mkdir -p "$1/s"; : > "$1/s/runtime-state"; restore_runtime_state "$1/s"; cat "$SERVICE_FILE"'
+    } > "$_rr/r.sh"
+    printf 'WG_PORT="51821"\n' > "$_rr/settings.env"; : > "$_rr/unit"
+    if [ "$(sh "$_rr/r.sh" "$_rr" 2>/dev/null)" = 51821 ]; then ok "a rollback renders the unit from the restored settings"
+    else bad "a rollback renders the unit from the restored settings"; fi
+    rm -rf "$_rr"
 
     _ud="$(mktemp -d)"
     {
@@ -290,6 +332,37 @@ SH
     fi
     [ "$_install_restore" = 1 ] && ok "installer rollback restores scripts, cores, and assets" \
         || bad "installer rollback restores scripts, cores, and assets"
+
+    # The documented "curl ... | sh" bootstrap must not take files from the
+    # current directory; running a clone's own install.sh uses that clone.
+    _bs="$(mktemp -d)"; mkdir -p "$_bs/src"; printf '#!/bin/sh\n' > "$_bs/src/proxy-unifi"
+    sed -n '/^# Resolve where we copy source files from/,/^CACHEBUST=/p' "$ROOT/install.sh" | sed '$d' > "$_bs/install.sh"
+    # shellcheck disable=SC2016 # expands in the generated script
+    printf 'echo "[$SCRIPT_DIR]"\n' >> "$_bs/install.sh"
+    _piped="$(cd "$_bs" && sh < "$_bs/install.sh")"
+    _file="$(cd / && sh "$_bs/install.sh")"
+    if [ "$_piped" = "[]" ] && [ "$_file" = "[$(cd "$_bs" && pwd)]" ]
+    then ok "piped installer ignores a src/ folder in the current directory"
+    else bad "piped installer ignores a src/ folder in the current directory (got: $_piped / $_file)"; fi
+    # Nothing is promoted when the service-state snapshot (needed to roll back) fails,
+    # even though the installer runs this function in an if (where set -e is off).
+    _pf="$_bs/promote"; mkdir -p "$_pf"
+    {
+        echo "WORKDIR='$_pf/w'; BIN_DIR='$_pf/bin'; PROMOTION_BACKUP='$_pf/backup'"
+        echo "PROMOTION_MARKER='$_pf/marker'; ONBOOT_DST='$_pf/onboot'; PYTHON=python3; PROXY_UNIFI_RAW=1"
+        cat <<'SH'
+fetch() { if [ "$1" = proxy-unifi ]; then printf '#!/bin/sh\n:\n' > "$2"; else printf '# x\n' > "$2"; fi; }
+snapshot_service_state() { return 37; }
+SH
+        sed -n '/^_install_files_locked() {/,/^}/p' "$ROOT/install.sh"
+        cat <<'SH'
+set -e; mkdir -p "$WORKDIR"; if _install_files_locked; then exit 1; fi
+SH
+    } > "$_pf/run.sh"
+    if sh "$_pf/run.sh" 2>/dev/null && [ ! -e "$_pf/bin/proxy-unifi" ] && [ ! -e "$_pf/marker" ]
+    then ok "installer promotes nothing without its service-state snapshot"
+    else bad "installer promotes nothing without its service-state snapshot"; fi
+    rm -rf "$_bs"
     rm -rf "$_id"
 
     _bd="$(mktemp -d)"
@@ -378,20 +451,32 @@ SH
     # Exercise firewall ownership and IPv6 fail-closed behavior against a stateful
     # iptables mock rather than only grepping the rendered unit.
     _fd="$(mktemp -d)"
+    # An ordered iptables model: INPUT keeps rule order, the guard chain keeps
+    # its ports, -S prints rules the way iptables does, and every flush is logged.
     cat > "$_fd/fw.sh" <<'SH'
-FW_CHAIN=PROXY_UNIFI_WG; WG_PORT=51821; D="$WORK"; FAIL6=0
+FW_CHAIN=PROXY_UNIFI_WG; INGRESS_IN_CHAIN=PROXY_UNIFI_IN; WG_PORT=51821; D="$WORK"; FAIL6=0; FAILADD=0
 load_settings() { :; }; err() { :; }; have() { command -v "$1" >/dev/null 2>&1; }
+_port_of() { printf '%s\n' "$*" | sed -n 's/.*--dport \([0-9]*\).*/\1/p'; }
 mock_iptables() {
-    _fam="$1"; shift; _base="$D/$_fam"
+    _fam="$1"; shift; _in="$D/$_fam.input"; _ch="$D/$_fam.chain"; touch "$_in"
     case "$1:$2" in
-        -N:*) [ ! -f "$_base.chain" ] || return 1; : > "$_base.chain" ;;
-        -F:*) [ -f "$_base.chain" ] || return 1; rm -f "$_base.rule" ;;
-        -A:*) printf '%s\n' "$6" > "$_base.rule" ;;
-        -C:INPUT) [ -f "$_base.jump" ] ;;
-        -C:*) [ -f "$_base.rule" ] && [ "$(cat "$_base.rule")" = "$6" ] ;;
-        -I:INPUT) : > "$_base.jump" ;;
-        -D:INPUT) rm -f "$_base.jump" ;;
-        -X:*) rm -f "$_base.chain" ;;
+        -N:"$FW_CHAIN") [ ! -f "$_ch" ] || return 1; : > "$_ch" ;;
+        -F:"$FW_CHAIN") echo flush >> "$D/$_fam.log"; [ -f "$_ch" ] || return 1; : > "$_ch" ;;
+        -X:"$FW_CHAIN") rm -f "$_ch" ;;
+        -A:"$FW_CHAIN") [ "$FAILADD" = 0 ] && [ -f "$_ch" ] || return 1; _port_of "$@" >> "$_ch" ;;
+        -C:"$FW_CHAIN") [ -f "$_ch" ] && grep -qx "$(_port_of "$@")" "$_ch" ;;
+        -D:"$FW_CHAIN") _x="$(_port_of "$@")"; grep -vx "$_x" "$_ch" > "$_ch.n"; mv "$_ch.n" "$_ch" ;;
+        -S:"$FW_CHAIN") [ -f "$_ch" ] || return 1; echo "-N $FW_CHAIN"
+            while read -r _x; do echo "-A $FW_CHAIN ! -i lo -p udp -m udp --dport $_x -j DROP"; done < "$_ch" ;;
+        -I:INPUT) { echo "$5"; cat "$_in"; } > "$_in.n"; mv "$_in.n" "$_in" ;;
+        -C:INPUT) grep -qx "$4" "$_in" ;;
+        -D:INPUT) if [ "$3" = -j ]; then awk -v t="$4" '$0 == t && !d { d = 1; next } 1' "$_in" > "$_in.n"
+                  else awk -v n="$3" 'NR != n' "$_in" > "$_in.n"; fi; mv "$_in.n" "$_in" ;;
+        -S:INPUT) echo "-P INPUT ACCEPT"
+            while read -r _x; do
+                if [ "$_x" = ACCEPT_WG ]; then echo "-A INPUT -p udp -m udp --dport 51821 -j ACCEPT"
+                else echo "-A INPUT -j $_x"; fi
+            done < "$_in" ;;
         *) return 1 ;;
     esac
 }
@@ -402,15 +487,39 @@ SH
     cat >> "$_fd/fw.sh" <<'SH'
 _ipv6_enabled() { return 0; }
 fw_lock && fw_is_locked 51821 || exit 1
-[ -f "$D/v4.jump" ] && [ -f "$D/v6.jump" ] || exit 1
+[ "$(cat "$D/v4.input")" = PROXY_UNIFI_WG ] && [ "$(cat "$D/v6.input")" = PROXY_UNIFI_WG ] || exit 1
+# A correct guard is left alone: reconciling never flushes it (no unguarded gap).
+rm -f "$D/v4.log"; fw_lock || exit 1; [ ! -e "$D/v4.log" ] || exit 1
+# A repair that cannot add the rule keeps the rule already there.
+FAILADD=1; fw_lock; FAILADD=0; fw_is_locked 51821 || exit 1
+# An ACCEPT placed before the guard bypasses it: not reported as locked, and
+# fw_lock puts the guard back in front (only the kernel ingress chain may precede it).
+{ echo ACCEPT_WG; cat "$D/v4.input"; } > "$D/v4.n"; mv "$D/v4.n" "$D/v4.input"
+if fw_is_locked 51821; then exit 1; fi
+fw_lock && fw_is_locked 51821 || exit 1
+[ "$(head -n 1 "$D/v4.input")" = PROXY_UNIFI_WG ] && [ "$(grep -c '^PROXY_UNIFI_WG$' "$D/v4.input")" = 1 ] || exit 1
+{ echo PROXY_UNIFI_IN; cat "$D/v4.input"; } > "$D/v4.n"; mv "$D/v4.n" "$D/v4.input"
+fw_is_locked 51821 || exit 1
+# A new port: its rule is in place before the old one goes.
+WG_PORT=51822; fw_lock && fw_is_locked 51822 || exit 1
+[ "$(cat "$D/v4.chain")" = 51822 ] || exit 1
+WG_PORT=51821; fw_lock || exit 1
 fw_unlock
-[ ! -e "$D/v4.jump" ] && [ ! -e "$D/v6.jump" ] || exit 1
+grep -q PROXY_UNIFI_WG "$D/v4.input" "$D/v6.input" && exit 1
+# Without a working ip6tables the guard fails closed, and IPv4 protection stays.
 FAIL6=1
 if fw_lock; then exit 1; fi
-[ ! -e "$D/v4.jump" ] && [ ! -e "$D/v4.chain" ] || exit 1
+grep -qx PROXY_UNIFI_WG "$D/v4.input" || exit 1
 SH
     if WORK="$_fd" sh "$_fd/fw.sh"; then ok "firewall guard owns rules and fails closed on IPv6"
     else bad "firewall guard owns rules and fails closed on IPv6"; fi
+    # Linux reports /proc/net/if_inet6 as size 0 even with addresses in it.
+    if [ -r /proc/net/if_inet6 ] && grep -q . /proc/net/if_inet6; then
+        # shellcheck disable=SC2016 # the function's body is evaluated in the child shell
+        if sh -c "$(sed -n '/^_ipv6_enabled()/p' "$SRC/proxy-unifi"); _ipv6_enabled"
+        then ok "IPv6 counts as enabled when the kernel lists addresses"
+        else bad "IPv6 counts as enabled when the kernel lists addresses"; fi
+    fi
     rm -rf "$_fd"
 
     if [ -n "$_sc_log" ]; then
@@ -860,6 +969,89 @@ for bad_header in ("bad\r\nX: y", "emoji-\U0001f600", "\u043a\u0438\u0440\u0438\
         raise AssertionError("accepted bad header")
     except SystemExit:
         pass
+PY
+
+
+    # Xray reads JSON field names case-insensitively: a field the validator or
+    # sanitizer handles must not slip past it spelled differently ("Inbounds",
+    # "Redirect", "Vnext"). One malformed profile must not abort the whole feed.
+    py_case "provider JSON: fields spelled as the core reads them; bad profiles stay local" "$SRC" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import mkjson, mksub
+base = {"inbounds": [{"tag": "socks", "protocol": "socks", "port": 10808}],
+        "outbounds": [{"protocol": "vless", "tag": "proxy",
+                       "settings": {"vnext": [{"address": "a.example.com", "port": 443}]}},
+                      {"protocol": "freedom", "tag": "direct"}],
+        "routing": {"rules": [{"type": "field", "outboundTag": "proxy"}]}}
+mkjson.validate_profile(json.loads(json.dumps(base)))            # the plain profile is fine
+def rejected(cfg):
+    try:
+        mkjson.validate_profile(cfg)
+    except SystemExit:
+        return True
+    return False
+alias = json.loads(json.dumps(base)); alias["Inbounds"] = [{"protocol": "socks", "listen": "0.0.0.0", "port": 1080}]
+assert rejected(alias)
+api = json.loads(json.dumps(base)); api["API"] = {"tag": "api", "services": ["HandlerService"]}
+assert rejected(api)
+redirect = json.loads(json.dumps(base)); redirect["outbounds"][1]["settings"] = {"Redirect": "192.168.1.1:22"}
+assert rejected(redirect)
+vnext = json.loads(json.dumps(base)); vnext["outbounds"][0]["settings"]["Vnext"] = [{"address": "10.0.0.1", "port": 1}]
+assert rejected(vnext)
+keyfile = json.loads(json.dumps(base)); keyfile["outbounds"][0]["streamSettings"] = {"tlsSettings": {"certificates": [{"CertificateFile": "/etc/shadow"}]}}
+assert rejected(keyfile)
+headers = json.loads(json.dumps(base))                             # user maps keep their own spelling
+headers["outbounds"][0]["streamSettings"] = {"network": "ws", "wsSettings": {"headers": {"Host": "a.example.com"}}}
+mkjson.validate_profile(headers)
+# a list where a tag belongs makes that one profile unsupported, not the feed unreadable
+bad = json.loads(json.dumps(base)); bad["remarks"] = "bad"
+bad["routing"]["balancers"] = [{"tag": "B", "selector": ["proxy"], "fallbackTag": ["direct"]}]
+good = json.loads(json.dumps(base)); good["remarks"] = "good"
+cat = mksub.process_body(json.dumps([bad, good]).encode())
+assert [n["recognized"] for n in cat["nodes"]] == [False, True], cat["nodes"]
+PY
+    # Provider text in hostile shapes: cleaning a label stays fast however long
+    # it is, error messages never carry terminal control codes, and a feed is
+    # refused if its saved node list would be too large to read back.
+    py_case "provider text: fast cleaning, clean errors, readable catalog" "$SRC" <<'PY'
+import json, os, subprocess, sys, tempfile, time
+src = sys.argv[1]; sys.path.insert(0, src)
+import mksub
+t = time.time()
+assert "\x1b" not in mksub.clean("\x1b]" * 40000, 36)
+assert time.time() - t < 0.5, time.time() - t                   # was ~2 s on a laptop, quadratic
+link = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.example.com:443?security=none&type=tcp&%1B%5D52%3Bc%3BaGk%3D%07=1#x"
+with tempfile.TemporaryDirectory() as tmp:
+    lf = os.path.join(tmp, "link"); open(lf, "w").write(link)
+    err = subprocess.run([sys.executable, os.path.join(src, "mkxray.py"), "--link-file", lf, "--port", "1",
+                          "--secret-key", "x", "--peer-pubkey", "y"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE).stderr
+    assert err and b"\x1b" not in err and b"\x07" not in err, err
+    # a feed under the 2 MB response cap whose saved catalog would exceed the reader's cap
+    body = b"[" + b",".join(b'{"remarks":"' + b"\xff" * 195000 + b'","inbounds":[{"protocol":"socks",'
+                            b'"tag":"socks"}],"outbounds":[{"protocol":"freedom","tag":"plain"}],"meta":'
+                            + str(i).encode() + b"}" for i in range(9)) + b"]"
+    assert len(body) < mksub.MAX_BYTES, len(body)
+    bf = os.path.join(tmp, "body"); open(bf, "wb").write(body)
+    out = os.path.join(tmp, "cat")
+    rc = subprocess.run([sys.executable, os.path.join(src, "mksub.py"), "fetch", "--body-file", bf],
+                        stdout=open(out, "wb"), stderr=subprocess.PIPE).returncode
+    if rc == 0:
+        mksub._load(out)                                         # whatever fetch emits must read back
+PY
+
+    # A provider that answers slowly enough never trips a per-read timeout; the
+    # whole fetch still ends at its deadline instead of hanging the refresh.
+    py_case "subscription fetch ends at its deadline" "$SRC" <<'PY'
+import subprocess, sys, time
+code = ("import sys, time; sys.path.insert(0, %r); import mksub; mksub.DEADLINE = 1; "
+        "mksub.fetch_url = lambda *a: time.sleep(30); "
+        "sys.argv = ['mksub.py', 'fetch', '--url', 'https://x.example/']; mksub.main()" % sys.argv[1])
+start = time.time()
+done = subprocess.run([sys.executable, "-c", code], stderr=subprocess.PIPE, timeout=25)
+assert time.time() - start < 6 and done.returncode != 0, (time.time() - start, done)
+assert b"took longer" in done.stderr, done.stderr
 PY
 
     # mkawg: AWG 1.5-3.1 parser, bridge generator, profile catalog, and UI safety.

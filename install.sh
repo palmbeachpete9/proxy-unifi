@@ -201,8 +201,15 @@ PY
     fi
 }
 
-# Resolve where we copy source files from: local clone if present, else download.
-SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || echo "")"
+# Resolve where we copy source files from: the clone this install.sh was run
+# from (sh install.sh), else the pinned download. Piped ("curl ... | sh"), $0
+# is the shell, and a src/ folder in the current directory must not be used.
+SCRIPT_DIR=""
+case "$0" in
+    install.sh|*/install.sh)
+        SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || echo "")"
+        [ -f "$SCRIPT_DIR/src/proxy-unifi" ] || SCRIPT_DIR="" ;;
+esac
 # Per-run nonce appended to every download URL. raw.githubusercontent.com is
 # served through a CDN that caches each path for minutes; a reinstall could
 # otherwise pull a STALE script (this is exactly what made an emoji fix look
@@ -377,8 +384,9 @@ _install_files_locked() {
     head -1 "$_stage/proxy-unifi" | grep -q '^#!/bin/sh' || { echo "fetched proxy-unifi looks wrong" >&2; return 1; }
     sh -n "$_stage/proxy-unifi" && sh -n "$_stage/on_boot.sh" || return 1
     "$PYTHON" -m py_compile "$_stage"/*.py || return 1
-    snapshot_service_state
-    _backup="$PROMOTION_BACKUP"; mkdir -p "$_backup"
+    # Checked explicitly: this function runs inside an if, where set -e is off.
+    snapshot_service_state || { echo "could not record the service state for a rollback" >&2; return 1; }
+    _backup="$PROMOTION_BACKUP"; mkdir -p "$_backup" || return 1
     for f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py \
              xray sing-box amnezia-box geoip.dat geosite.dat; do
         if [ -e "$BIN_DIR/$f" ]; then cp -p "$BIN_DIR/$f" "$_backup/$f" || return 1

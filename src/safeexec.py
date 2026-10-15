@@ -104,15 +104,26 @@ def main():
         elif os.geteuid() != account.pw_uid:
             raise PermissionError("cannot switch to requested service account")
 
+    # The child runs in its own session, so signals meant for this run must be
+    # passed on, and a hang-up (the SSH session closed mid-ping) cancels it.
+    # Installed before the child starts: one arriving in between is kept.
+    started, pending = [], []
+
+    def forward(signum, _frame):
+        signum = signal.SIGTERM if signum == signal.SIGHUP else signum
+        if started:
+            _kill_group(started[0].pid, signum)
+        else:
+            pending.append(signum)
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, forward)
     try:
         proc = subprocess.Popen(command, preexec_fn=prepare)
     except (OSError, subprocess.SubprocessError) as exc:
         return fail("could not start validator: %s" % exc)
-
-    def forward(signum, _frame):
-        _kill_group(proc.pid, signum)
-    signal.signal(signal.SIGTERM, forward)
-    signal.signal(signal.SIGINT, forward)
+    started.append(proc)
+    if pending:
+        _kill_group(proc.pid, pending[0])
     deadline = time.monotonic() + args.timeout
     memory_limit = args.memory_mb * 1024 * 1024
     reason = ""
