@@ -63,9 +63,11 @@ for _name in ("log", "api", "dns", "routing", "policy", "inbounds", "outbounds",
               "proxySettings", "dialerProxy", "vnext", "servers", "peers", "users", "accounts",
               "address", "server", "port", "server_port", "endpoint", "redirect", "protocol",
               "tag", "rules", "balancers", "selector", "subjectSelector", "fallbackTag",
-              "balancerTag", "outboundTag", "inboundTag", "strategy", "probeURL", "probeUrl",
+              "balancerTag", "outboundTag", "inboundTag", "webhook", "strategy", "probeURL",
+              "probeUrl",
               "pingConfig", "destination", "interval", "timeout", "sampling", "probeInterval",
-              "hosts", "sniffing", "network", "source", "sourcePort", "user", "type", "remarks",
+              "hosts", "sniffing", "network", "source", "sourceIP", "sourcePort", "localIP",
+              "localPort", "user", "type", "remarks",
               "dnsLog", "access", "error", "loglevel", "downloadSettings", "unixSettings",
               "dsSettings", "certificateFile", "keyFile", "masterKeyLog", "socketPath",
               "unixSocket", "unixSocketPath"):
@@ -124,10 +126,13 @@ def _validate_untrusted_tree(value, path="profile"):
         if path.endswith(".downloadSettings"):
             validate_xhttp_download_settings(value)
         folded = {}
+        # Header names, DNS host aliases and routing attribute names are data,
+        # not core fields: a header called "Webhook" is not a webhook.
+        data_map = path.rsplit(".", 1)[-1] in ("headers", "hosts", "attrs")
         for key, child in value.items():
             if not isinstance(key, str):
                 die("%s has a non-string key" % path)
-            spellings = _CHECKED_FIELDS.get(key.casefold())
+            spellings = None if data_map else _CHECKED_FIELDS.get(key.casefold())
             if spellings and key not in spellings:
                 die("%s.%s must be spelled %s" % (path, key, " or ".join(sorted(spellings))))
             # Two spellings of one field ("probeURL" and "probeUrl"): we would
@@ -276,8 +281,15 @@ def validate_profile(cfg):
         die("profile has a malformed routing rule")
     rules = [r for r in rules if _rule_applies(r, primary_tag)]
     for r in rules:
-        if r.get("user") or r.get("source") or r.get("sourcePort"):
-            die("profile routing depends on source/user identity, which a "
+        # Routing webhooks create their own HTTP client and send per-connection
+        # metadata outside the configured outbounds. Provider profiles do not
+        # have permission to enable this separate telemetry/control feature.
+        # The core treats absent/null/empty objects as disabled.
+        if r.get("webhook") not in (None, {}):
+            die("provider routing webhooks are not supported")
+        if any(r.get(field) for field in ("user", "source", "sourceIP", "sourcePort",
+                                           "localIP", "localPort")):
+            die("profile routing depends on source/user/local-entry identity, which a "
                 "WireGuard entry cannot reproduce; not supported")
 
     balancers = routing.get("balancers", [])

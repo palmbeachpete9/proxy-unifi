@@ -227,6 +227,13 @@ WireGuard inbound. Provider outbounds, routing rules, balancer strategies,
 health probes, and failover tags otherwise remain intact. Profiles that cannot
 be projected safely are rejected before xray-core is started.
 
+Routing rules that depend on source/user identity or the provider's local entry
+address or port are rejected when they apply to the retained inbound. This
+includes `source`, `sourceIP`, `sourcePort`, `user`, `localIP` and `localPort`.
+Rules restricted to removed inbounds are discarded. Routing webhooks are not
+supported: they can send connection metadata through a separate HTTP client,
+outside the profile's configured outbounds.
+
 ## Fallback pool
 
 Main menu 3 sets up a pool of 2-10 nodes, from any of your subscriptions, in

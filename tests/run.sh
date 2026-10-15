@@ -956,6 +956,18 @@ parser_tests() {
         bad "provider routing preserves unrestricted inbound selectors"
         printf '%s\n' "$_routing_test"
     fi
+    if _context_test="$(python3 "$ROOT/tests/test_profile_context.py" 2>&1)"; then
+        ok "provider routing rejects unreproducible entry-context selectors"
+    else
+        bad "provider routing rejects unreproducible entry-context selectors"
+        printf '%s\n' "$_context_test"
+    fi
+    if _webhook_test="$(python3 "$ROOT/tests/test_profile_webhooks.py" 2>&1)"; then
+        ok "provider routing cannot enable connection metadata webhooks"
+    else
+        bad "provider routing cannot enable connection metadata webhooks"
+        printf '%s\n' "$_webhook_test"
+    fi
     if _hosts_test="$(python3 "$ROOT/tests/test_subscription_hosts.py" 2>&1)"; then
         ok "subscription destination policy uses activation host normalization"
     else
