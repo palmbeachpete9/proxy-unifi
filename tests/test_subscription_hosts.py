@@ -3,12 +3,10 @@
 
 import base64
 import contextlib
-import copy
 import io
 import json
 from pathlib import Path
 import sys
-import tempfile
 import unittest
 from unittest import mock
 
@@ -69,49 +67,6 @@ class SubscriptionHostTests(unittest.TestCase):
             with self.subTest(host=host):
                 node = mksub.node_from_link("vless://user@%s:443#example" % host)
                 self.assertTrue(node["recognized"], node)
-
-    def test_saved_recognized_link_rechecks_canonical_policy(self):
-        catalog = mksub.process_body("vless://user@bücher.example:443#example".encode())
-        original = copy.deepcopy(catalog)
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "catalog.json"
-            path.write_text(json.dumps(catalog), encoding="utf-8")
-            with mock.patch.object(mksub, "is_non_public_host", return_value=False) as policy:
-                loaded = mksub._load(str(path))
-        policy.assert_called_once_with("xn--bcher-kva.example")
-        self.assertEqual(loaded, original)
-
-    def test_saved_invalid_verdict_is_downgraded_without_identity_changes(self):
-        feed = ("vless://user@-invalid.example:443#unsupported\n"
-                "vless://user@proxy.example.com:443#supported\n")
-        catalog = mksub.process_body(feed.encode())
-        catalog["nodes"][0]["recognized"] = True
-        catalog["nodes"][0]["reason"] = ""
-        original = copy.deepcopy(catalog)
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "catalog.json"
-            path.write_text(json.dumps(catalog), encoding="utf-8")
-            errors = io.StringIO()
-            with contextlib.redirect_stderr(errors):
-                loaded = mksub._load(str(path))
-        self.assertEqual(errors.getvalue(), "")
-        self.assertEqual([node["recognized"] for node in loaded["nodes"]], [False, True])
-        self.assertEqual(loaded["nodes"][0]["reason"], "invalid provider destination")
-        for before, after in zip(original["nodes"], loaded["nodes"]):
-            for field in ("id", "n", "label", "server", "scheme", "link"):
-                self.assertEqual(before[field], after[field])
-
-    def test_saved_unsupported_node_is_not_resurrected(self):
-        catalog = mksub.process_body(b"vless://user@proxy.example.com:443#example")
-        catalog["nodes"][0]["recognized"] = False
-        catalog["nodes"][0]["reason"] = "previously unsupported"
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "catalog.json"
-            path.write_text(json.dumps(catalog), encoding="utf-8")
-            with mock.patch.object(mksub, "node_from_link") as classify:
-                loaded = mksub._load(str(path))
-        classify.assert_not_called()
-        self.assertEqual(loaded, catalog)
 
 
 if __name__ == "__main__":

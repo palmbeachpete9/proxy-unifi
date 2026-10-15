@@ -2256,16 +2256,9 @@ cmd_import_json() {
     # bounded input snapshot so regeneration uses the bytes that were applied.
     ensure_run_dir
     _profile_candidate="$RUN_DIR/profile.candidate"
-    py - "$_src" "$_profile_candidate" <<'PYEOF' || fatal "could not snapshot profile (empty, unreadable or larger than 2000000 bytes)"
-import os, sys
-with open(sys.argv[1], "rb") as source:
-    raw = source.read(2000001)
-if not raw or len(raw) > 2000000:
-    raise SystemExit(1)
-with open(sys.argv[2], "wb") as output:
-    os.fchmod(output.fileno(), 0o600)
-    output.write(raw)
-PYEOF
+    ( umask 077; head -c 2000001 "$_src" > "$_profile_candidate" ) || fatal "could not read profile"
+    [ -s "$_profile_candidate" ] && [ "$(wc -c < "$_profile_candidate")" -le 2000000 ] \
+        || fatal "profile is empty or larger than 2000000 bytes"
     _src="$_profile_candidate"
     load_settings
     _cmd_owned=0

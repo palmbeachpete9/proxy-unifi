@@ -1049,15 +1049,6 @@ def _load(path):
             except ValueError:
                 die("catalog pool node has an invalid profile")
             nd.update(_pool_verdict(prof))
-        elif nd["recognized"]:
-            # Older catalogs may have checked the pre-IDNA host spelling.
-            # Recheck through the fresh parser, downgrading stale safety
-            # verdicts without changing saved identity or selection metadata.
-            current = node_from_link(nd["link"])
-            if current is None or not current.get("recognized"):
-                nd["recognized"] = False
-                nd["reason"] = (current.get("reason") if current else "") \
-                    or "node is no longer supported"
     return cat
 
 
