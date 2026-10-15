@@ -1153,11 +1153,12 @@ _ipv6_enabled() { grep -q . /proc/net/if_inet6 2>/dev/null; }
 
 _fw_rule() { "$1" "$2" "$FW_CHAIN" -p udp --dport "$3" ! -i lo -j DROP 2>/dev/null; }   # <ipt> <-A|-C> <port>
 
-# 0 when INPUT reaches the guard before anything but the project's own chains.
+# 0 when INPUT reaches the guard before anything but the kernel ingress chain
+# (the project's only other INPUT chain).
 _fw_jump_first() {
-    "$1" -S INPUT 2>/dev/null | awk -v jump="-A INPUT -j $FW_CHAIN" '
+    "$1" -S INPUT 2>/dev/null | awk -v jump="-A INPUT -j $FW_CHAIN" -v ingress="-A INPUT -j $INGRESS_IN_CHAIN" '
         $0 == jump { found = 1; exit }
-        /^-A INPUT / && $0 !~ /^-A INPUT -j PROXY_UNIFI_[A-Z0-9_]+$/ { exit }
+        /^-A INPUT / && $0 != ingress { exit }
         END { exit !found }'
 }
 
