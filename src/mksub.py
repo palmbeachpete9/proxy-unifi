@@ -151,7 +151,9 @@ def clean(s, maxlen=FIELD_MAX):
     """Return terminal-safe Unicode while preserving letters and emoji."""
     if not s:
         return ""
-    value = unicodedata.normalize("NFC", _repair_mojibake(str(s)))
+    # ponytail: a label never needs more than this; the escape-stripping regexes
+    # below slow down quadratically on long hostile input.
+    value = unicodedata.normalize("NFC", _repair_mojibake(str(s)[:4096]))
     if os.environ.get("PROXY_UNIFI_TERMINAL_SAFE_EMOJI") == "1":
         value = terminal_emoji_fallback(value)
     value = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", value)
@@ -950,8 +952,12 @@ def cmd_fetch(args):
     # ensure_ascii=True: the on-disk catalog stays pure ASCII (\uXXXX escapes),
     # so stored text (Cyrillic / CJK labels, ...) survives being written and read
     # back regardless of the gateway's locale / stream encoding.
-    json.dump(process_body(raw, headers), sys.stdout, ensure_ascii=True, indent=2)
-    sys.stdout.write("\n")
+    text = json.dumps(process_body(raw, headers), ensure_ascii=True, indent=2)
+    # Escaping can grow a feed several times over: what fetch emits must fit
+    # the reader (_load), or the saved catalog could never be opened again.
+    if len(text) > MAX_BYTES * 8:
+        die("the subscription is too large once parsed (%d MB)" % (len(text) // 1000000))
+    sys.stdout.write(text + "\n")
 
 
 _HEX64 = set("0123456789abcdef")

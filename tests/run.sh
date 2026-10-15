@@ -1597,6 +1597,49 @@ cat = mksub.process_body(json.dumps([bad, good]).encode())
 assert [n["recognized"] for n in cat["nodes"]] == [False, True], cat["nodes"]
 PY
 
+    # Provider text in hostile shapes: cleaning a label stays fast however long
+    # it is, error messages never carry terminal control codes, a feed is
+    # refused if its saved node list would be too large to read back, and a
+    # refresh that maps two pool nodes onto one keeps the pool readable.
+    py_case "provider text: fast cleaning, clean errors, readable catalog and pool" "$SRC" <<'PY'
+import json, os, subprocess, sys, tempfile, time
+src = sys.argv[1]; sys.path.insert(0, src)
+import mksub, mkfallback
+t = time.time()
+assert "\x1b" not in mksub.clean("\x1b]" * 40000, 36)
+assert time.time() - t < 0.5, time.time() - t                   # was ~2 s on a laptop, quadratic
+link = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.example.com:443?security=none&type=tcp&%1B%5D52%3Bc%3BaGk%3D%07=1#x"
+with tempfile.TemporaryDirectory() as tmp:
+    lf = os.path.join(tmp, "link"); open(lf, "w").write(link)
+    err = subprocess.run([sys.executable, os.path.join(src, "mkxray.py"), "--link-file", lf, "--port", "1",
+                          "--secret-key", "x", "--peer-pubkey", "y"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE).stderr
+    assert err and b"\x1b" not in err and b"\x07" not in err, err
+    # a feed under the 2 MB response cap whose saved catalog would exceed the reader's cap
+    body = b"[" + b",".join(b'{"remarks":"' + b"\xff" * 195000 + b'","inbounds":[{"protocol":"socks",'
+                            b'"tag":"socks"}],"outbounds":[{"protocol":"freedom","tag":"plain"}],"meta":'
+                            + str(i).encode() + b"}" for i in range(9)) + b"]"
+    assert len(body) < mksub.MAX_BYTES, len(body)
+    bf = os.path.join(tmp, "body"); open(bf, "wb").write(body)
+    out = os.path.join(tmp, "cat")
+    rc = subprocess.run([sys.executable, os.path.join(src, "mksub.py"), "fetch", "--body-file", bf],
+                        stdout=open(out, "wb"), stderr=subprocess.PIPE).returncode
+    if rc == 0:
+        mksub._load(out)                                         # whatever fetch emits must read back
+    # pool: two London entries, one London node after the refresh
+    def node(server):
+        return mksub.node_from_link("trojan://p@%s:443?security=tls#London" % server)
+    old_a, old_b, new = node("a.example.com"), node("b.example.com"), node("c.example.com")
+    for n, nd in enumerate((old_a, old_b), 1):
+        nd["n"] = n
+    pool = [{"sub": "1", "meta": mksub._selection_meta(nd), "missing": False} for nd in (old_a, old_b)]
+    new["n"] = 1
+    pf = os.path.join(tmp, "pool")
+    mkfallback.save_pool(pf, mkfallback.rematch(pool, "1", {"nodes": [new]}))
+    loaded = mkfallback.load_pool(pf)
+    assert sorted(e["missing"] for e in loaded) == [False, True], loaded
+PY
+
     # mkawg: AWG 1.5-3.1 parser, bridge generator, profile catalog, and UI safety.
     py_case "mkawg parser and UI corpus" "$SRC" <<'PY'
 import base64

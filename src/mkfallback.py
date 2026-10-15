@@ -74,6 +74,9 @@ def load_pool(path):
 
 
 def save_pool(path, nodes):
+    keys = [(n["sub"], n["meta"]["id"]) for n in nodes]
+    if len(set(keys)) != len(keys):                    # never write what load_pool rejects
+        die("the fallback pool would list a node twice")
     _write_json(path, {"schema": SCHEMA, "nodes": nodes})
 
 
@@ -124,14 +127,23 @@ def cmd_drop_sub(args):
 
 
 def rematch(nodes, sub, cat):
-    """Re-point the pool entries of one refreshed subscription; returns nodes."""
-    for entry in nodes:
-        if entry["sub"] != sub:
+    """Re-point the pool entries of one refreshed subscription; returns nodes.
+
+    Entries whose node is still there claim it first; then the others may take
+    a look-alike, each new node at most once. An entry left without one is
+    marked missing (and keeps its old id, which is no longer in the catalog)."""
+    ids = {nd["id"] for nd in cat.get("nodes", []) if nd.get("recognized")}
+    mine = [e for e in nodes if e["sub"] == sub]
+    claimed = {e["meta"]["id"] for e in mine if e["meta"]["id"] in ids}
+    for entry in mine:
+        if entry["meta"]["id"] in ids:
+            entry["missing"] = False
             continue
         found = mksub.match_node(cat, entry["meta"])
-        if found is None:
+        if found is None or found[0]["id"] in claimed:
             entry["missing"] = True
         else:
+            claimed.add(found[0]["id"])
             entry["meta"], entry["missing"] = mksub._selection_meta(found[0]), False
     return nodes
 
