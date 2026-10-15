@@ -133,7 +133,7 @@ def safe_port(value):
     """Parse a port string/int into 1..65535, dying cleanly on anything else."""
     try:
         p = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):     # OverflowError: JSON 1e309 is infinity
         die("invalid port in link (must be a number 1-65535)")
     if not (0 < p < 65536):
         die("port out of range in link (1-65535)")

@@ -136,6 +136,8 @@ def main():
             break
         time.sleep(0.05)
     if not reason:
+        # The leader is done; anything it left in its group (even ignoring TERM) goes too.
+        _kill_group(proc.pid, signal.SIGKILL)
         return proc.returncode
     _kill_group(proc.pid, signal.SIGTERM)
     try:
