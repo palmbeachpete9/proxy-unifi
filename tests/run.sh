@@ -378,20 +378,32 @@ SH
     # Exercise firewall ownership and IPv6 fail-closed behavior against a stateful
     # iptables mock rather than only grepping the rendered unit.
     _fd="$(mktemp -d)"
+    # An ordered iptables model: INPUT keeps rule order, the guard chain keeps
+    # its ports, -S prints rules the way iptables does, and every flush is logged.
     cat > "$_fd/fw.sh" <<'SH'
-FW_CHAIN=PROXY_UNIFI_WG; WG_PORT=51821; D="$WORK"; FAIL6=0
+FW_CHAIN=PROXY_UNIFI_WG; WG_PORT=51821; D="$WORK"; FAIL6=0; FAILADD=0
 load_settings() { :; }; err() { :; }; have() { command -v "$1" >/dev/null 2>&1; }
+_port_of() { printf '%s\n' "$*" | sed -n 's/.*--dport \([0-9]*\).*/\1/p'; }
 mock_iptables() {
-    _fam="$1"; shift; _base="$D/$_fam"
+    _fam="$1"; shift; _in="$D/$_fam.input"; _ch="$D/$_fam.chain"; touch "$_in"
     case "$1:$2" in
-        -N:*) [ ! -f "$_base.chain" ] || return 1; : > "$_base.chain" ;;
-        -F:*) [ -f "$_base.chain" ] || return 1; rm -f "$_base.rule" ;;
-        -A:*) printf '%s\n' "$6" > "$_base.rule" ;;
-        -C:INPUT) [ -f "$_base.jump" ] ;;
-        -C:*) [ -f "$_base.rule" ] && [ "$(cat "$_base.rule")" = "$6" ] ;;
-        -I:INPUT) : > "$_base.jump" ;;
-        -D:INPUT) rm -f "$_base.jump" ;;
-        -X:*) rm -f "$_base.chain" ;;
+        -N:"$FW_CHAIN") [ ! -f "$_ch" ] || return 1; : > "$_ch" ;;
+        -F:"$FW_CHAIN") echo flush >> "$D/$_fam.log"; [ -f "$_ch" ] || return 1; : > "$_ch" ;;
+        -X:"$FW_CHAIN") rm -f "$_ch" ;;
+        -A:"$FW_CHAIN") [ "$FAILADD" = 0 ] && [ -f "$_ch" ] || return 1; _port_of "$@" >> "$_ch" ;;
+        -C:"$FW_CHAIN") [ -f "$_ch" ] && grep -qx "$(_port_of "$@")" "$_ch" ;;
+        -D:"$FW_CHAIN") _x="$(_port_of "$@")"; grep -vx "$_x" "$_ch" > "$_ch.n"; mv "$_ch.n" "$_ch" ;;
+        -S:"$FW_CHAIN") [ -f "$_ch" ] || return 1; echo "-N $FW_CHAIN"
+            while read -r _x; do echo "-A $FW_CHAIN ! -i lo -p udp -m udp --dport $_x -j DROP"; done < "$_ch" ;;
+        -I:INPUT) { echo "$5"; cat "$_in"; } > "$_in.n"; mv "$_in.n" "$_in" ;;
+        -C:INPUT) grep -qx "$4" "$_in" ;;
+        -D:INPUT) if [ "$3" = -j ]; then awk -v t="$4" '$0 == t && !d { d = 1; next } 1' "$_in" > "$_in.n"
+                  else awk -v n="$3" 'NR != n' "$_in" > "$_in.n"; fi; mv "$_in.n" "$_in" ;;
+        -S:INPUT) echo "-P INPUT ACCEPT"
+            while read -r _x; do
+                if [ "$_x" = ACCEPT_WG ]; then echo "-A INPUT -p udp -m udp --dport 51821 -j ACCEPT"
+                else echo "-A INPUT -j $_x"; fi
+            done < "$_in" ;;
         *) return 1 ;;
     esac
 }
@@ -402,15 +414,39 @@ SH
     cat >> "$_fd/fw.sh" <<'SH'
 _ipv6_enabled() { return 0; }
 fw_lock && fw_is_locked 51821 || exit 1
-[ -f "$D/v4.jump" ] && [ -f "$D/v6.jump" ] || exit 1
+[ "$(cat "$D/v4.input")" = PROXY_UNIFI_WG ] && [ "$(cat "$D/v6.input")" = PROXY_UNIFI_WG ] || exit 1
+# A correct guard is left alone: reconciling never flushes it (no unguarded gap).
+rm -f "$D/v4.log"; fw_lock || exit 1; [ ! -e "$D/v4.log" ] || exit 1
+# A repair that cannot add the rule keeps the rule already there.
+FAILADD=1; fw_lock; FAILADD=0; fw_is_locked 51821 || exit 1
+# An ACCEPT placed before the guard bypasses it: not reported as locked, and
+# fw_lock puts the guard back in front (the project's own chains may precede it).
+{ echo ACCEPT_WG; cat "$D/v4.input"; } > "$D/v4.n"; mv "$D/v4.n" "$D/v4.input"
+if fw_is_locked 51821; then exit 1; fi
+fw_lock && fw_is_locked 51821 || exit 1
+[ "$(head -n 1 "$D/v4.input")" = PROXY_UNIFI_WG ] && [ "$(grep -c '^PROXY_UNIFI_WG$' "$D/v4.input")" = 1 ] || exit 1
+{ echo PROXY_UNIFI_IN; cat "$D/v4.input"; } > "$D/v4.n"; mv "$D/v4.n" "$D/v4.input"
+fw_is_locked 51821 || exit 1
+# A new port: its rule is in place before the old one goes.
+WG_PORT=51822; fw_lock && fw_is_locked 51822 || exit 1
+[ "$(cat "$D/v4.chain")" = 51822 ] || exit 1
+WG_PORT=51821; fw_lock || exit 1
 fw_unlock
-[ ! -e "$D/v4.jump" ] && [ ! -e "$D/v6.jump" ] || exit 1
+grep -q PROXY_UNIFI_WG "$D/v4.input" "$D/v6.input" && exit 1
+# Without a working ip6tables the guard fails closed, and IPv4 protection stays.
 FAIL6=1
 if fw_lock; then exit 1; fi
-[ ! -e "$D/v4.jump" ] && [ ! -e "$D/v4.chain" ] || exit 1
+grep -qx PROXY_UNIFI_WG "$D/v4.input" || exit 1
 SH
     if WORK="$_fd" sh "$_fd/fw.sh"; then ok "firewall guard owns rules and fails closed on IPv6"
     else bad "firewall guard owns rules and fails closed on IPv6"; fi
+    # Linux reports /proc/net/if_inet6 as size 0 even with addresses in it.
+    if [ -r /proc/net/if_inet6 ] && grep -q . /proc/net/if_inet6; then
+        # shellcheck disable=SC2016 # the function's body is evaluated in the child shell
+        if sh -c "$(sed -n '/^_ipv6_enabled()/p' "$SRC/proxy-unifi"); _ipv6_enabled"
+        then ok "IPv6 counts as enabled when the kernel lists addresses"
+        else bad "IPv6 counts as enabled when the kernel lists addresses"; fi
+    fi
     rm -rf "$_fd"
 
     if [ -n "$_sc_log" ]; then
