@@ -2243,6 +2243,21 @@ _build_pool() {
 cmd_import_json() {
     _src="$1"
     [ -s "$_src" ] || fatal "empty profile"
+    # The caller's file may still be edited. Validate and retain one private,
+    # bounded input snapshot so regeneration uses the bytes that were applied.
+    ensure_run_dir
+    _profile_candidate="$RUN_DIR/profile.candidate"
+    py - "$_src" "$_profile_candidate" <<'PYEOF' || fatal "could not snapshot profile (empty, unreadable or larger than 2000000 bytes)"
+import os, sys
+with open(sys.argv[1], "rb") as source:
+    raw = source.read(2000001)
+if not raw or len(raw) > 2000000:
+    raise SystemExit(1)
+with open(sys.argv[2], "wb") as output:
+    os.fchmod(output.fileno(), 0o600)
+    output.write(raw)
+PYEOF
+    _src="$_profile_candidate"
     load_settings
     _cmd_owned=0
     if [ -z "$TXN_DIR" ]; then txn_begin; _cmd_owned=1; fi
