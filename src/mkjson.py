@@ -52,6 +52,23 @@ MAX_BALANCERS = 64
 MIN_PROBE_SECONDS = 5.0
 _FORBIDDEN_KEYS = {"certificateFile", "keyFile", "masterKeyLog",
                    "socketPath", "unixSocket", "unixSocketPath"}
+# Xray matches JSON field names case-insensitively. Every field this module
+# validates or strips must arrive spelled exactly as it reads it, or a copy
+# spelled differently ("Inbounds", "Redirect") would reach the core unchecked.
+_CHECKED_FIELDS = {}
+for _name in ("log", "api", "dns", "routing", "policy", "inbounds", "outbounds", "transport",
+              "stats", "reverse", "fakedns", "metrics", "observatory", "burstObservatory",
+              "geodata", "settings", "streamSettings", "tlsSettings", "sockopt", "mux",
+              "proxySettings", "dialerProxy", "vnext", "servers", "peers", "users", "accounts",
+              "address", "server", "port", "server_port", "endpoint", "redirect", "protocol",
+              "tag", "rules", "balancers", "selector", "subjectSelector", "fallbackTag",
+              "balancerTag", "outboundTag", "inboundTag", "strategy", "probeURL", "probeUrl",
+              "pingConfig", "destination", "interval", "timeout", "sampling", "probeInterval",
+              "hosts", "sniffing", "network", "source", "sourcePort", "user", "type", "remarks",
+              "dnsLog", "access", "error", "loglevel", "downloadSettings", "unixSettings",
+              "dsSettings", "certificateFile", "keyFile", "masterKeyLog", "socketPath",
+              "unixSocket", "unixSocketPath"):
+    _CHECKED_FIELDS.setdefault(_name.lower(), set()).add(_name)
 _PATHLIKE_KEY = re.compile(
     r"(?:File|FilePath|SocketPath|KeyLog)$|(?:^|_)(?:file|file_path|socket_path|key_log)$")
 
@@ -108,6 +125,9 @@ def _validate_untrusted_tree(value, path="profile"):
         for key, child in value.items():
             if not isinstance(key, str):
                 die("%s has a non-string key" % path)
+            spellings = _CHECKED_FIELDS.get(key.lower())
+            if spellings and key not in spellings:
+                die("%s.%s must be spelled %s" % (path, key, " or ".join(sorted(spellings))))
             if key in _FORBIDDEN_KEYS and child not in (None, "", []):
                 die("unsafe local file/device field is not allowed: %s.%s" % (path, key))
             if _PATHLIKE_KEY.search(key) and key not in _FORBIDDEN_KEYS \
@@ -281,7 +301,7 @@ def validate_profile(cfg):
         if isinstance(strategy, dict) and strategy.get("type"):
             _safe_text(strategy["type"], "balancer strategy")
         fallback = balancer.get("fallbackTag")
-        if fallback and fallback not in outbound_tags:
+        if fallback not in (None, "") and (not isinstance(fallback, str) or fallback not in outbound_tags):
             die("balancer fallbackTag references a missing outbound")
 
     for rule in rules:
