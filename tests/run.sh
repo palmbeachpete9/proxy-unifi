@@ -950,6 +950,12 @@ PY
 
 parser_tests() {
     echo "== parsers =="
+    if _routing_test="$(python3 "$ROOT/tests/test_profile_routing.py" 2>&1)"; then
+        ok "provider routing preserves unrestricted inbound selectors"
+    else
+        bad "provider routing preserves unrestricted inbound selectors"
+        printf '%s\n' "$_routing_test"
+    fi
     KEY=cvttX9u3nd7XD16gF4LJ09KjFZ0ZN4x9nk2TQePX5jk
     VM="vmess://$(printf '{"add":"h","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","net":"ws","tls":"tls","host":"h","path":"/w"}' | base64 | tr -d '\n')"
     SS16="$(ss_test_key 16)"; SS32="$(ss_test_key 32)"; SS15="$(ss_test_key 15)"

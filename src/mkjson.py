@@ -202,7 +202,9 @@ def _rule_applies(rule, primary_tag):
     refs = [refs] if isinstance(refs, str) else refs
     if not isinstance(refs, list) or not all(isinstance(tag, str) for tag in refs):
         die("routing inboundTag must be a string or array of strings")
-    return primary_tag in refs
+    # Xray only installs an inbound matcher for a nonempty tag list. An empty
+    # list leaves the rule unrestricted, just like an omitted inboundTag.
+    return not refs or primary_tag in refs
 
 
 def _balancer_info(cfg):
