@@ -290,6 +290,37 @@ SH
     fi
     [ "$_install_restore" = 1 ] && ok "installer rollback restores scripts, cores, and assets" \
         || bad "installer rollback restores scripts, cores, and assets"
+
+    # The documented "curl ... | sh" bootstrap must not take files from the
+    # current directory; running a clone's own install.sh uses that clone.
+    _bs="$(mktemp -d)"; mkdir -p "$_bs/src"; printf '#!/bin/sh\n' > "$_bs/src/proxy-unifi"
+    sed -n '/^# Resolve where we copy source files from/,/^CACHEBUST=/p' "$ROOT/install.sh" | sed '$d' > "$_bs/install.sh"
+    # shellcheck disable=SC2016 # expands in the generated script
+    printf 'echo "[$SCRIPT_DIR]"\n' >> "$_bs/install.sh"
+    _piped="$(cd "$_bs" && sh < "$_bs/install.sh")"
+    _file="$(cd / && sh "$_bs/install.sh")"
+    if [ "$_piped" = "[]" ] && [ "$_file" = "[$(cd "$_bs" && pwd)]" ]
+    then ok "piped installer ignores a src/ folder in the current directory"
+    else bad "piped installer ignores a src/ folder in the current directory (got: $_piped / $_file)"; fi
+    # Nothing is promoted when the service-state snapshot (needed to roll back) fails,
+    # even though the installer runs this function in an if (where set -e is off).
+    _pf="$_bs/promote"; mkdir -p "$_pf"
+    {
+        echo "WORKDIR='$_pf/w'; BIN_DIR='$_pf/bin'; PROMOTION_BACKUP='$_pf/backup'"
+        echo "PROMOTION_MARKER='$_pf/marker'; ONBOOT_DST='$_pf/onboot'; PYTHON=python3; PROXY_UNIFI_RAW=1"
+        cat <<'SH'
+fetch() { if [ "$1" = proxy-unifi ]; then printf '#!/bin/sh\n:\n' > "$2"; else printf '# x\n' > "$2"; fi; }
+snapshot_service_state() { return 37; }
+SH
+        sed -n '/^_install_files_locked() {/,/^}/p' "$ROOT/install.sh"
+        cat <<'SH'
+set -e; mkdir -p "$WORKDIR"; if _install_files_locked; then exit 1; fi
+SH
+    } > "$_pf/run.sh"
+    if sh "$_pf/run.sh" 2>/dev/null && [ ! -e "$_pf/bin/proxy-unifi" ] && [ ! -e "$_pf/marker" ]
+    then ok "installer promotes nothing without its service-state snapshot"
+    else bad "installer promotes nothing without its service-state snapshot"; fi
+    rm -rf "$_bs"
     rm -rf "$_id"
 
     _bd="$(mktemp -d)"
