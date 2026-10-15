@@ -2257,7 +2257,7 @@ cmd_import_json() {
     ensure_run_dir
     _profile_candidate="$RUN_DIR/profile.candidate"
     ( umask 077; head -c 2000001 "$_src" > "$_profile_candidate" ) || fatal "could not read profile"
-    [ -s "$_profile_candidate" ] && [ "$(wc -c < "$_profile_candidate")" -le 2000000 ] \
+    { [ -s "$_profile_candidate" ] && [ "$(wc -c < "$_profile_candidate")" -le 2000000 ]; } \
         || fatal "profile is empty or larger than 2000000 bytes"
     _src="$_profile_candidate"
     load_settings
