@@ -103,6 +103,17 @@ PY
     [ -n "$_child" ] && proc_alive "$_child" && _dead=0
     if [ "$_src" = 124 ] && [ "$_dead" = 1 ]; then ok "safe validator timeout kills process group"
     else bad "safe validator timeout kills process group"; [ "$_dead" = 1 ] || kill "$_child" 2>/dev/null || true; fi
+    # A hang-up (an SSH session closing mid-ping) stops the validator's group too.
+    # shellcheck disable=SC2016 # $$/$1 expand inside the child shell
+    python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 30 --memory-mb 64 --fsize-mb 1 -- \
+        sh -c 'echo $$ > "$1/hup"; exec sleep 30' sh "$_sd" >/dev/null 2>&1 &
+    _sx=$!; _i=0
+    while [ ! -s "$_sd/hup" ] && [ "$_i" -lt 100 ]; do _i=$((_i + 1)); sleep 0.05 2>/dev/null || sleep 1; done
+    kill -HUP "$_sx" 2>/dev/null; _i=0
+    while proc_alive "$(cat "$_sd/hup")" && [ "$_i" -lt 40 ]; do _i=$((_i + 1)); sleep 0.05 2>/dev/null || sleep 1; done
+    if proc_alive "$(cat "$_sd/hup")"; then bad "safe validator stops its group on a hang-up"; kill "$(cat "$_sd/hup")" 2>/dev/null
+    else ok "safe validator stops its group on a hang-up"; fi
+    wait "$_sx" 2>/dev/null
     rm -rf "$_sd"
     if [ "$(uname -s)" = Linux ]; then
         python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 10 --memory-mb 64 --fsize-mb 1 -- \
@@ -116,6 +127,37 @@ PY
     else
         ok "proxy credentials and keys stay out of child argv"
     fi
+
+    # A failed AmneziaWG update must not leave an older core accepted.
+    _aw="$(mktemp -d)"
+    printf '#!/bin/sh\necho "sing-box version proxy-unifi-awg-1.0.0"\n' > "$_aw/amnezia-box"; chmod 755 "$_aw/amnezia-box"
+    {
+        echo "ABIN='$_aw/amnezia-box'; AWG_CORE_VERSION=1.1.0"
+        echo 'fatal() { exit 1; }; cmd_install_awg() { return 1; }'
+        sed -n '/^_awg_version_ok() {/,/^}/p; /^ensure_awg() {/,/^}/p' "$SRC/proxy-unifi"
+        echo 'ensure_awg'
+    } > "$_aw/e.sh"
+    if sh "$_aw/e.sh" 2>/dev/null; then bad "a failed AmneziaWG update rejects the older core"
+    else ok "a failed AmneziaWG update rejects the older core"; fi
+    rm -rf "$_aw"
+    # A rollback renders the service from the restored settings, not from the
+    # failed operation's values still in memory.
+    _rr="$(mktemp -d)"
+    {
+        echo "SETTINGS='$_rr/settings.env'; SERVICE_FILE='$_rr/unit'; SERVICE_NAME=proxy-unifi; FB_SERVICE_NAME=f"
+        cat <<'SH'
+WG_PORT=51999
+systemctl() { :; }; fw_reconcile() { :; }; write_refresh_timer() { :; }
+write_service() { echo "$WG_PORT" > "$SERVICE_FILE"; }
+SH
+        sed -n '/^_uint() {/p; /^load_settings() {/,/^}/p; /^restore_runtime_state() {/,/^}/p' "$SRC/proxy-unifi"
+        # shellcheck disable=SC2016 # expands in the generated script
+        echo 'mkdir -p "$1/s"; : > "$1/s/runtime-state"; restore_runtime_state "$1/s"; cat "$SERVICE_FILE"'
+    } > "$_rr/r.sh"
+    printf 'WG_PORT="51821"\n' > "$_rr/settings.env"; : > "$_rr/unit"
+    if [ "$(sh "$_rr/r.sh" "$_rr" 2>/dev/null)" = 51821 ]; then ok "a rollback renders the unit from the restored settings"
+    else bad "a rollback renders the unit from the restored settings"; fi
+    rm -rf "$_rr"
 
     _ud="$(mktemp -d)"
     {
@@ -969,6 +1011,49 @@ good = json.loads(json.dumps(base)); good["remarks"] = "good"
 cat = mksub.process_body(json.dumps([bad, good]).encode())
 assert [n["recognized"] for n in cat["nodes"]] == [False, True], cat["nodes"]
 PY
+    # Provider text in hostile shapes: cleaning a label stays fast however long
+    # it is, error messages never carry terminal control codes, and a feed is
+    # refused if its saved node list would be too large to read back.
+    py_case "provider text: fast cleaning, clean errors, readable catalog" "$SRC" <<'PY'
+import json, os, subprocess, sys, tempfile, time
+src = sys.argv[1]; sys.path.insert(0, src)
+import mksub
+t = time.time()
+assert "\x1b" not in mksub.clean("\x1b]" * 40000, 36)
+assert time.time() - t < 0.5, time.time() - t                   # was ~2 s on a laptop, quadratic
+link = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.example.com:443?security=none&type=tcp&%1B%5D52%3Bc%3BaGk%3D%07=1#x"
+with tempfile.TemporaryDirectory() as tmp:
+    lf = os.path.join(tmp, "link"); open(lf, "w").write(link)
+    err = subprocess.run([sys.executable, os.path.join(src, "mkxray.py"), "--link-file", lf, "--port", "1",
+                          "--secret-key", "x", "--peer-pubkey", "y"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE).stderr
+    assert err and b"\x1b" not in err and b"\x07" not in err, err
+    # a feed under the 2 MB response cap whose saved catalog would exceed the reader's cap
+    body = b"[" + b",".join(b'{"remarks":"' + b"\xff" * 195000 + b'","inbounds":[{"protocol":"socks",'
+                            b'"tag":"socks"}],"outbounds":[{"protocol":"freedom","tag":"plain"}],"meta":'
+                            + str(i).encode() + b"}" for i in range(9)) + b"]"
+    assert len(body) < mksub.MAX_BYTES, len(body)
+    bf = os.path.join(tmp, "body"); open(bf, "wb").write(body)
+    out = os.path.join(tmp, "cat")
+    rc = subprocess.run([sys.executable, os.path.join(src, "mksub.py"), "fetch", "--body-file", bf],
+                        stdout=open(out, "wb"), stderr=subprocess.PIPE).returncode
+    if rc == 0:
+        mksub._load(out)                                         # whatever fetch emits must read back
+PY
+
+    # A provider that answers slowly enough never trips a per-read timeout; the
+    # whole fetch still ends at its deadline instead of hanging the refresh.
+    py_case "subscription fetch ends at its deadline" "$SRC" <<'PY'
+import subprocess, sys, time
+code = ("import sys, time; sys.path.insert(0, %r); import mksub; mksub.DEADLINE = 1; "
+        "mksub.fetch_url = lambda *a: time.sleep(30); "
+        "sys.argv = ['mksub.py', 'fetch', '--url', 'https://x.example/']; mksub.main()" % sys.argv[1])
+start = time.time()
+done = subprocess.run([sys.executable, "-c", code], stderr=subprocess.PIPE, timeout=25)
+assert time.time() - start < 6 and done.returncode != 0, (time.time() - start, done)
+assert b"took longer" in done.stderr, done.stderr
+PY
+
     # mkawg: AWG 1.5-3.1 parser, bridge generator, profile catalog, and UI safety.
     py_case "mkawg parser and UI corpus" "$SRC" <<'PY'
 import base64

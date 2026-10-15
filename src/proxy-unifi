@@ -406,6 +406,8 @@ restore_transaction_files() {
 
 restore_runtime_state() {
     _state="$1"
+    # Render from the restored settings, not the failed operation's values in memory.
+    load_settings
     if [ ! -f "$_state/runtime-state" ]; then
         [ -f "$SERVICE_FILE" ] && { ( write_service ) 2>/dev/null || true; systemctl restart "$SERVICE_NAME" 2>/dev/null || true; }
         return 0
@@ -909,12 +911,15 @@ cmd_install_awg() {
     c_grn "AmneziaWG core installed: $(core_version "$ABIN")"
 }
 
+_awg_version_ok() {
+    "$ABIN" version 2>/dev/null | grep -q "version proxy-unifi-awg-${AWG_CORE_VERSION}\$"
+}
+
 ensure_awg() {
     # An older pinned core rejects newer profile fields (e.g. AWG 3.x), so a
-    # version mismatch is treated like a missing core.
-    "$ABIN" version 2>/dev/null | grep -q "version proxy-unifi-awg-${AWG_CORE_VERSION}\$" \
-        || cmd_install_awg || true
-    [ -x "$ABIN" ] || fatal "the AmneziaWG core is required but could not be installed"
+    # version mismatch is treated like a missing core, also after a failed update.
+    _awg_version_ok || cmd_install_awg || true
+    _awg_version_ok || fatal "the AmneziaWG core ${AWG_CORE_VERSION} is required but could not be installed"
 }
 
 # --------------------------------------------------------------------------
@@ -2047,8 +2052,11 @@ ping_proxy() {   # $1 = get|head
     fi
     if [ "$_m" = "head" ]; then _label="via proxy (HEAD)"; set -- -I; else _label="via proxy (GET)"; set -- -X GET; fi
     # LC_ALL=C so curl prints time_total with a '.' decimal regardless of locale
-    _out="$(LC_ALL=C curl -sS -o /dev/null -w '%{http_code} %{time_total}\n' --max-time "$PING_TIMEOUT" \
-             "$@" --proxy "${_proxy_scheme}://127.0.0.1:${_port}" "$PING_URL" 2>&1)" && _rc=0 || _rc=$?
+    # Proxy variables or a .curlrc would route the check around the node under test.
+    _out="$(LC_ALL=C env -u http_proxy -u HTTP_PROXY -u https_proxy -u HTTPS_PROXY -u all_proxy \
+             -u ALL_PROXY -u no_proxy -u NO_PROXY curl -q -sS -o /dev/null -w '%{http_code} %{time_total}\n' \
+             --max-time "$PING_TIMEOUT" "$@" --proxy "${_proxy_scheme}://127.0.0.1:${_port}" "$PING_URL" 2>&1)" \
+             && _rc=0 || _rc=$?
     _ping_cleanup
     if [ "$_rc" = 28 ]; then c_red "${_label}: timeout (>${PING_TIMEOUT}s)"; return 1; fi
     if [ "$_rc" != 0 ]; then
