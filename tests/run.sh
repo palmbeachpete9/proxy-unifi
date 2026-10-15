@@ -37,8 +37,9 @@ py_case() {
 # and some container inits never reap. kill -0 still succeeds on a zombie, which
 # holds no resources, so only a live (non-zombie) process counts as surviving.
 proc_alive() {
-    kill -0 "$1" 2>/dev/null || return 1
-    case "$(ps -o stat= -p "$1" 2>/dev/null)" in Z*) return 1 ;; esac
+    # ps must show it running: kill -0 also succeeds on a zombie, which may be
+    # reaped (and vanish from ps) between the two checks.
+    case "$(ps -o stat= -p "$1" 2>/dev/null)" in ""|Z*) return 1 ;; esac
 }
 sha256_of() {
     if have sha256sum; then sha256sum "$1" | awk '{print $1}'
