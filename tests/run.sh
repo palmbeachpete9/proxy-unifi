@@ -116,6 +116,12 @@ static_tests() {
         bad "JSON imports validate and retain one bounded input snapshot"
         printf '%s\n' "$_import_test"
     fi
+    if _ingress_order_test="$(python3 "$ROOT/tests/test_ingress_order.py" 2>&1)"; then
+        ok "ingress guard repairs INPUT ordering and preserves foreign rules"
+    else
+        bad "ingress guard repairs INPUT ordering and preserves foreign rules"
+        printf '%s\n' "$_ingress_order_test"
+    fi
     # ShellCheck is the slowest static check; run it alongside the others and
     # report it at the end of this tier.
     _sc_log=""

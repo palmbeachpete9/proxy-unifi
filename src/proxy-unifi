@@ -1848,6 +1848,15 @@ ingress_rt_status() {
     echo "on via table $_rs_tbl (${_rs_syn:-0} TCP connections passed UniFi's firewall)"
 }
 
+# INPUT must reach the ingress guard before foreign rules. The other owned
+# guard may precede it: it only handles the WireGuard UDP port.
+_ingress_input_first() {
+    iptables -S INPUT 2>/dev/null | awk -v jump="-A INPUT -j $INGRESS_IN_CHAIN" -v guard="-A INPUT -j $FW_CHAIN" '
+        $0 == jump { found = 1; exit }
+        /^-A INPUT / && $0 != guard { exit }
+        END { exit !found }'
+}
+
 # Root-namespace rules: TPROXY every TCP/UDP packet from the veth to Xray, admit
 # from the veth only the TCP/UDP that TPROXY marked for Xray and ICMP, keep Xray's
 # listener off every other interface, never forward from the veth (no tunnel
@@ -1858,7 +1867,7 @@ _ingress_rules_ok() {
     iptables -t mangle -C PREROUTING -i "$INGRESS_VETH" -j "$INGRESS_TP_CHAIN" 2>/dev/null \
         && iptables -t mangle -C "$INGRESS_TP_CHAIN" -p tcp $_ir_tp 2>/dev/null \
         && iptables -t mangle -C "$INGRESS_TP_CHAIN" -p udp $_ir_tp 2>/dev/null \
-        && iptables -C INPUT -j "$INGRESS_IN_CHAIN" 2>/dev/null \
+        && _ingress_input_first \
         && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -m mark --mark "$INGRESS_MARK" -j ACCEPT 2>/dev/null \
         && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p icmp -j ACCEPT 2>/dev/null \
         && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -j DROP 2>/dev/null \
@@ -1894,7 +1903,7 @@ _ingress_rules_add() {
     _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -j DROP || return 1
     _ingress_step iptables -A "$INGRESS_IN_CHAIN" -p tcp --dport "$INGRESS_PORT" -j DROP || return 1
     _ingress_step iptables -A "$INGRESS_IN_CHAIN" -p udp --dport "$INGRESS_PORT" -j DROP || return 1
-    iptables -C INPUT -j "$INGRESS_IN_CHAIN" 2>/dev/null \
+    _ingress_input_first \
         || _ingress_step iptables -I INPUT 1 -j "$INGRESS_IN_CHAIN" || return 1
     iptables -C FORWARD -i "$INGRESS_VETH" -j DROP 2>/dev/null \
         || _ingress_step iptables -I FORWARD 1 -i "$INGRESS_VETH" -j DROP || return 1
