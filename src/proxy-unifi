@@ -2261,10 +2261,7 @@ cmd_import_json() {
     # a pool import supersedes any single link + subscription selection
     rm -f "$OUTBOUND_LINK" 2>/dev/null || true
     rm -f "$AWG_SELECTED" 2>/dev/null || true
-    if [ "${_FROM_SUB:-0}" != "1" ]; then
-        rm -f "$SUB_SELECTED" "$SUB_SELECTED_META" 2>/dev/null || true
-        fallback_detach
-    fi
+    sub_forget_manual
     save_settings
     restart_service || fatal "profile was valid, but the service failed its startup health check"
     [ "$_cmd_owned" = 1 ] && txn_commit
@@ -2299,13 +2296,7 @@ cmd_import() {
     rm -rf "$POOL_DIR" "$POOL_SRC" 2>/dev/null || true
     rm -f "$AWG_SELECTED" 2>/dev/null || true
     save_settings
-    # A manual import detaches any subscription selection (so a later 'sub refresh'
-    # won't think this hand-picked link came from the subscription). sub_select sets
-    # _FROM_SUB=1 to keep its own marker.
-    if [ "${_FROM_SUB:-0}" != "1" ]; then
-        rm -f "$SUB_SELECTED" "$SUB_SELECTED_META" 2>/dev/null || true
-        fallback_detach
-    fi
+    sub_forget_manual
     # Apply immediately (starts the service even if autostart is off; the unit's
     # ConditionPathExists is now satisfied because config.json exists).
     restart_service || fatal "link was valid, but the service failed its startup health check"
@@ -4487,6 +4478,15 @@ fallback_set() {   # on|off
     else
         systemctl disable --now "$FB_SERVICE_NAME.timer" >/dev/null 2>&1 || true
     fi
+}
+
+# A manual import detaches any subscription selection (so a later refresh won't
+# think the hand-picked node came from the subscription) and the watchdog.
+# sub_select sets _FROM_SUB=1 to keep its own marker.
+sub_forget_manual() {
+    [ "${_FROM_SUB:-0}" != 1 ] || return 0
+    rm -f "$SUB_SELECTED" "$SUB_SELECTED_META" 2>/dev/null || true
+    fallback_detach
 }
 
 # A node chosen by hand takes over from the watchdog; the pool is kept.

@@ -22,7 +22,7 @@ def function(name):
     return "".join(lines[start:end + 1])
 
 
-FUNCTIONS = "".join(function(name) for name in ("atomic_write", "cmd_import_json"))
+FUNCTIONS = "".join(function(name) for name in ("atomic_write", "cmd_import_json", "sub_forget_manual"))
 PROFILE = {"inbounds": [{"protocol": "socks", "tag": "entry", "port": 10808}],
            "outbounds": [{"protocol": "blackhole", "tag": "block"},
                          {"protocol": "freedom", "tag": "direct"}],
