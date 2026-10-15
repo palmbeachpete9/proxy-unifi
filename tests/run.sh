@@ -898,6 +898,46 @@ for bad_header in ("bad\r\nX: y", "emoji-\U0001f600", "\u043a\u0438\u0440\u0438\
         pass
 PY
 
+
+    # Xray reads JSON field names case-insensitively: a field the validator or
+    # sanitizer handles must not slip past it spelled differently ("Inbounds",
+    # "Redirect", "Vnext"). One malformed profile must not abort the whole feed.
+    py_case "provider JSON: fields spelled as the core reads them; bad profiles stay local" "$SRC" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import mkjson, mksub
+base = {"inbounds": [{"tag": "socks", "protocol": "socks", "port": 10808}],
+        "outbounds": [{"protocol": "vless", "tag": "proxy",
+                       "settings": {"vnext": [{"address": "a.example.com", "port": 443}]}},
+                      {"protocol": "freedom", "tag": "direct"}],
+        "routing": {"rules": [{"type": "field", "outboundTag": "proxy"}]}}
+mkjson.validate_profile(json.loads(json.dumps(base)))            # the plain profile is fine
+def rejected(cfg):
+    try:
+        mkjson.validate_profile(cfg)
+    except SystemExit:
+        return True
+    return False
+alias = json.loads(json.dumps(base)); alias["Inbounds"] = [{"protocol": "socks", "listen": "0.0.0.0", "port": 1080}]
+assert rejected(alias)
+api = json.loads(json.dumps(base)); api["API"] = {"tag": "api", "services": ["HandlerService"]}
+assert rejected(api)
+redirect = json.loads(json.dumps(base)); redirect["outbounds"][1]["settings"] = {"Redirect": "192.168.1.1:22"}
+assert rejected(redirect)
+vnext = json.loads(json.dumps(base)); vnext["outbounds"][0]["settings"]["Vnext"] = [{"address": "10.0.0.1", "port": 1}]
+assert rejected(vnext)
+keyfile = json.loads(json.dumps(base)); keyfile["outbounds"][0]["streamSettings"] = {"tlsSettings": {"certificates": [{"CertificateFile": "/etc/shadow"}]}}
+assert rejected(keyfile)
+headers = json.loads(json.dumps(base))                             # user maps keep their own spelling
+headers["outbounds"][0]["streamSettings"] = {"network": "ws", "wsSettings": {"headers": {"Host": "a.example.com"}}}
+mkjson.validate_profile(headers)
+# a list where a tag belongs makes that one profile unsupported, not the feed unreadable
+bad = json.loads(json.dumps(base)); bad["remarks"] = "bad"
+bad["routing"]["balancers"] = [{"tag": "B", "selector": ["proxy"], "fallbackTag": ["direct"]}]
+good = json.loads(json.dumps(base)); good["remarks"] = "good"
+cat = mksub.process_body(json.dumps([bad, good]).encode())
+assert [n["recognized"] for n in cat["nodes"]] == [False, True], cat["nodes"]
+PY
     # mkawg: AWG 1.5-3.1 parser, bridge generator, profile catalog, and UI safety.
     py_case "mkawg parser and UI corpus" "$SRC" <<'PY'
 import base64
