@@ -403,8 +403,11 @@ PROMOTION_BACKUP='$_id/backup'
 BIN_DIR='$_id/live'
 ONBOOT_DST='$_id/on_boot.sh'
 SH
-    awk '/^restore_promotion\(\) \{/,/^}/' "$ROOT/install.sh" >> "$_id/restore.sh"
-    echo 'restore_promotion' >> "$_id/restore.sh"
+    {
+        grep '^SCRIPTS=' "$ROOT/install.sh"
+        awk '/^restore_promotion\(\) \{/,/^}/' "$ROOT/install.sh"
+        echo 'restore_promotion'
+    } >> "$_id/restore.sh"
     _install_restore=1
     if sh "$_id/restore.sh"; then
         for _f in proxy-unifi mkawg.py xray sing-box amnezia-box geoip.dat geosite.dat; do
@@ -512,6 +515,7 @@ REPO_RAW='https://invalid'
 CACHEBUST=1
 SH
     {
+        grep '^SCRIPTS=' "$ROOT/install.sh"
         sed -n '/^prepare_source_bundle() {/,/^}/p' "$ROOT/install.sh"
         sed -n '/^fetch() {/,/^}/p' "$ROOT/install.sh"
         cat <<'SH'
@@ -1676,7 +1680,7 @@ with tempfile.TemporaryDirectory() as tmp:
     now = int(time.time())
     json.dump({"schema": 1, "rot": 0, "nodes": {"1:" + "1" * 64: {"fails": 0, "oks": 3, "at": now - 7200,
                                                                     "ms": 40, "err": ""}}}, open(sf, "w"))
-    args = type("A", (), dict(pool=pf, state=sf, last=lf, selected=af, subs_dir=tmp))()
+    args = type("A", (), dict(pool=pf, state=sf, last=lf, selected=af, subs_dir=tmp, short=False))()
     for cmd in (fb.cmd_show, fb.cmd_status):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):

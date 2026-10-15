@@ -19,11 +19,9 @@ FOREIGN = ["-p", "tcp", "--dport", "41820", "-j", "ACCEPT"]
 FOREIGN_OTHER = ["-p", "tcp", "--dport", "22", "-j", "DROP"]
 
 
-def function(name, optional=False):
+def function(name):
     start = re.search(r"^" + re.escape(name) + r"\(\)\s*\{[^\n]*", SOURCE, re.M)
     if start is None:
-        if optional:
-            return ""
         raise AssertionError("missing production helper: " + name)
     if re.search(r"\}\s*(?:#.*)?$", start.group()):
         return start.group()
@@ -126,9 +124,9 @@ class IngressOrderingTests(unittest.TestCase):
             mock.write_text(MOCK)
             mock.chmod(0o755)
             script = work / "case.sh"
-            helpers = "\n".join(function(name, optional=(name == "_ingress_input_first")) for name in (
-                "_fw_rule", "_fw_jump_first", "_fw_lock_one", "fw_lock",
-                "_ingress_input_first", "_ingress_step", "_ingress_rules_ok", "_ingress_rules_add",
+            helpers = "\n".join(function(name) for name in (
+                "_fw_rule", "_input_first", "_fw_jump_first", "_fw_lock_one", "fw_lock",
+                "_ingress_step", "_ingress_rules_ok", "_ingress_rules_add",
             ))
             script.write_text("""set -eu
 INGRESS_PREF=10 INGRESS_VETH=pu-veth0 INGRESS_TABLE=7707

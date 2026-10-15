@@ -159,18 +159,24 @@ def _key(entry):
     return "%s:%s" % (entry["sub"], entry["meta"]["id"])
 
 
-def load_state(path):
-    """The watchdog's counters; missing or malformed means a fresh start."""
+def _read_json(path):
+    """A small state file's JSON object; {} when it is missing or unreadable."""
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            state = json.load(fh)
-        if isinstance(state, dict) and state.get("schema") == SCHEMA \
-                and isinstance(state.get("nodes"), dict) and isinstance(state.get("rot"), int):
-            state.setdefault("tunnel", "ok")
-            state.setdefault("note", "")
-            return state
+            value = json.load(fh)
+        return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
-        pass
+        return {}
+
+
+def load_state(path):
+    """The watchdog's counters; missing or malformed means a fresh start."""
+    state = _read_json(path)
+    if state.get("schema") == SCHEMA and isinstance(state.get("nodes"), dict) \
+            and isinstance(state.get("rot"), int):
+        state.setdefault("tunnel", "ok")
+        state.setdefault("note", "")
+        return state
     return {"schema": SCHEMA, "nodes": {}, "rot": 0, "tunnel": "ok", "note": ""}
 
 
@@ -276,14 +282,10 @@ class Stale(Exception):
 
 
 def _active(path):
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            meta = json.load(fh)
-        sub, nid = meta.get("sub"), meta.get("id")
-        if isinstance(sub, str) and _SUB_RE.match(sub) and isinstance(nid, str) and _ID_RE.match(nid):
-            return (sub, nid)
-    except (OSError, ValueError, AttributeError):
-        pass
+    meta = _read_json(path)
+    sub, nid = meta.get("sub"), meta.get("id")
+    if isinstance(sub, str) and _SUB_RE.match(sub) and isinstance(nid, str) and _ID_RE.match(nid):
+        return (sub, nid)
     return None
 
 
@@ -388,14 +390,8 @@ def cmd_test(args):
 
 
 def _last(path):
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            last = json.load(fh)
-        if isinstance(last, dict) and isinstance(last.get("at"), int) and isinstance(last.get("line"), str):
-            return last
-    except (OSError, ValueError):
-        pass
-    return None
+    last = _read_json(path)
+    return last if isinstance(last.get("at"), int) and isinstance(last.get("line"), str) else None
 
 
 def cmd_show(args):
@@ -424,10 +420,9 @@ def cmd_status(args):
     state = load_state(args.state)
     active = _active(args.selected)
     pos = next((i for i, e in enumerate(pool, 1) if active == (e["sub"], e["meta"]["id"])), 0)
-    short = getattr(args, "short", False)
     if pos:
         text = "active #%d of %d" % (pos, len(pool))
-        if not short:
+        if not args.short:
             text += " ([%s] %s)" % (mksub.sub_name(args.subs_dir, pool[pos - 1]["sub"], 16), _label(pool[pos - 1]))
     else:
         text = "the active node is not in the pool (%d nodes)" % len(pool)

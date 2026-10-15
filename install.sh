@@ -36,11 +36,14 @@ PROMOTION_MARKER="$WORKDIR/promotion-active"
 PROMOTION_BACKUP="$WORKDIR/bin-backup"
 SERVICE_STATE_BACKUP="$WORKDIR/service-state-backup"
 SERVICE_STATE_MARKER="$WORKDIR/service-state-active"
+# Every installed program file (on_boot.sh is handled apart) and systemd unit.
+SCRIPTS="proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkfallback.py proxylib.py safeexec.py"
+UNITS="proxy-unifi.service proxy-unifi-refresh.service proxy-unifi-refresh.timer proxy-unifi-guard.service
+       proxy-unifi-guard.timer proxy-unifi-fallback.service proxy-unifi-fallback.timer"
 
 snapshot_service_state() {
     mkdir -p "$SERVICE_STATE_BACKUP"
-    for _unit in proxy-unifi.service proxy-unifi-refresh.service proxy-unifi-refresh.timer proxy-unifi-guard.service proxy-unifi-guard.timer \
-                 proxy-unifi-fallback.service proxy-unifi-fallback.timer; do
+    for _unit in $UNITS; do
         if [ -e "/etc/systemd/system/$_unit" ]; then
             : > "$SERVICE_STATE_BACKUP/$_unit.present"
             cp -p "/etc/systemd/system/$_unit" "$SERVICE_STATE_BACKUP/$_unit" || return 1
@@ -56,8 +59,7 @@ restore_service_state() {
     [ -f "$SERVICE_STATE_MARKER" ] || return 0
     [ -f "$SERVICE_STATE_BACKUP/snapshotted" ] || return 0
     systemctl daemon-reload >/dev/null 2>&1 || return 1
-    for _unit in proxy-unifi.service proxy-unifi-refresh.service proxy-unifi-refresh.timer proxy-unifi-guard.service proxy-unifi-guard.timer \
-                 proxy-unifi-fallback.service proxy-unifi-fallback.timer; do
+    for _unit in $UNITS; do
         if [ ! -f "$SERVICE_STATE_BACKUP/$_unit.present" ]; then
             systemctl disable --now "$_unit" >/dev/null 2>&1 || true
             rm -f "/etc/systemd/system/$_unit"
@@ -74,7 +76,7 @@ restore_service_state() {
 restore_promotion() {
     [ -f "$PROMOTION_MARKER" ] || return 0
     _restore_rc=0
-    for _r in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkfallback.py proxylib.py safeexec.py \
+    for _r in $SCRIPTS \
               xray sing-box amnezia-box geoip.dat geosite.dat; do
         if [ -f "$PROMOTION_BACKUP/$_r.absent" ]; then rm -f "$BIN_DIR/$_r" || _restore_rc=1
         # Copy then rename: a running core cannot be overwritten in place (ETXTBSY).
@@ -247,15 +249,14 @@ prepare_source_bundle() {
         "$_bundle" 10485760 || return 1
     rm -rf "$_source"
     mkdir -p "$_source/src" || return 1
-    "$PYTHON" - "$_bundle" "$_source/src" <<'PY' || { rm -rf "$_source"; return 1; }
+    "$PYTHON" - "$_bundle" "$_source/src" "$SCRIPTS on_boot.sh" <<'PY' || { rm -rf "$_source"; return 1; }
 import os
 import shutil
 import sys
 import tarfile
 
 archive_path, outdir = sys.argv[1], sys.argv[2]
-needed = set("proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkfallback.py proxylib.py "
-             "safeexec.py on_boot.sh".split())
+needed = set(sys.argv[3].split())
 found = set()
 limit = 2 * 1024 * 1024
 root = os.path.realpath(outdir)
@@ -393,7 +394,7 @@ _install_files_locked() {
         prepare_source_bundle \
             || echo "project source archive unavailable; falling back to per-file downloads" >&2
     fi
-    for f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkfallback.py proxylib.py safeexec.py on_boot.sh; do
+    for f in $SCRIPTS on_boot.sh; do
         fetch "$f" "$_stage/$f" 0755 || { echo "fetch failed: $f" >&2; return 1; }
         [ -s "$_stage/$f" ] || { echo "empty file fetched: $f" >&2; return 1; }
     done
@@ -404,7 +405,7 @@ _install_files_locked() {
     # Checked explicitly: this function runs inside an if, where set -e is off.
     snapshot_service_state || { echo "could not record the service state for a rollback" >&2; return 1; }
     _backup="$PROMOTION_BACKUP"; mkdir -p "$_backup" || return 1
-    for f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkfallback.py proxylib.py safeexec.py \
+    for f in $SCRIPTS \
              xray sing-box amnezia-box geoip.dat geosite.dat; do
         if [ -e "$BIN_DIR/$f" ]; then cp -p "$BIN_DIR/$f" "$_backup/$f" || return 1
         else : > "$_backup/$f.absent"; fi
@@ -413,7 +414,7 @@ _install_files_locked() {
     else : > "$_backup/on_boot.sh.absent"; fi
     : > "$PROMOTION_MARKER"
     # promote atomically
-    for f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkfallback.py proxylib.py safeexec.py; do
+    for f in $SCRIPTS; do
         if ! mv -f "$_stage/$f" "$BIN_DIR/$f" || ! chmod 0755 "$BIN_DIR/$f"; then
             return 1
         fi

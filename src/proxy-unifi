@@ -1161,14 +1161,15 @@ _ipv6_enabled() { grep -q . /proc/net/if_inet6 2>/dev/null; }
 
 _fw_rule() { "$1" "$2" "$FW_CHAIN" -p udp --dport "$3" ! -i lo -j DROP 2>/dev/null; }   # <ipt> <-A|-C> <port>
 
-# 0 when INPUT reaches the guard before anything but the kernel ingress chain
-# (the project's only other INPUT chain).
-_fw_jump_first() {
-    "$1" -S INPUT 2>/dev/null | awk -v jump="-A INPUT -j $FW_CHAIN" -v ingress="-A INPUT -j $INGRESS_IN_CHAIN" '
+# 0 when INPUT jumps to <chain> before any rule but a jump to <other>: the
+# project's two INPUT guards may precede each other, nothing else may.
+_input_first() {   # <iptables> <chain> <other>
+    "$1" -S INPUT 2>/dev/null | awk -v jump="-A INPUT -j $2" -v other="-A INPUT -j $3" '
         $0 == jump { found = 1; exit }
-        /^-A INPUT / && $0 != ingress { exit }
+        /^-A INPUT / && $0 != other { exit }
         END { exit !found }'
 }
+_fw_jump_first() { _input_first "$1" "$FW_CHAIN" "$INGRESS_IN_CHAIN"; }
 
 # Install or repair the guard. A correct guard is left untouched (the timer
 # reconciles every 30 s while the core listens), and a repair adds the new rule
@@ -1848,15 +1849,6 @@ ingress_rt_status() {
     echo "on via table $_rs_tbl (${_rs_syn:-0} TCP connections passed UniFi's firewall)"
 }
 
-# INPUT must reach the ingress guard before foreign rules. The other owned
-# guard may precede it: it only handles the WireGuard UDP port.
-_ingress_input_first() {
-    iptables -S INPUT 2>/dev/null | awk -v jump="-A INPUT -j $INGRESS_IN_CHAIN" -v guard="-A INPUT -j $FW_CHAIN" '
-        $0 == jump { found = 1; exit }
-        /^-A INPUT / && $0 != guard { exit }
-        END { exit !found }'
-}
-
 # Root-namespace rules: TPROXY every TCP/UDP packet from the veth to Xray, admit
 # from the veth only the TCP/UDP that TPROXY marked for Xray and ICMP, keep Xray's
 # listener off every other interface, never forward from the veth (no tunnel
@@ -1867,7 +1859,7 @@ _ingress_rules_ok() {
     iptables -t mangle -C PREROUTING -i "$INGRESS_VETH" -j "$INGRESS_TP_CHAIN" 2>/dev/null \
         && iptables -t mangle -C "$INGRESS_TP_CHAIN" -p tcp $_ir_tp 2>/dev/null \
         && iptables -t mangle -C "$INGRESS_TP_CHAIN" -p udp $_ir_tp 2>/dev/null \
-        && _ingress_input_first \
+        && _input_first iptables "$INGRESS_IN_CHAIN" "$FW_CHAIN" \
         && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -m mark --mark "$INGRESS_MARK" -j ACCEPT 2>/dev/null \
         && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p icmp -j ACCEPT 2>/dev/null \
         && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -j DROP 2>/dev/null \
@@ -1903,7 +1895,7 @@ _ingress_rules_add() {
     _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -j DROP || return 1
     _ingress_step iptables -A "$INGRESS_IN_CHAIN" -p tcp --dport "$INGRESS_PORT" -j DROP || return 1
     _ingress_step iptables -A "$INGRESS_IN_CHAIN" -p udp --dport "$INGRESS_PORT" -j DROP || return 1
-    _ingress_input_first \
+    _input_first iptables "$INGRESS_IN_CHAIN" "$FW_CHAIN" \
         || _ingress_step iptables -I INPUT 1 -j "$INGRESS_IN_CHAIN" || return 1
     iptables -C FORWARD -i "$INGRESS_VETH" -j DROP 2>/dev/null \
         || _ingress_step iptables -I FORWARD 1 -i "$INGRESS_VETH" -j DROP || return 1
@@ -3919,10 +3911,8 @@ fallback_install() {   # <draft> <interval> <down> <up> <timeout> <return on|off
     py "$MKFALLBACK" count --pool "$1" >/dev/null || fatal "the new pool is malformed"
     txn_begin
     atomic_write "$FB_POOL" 600 < "$1" || fatal "could not save the pool"
-    FB_INTERVAL="$2"; FB_DOWN="$3"; FB_UP="$4"; FB_TIMEOUT="$5"; FB_RETURN="$6"
-    save_settings
-    if [ "$FALLBACK" = on ]; then fallback_set on; fi
-    txn_commit
+    FB_RETURN="$6"
+    fallback_set_timing "$2" "$3" "$4" "$5"     # saves the settings, commits
 }
 
 fallback_add() {   # <subscription id> <node number> <position>
@@ -4110,21 +4100,16 @@ PYEOF
 # The provider's title, else the URL's host.
 sub_name_default() {
     py - "$SUB_DIR/$1" <<'PYEOF' 2>/dev/null || echo subscription
-import json, os, sys
+import json, sys
 from urllib.parse import urlsplit
 folder = sys.argv[1]
 try:
-    with open(os.path.join(folder, "catalog.json"), encoding="utf-8") as fh:
-        title = json.load(fh).get("meta", {}).get("title", "")
+    title = json.load(open(folder + "/catalog.json", encoding="utf-8")).get("meta", {}).get("title", "")
 except (OSError, ValueError, AttributeError):
     title = ""
-if not title:
-    try:
-        with open(os.path.join(folder, "url.txt"), encoding="utf-8") as fh:
-            title = urlsplit(fh.read().strip()).hostname or ""
-    except (OSError, ValueError):
-        title = ""
-print(title or "subscription")
+# An unreadable URL fails the script: the caller's fallback name applies.
+print(title or urlsplit(open(folder + "/url.txt", encoding="utf-8").read().strip()).hostname
+      or "subscription")
 PYEOF
 }
 
