@@ -213,9 +213,12 @@ cross-origin redirect. The default User-Agent is `Happ/2.0` and can be
 changed from the Subscriptions menu, for all subscriptions or for one. A
 persistent systemd timer refreshes every subscription in the background at the
 configured interval; one failing provider keeps its nodes and does not stop the
-others, and downloads never block the menu or the fallback watchdog. If a
-selected node disappears or matches ambiguously, the active tunnel is kept
-unchanged.
+others, and downloads never block the menu or the fallback watchdog. After a
+refresh the selected node is found again by its exact content; if that changed,
+by its name, protocol and server. When the provider moved it to a new server, a
+node with the same name and protocol takes its place, and among several such
+nodes the one at the same list position wins. If none fits, the active tunnel is
+kept unchanged.
 
 Provider JSON is not executed byte-for-byte. proxy-unifi validates target
 addresses, routing references, balancers, observatories, DNS, and resource
