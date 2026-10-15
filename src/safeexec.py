@@ -113,6 +113,9 @@ def main():
         _kill_group(proc.pid, signum)
     signal.signal(signal.SIGTERM, forward)
     signal.signal(signal.SIGINT, forward)
+    # A hang-up (the SSH session closed mid-ping) cancels the run: the child is
+    # in its own session and would not get it, so stop its whole group.
+    signal.signal(signal.SIGHUP, lambda _signum, _frame: _kill_group(proc.pid, signal.SIGTERM))
     deadline = time.monotonic() + args.timeout
     memory_limit = args.memory_mb * 1024 * 1024
     reason = ""

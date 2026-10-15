@@ -948,7 +948,13 @@ def cmd_fetch(args):
         if not url:
             die("fetch needs --url-file/--url (or --body-file)")
         hwid = _read_secret(args.hwid_file) if args.hwid_file else args.hwid
+        # The per-read socket timeouts restart with every byte, so a provider
+        # trickling its answer could hold the refresh forever: end it outright.
+        import signal
+        signal.signal(signal.SIGALRM, lambda _s, _f: die("the provider took longer than %d s" % DEADLINE))
+        signal.alarm(int(DEADLINE * 1.5) + 1)
         raw, headers = fetch_url(url, hwid, args.ua)
+        signal.alarm(0)
     # ensure_ascii=True: the on-disk catalog stays pure ASCII (\uXXXX escapes),
     # so stored text (Cyrillic / CJK labels, ...) survives being written and read
     # back regardless of the gateway's locale / stream encoding.

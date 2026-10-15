@@ -157,6 +157,17 @@ PY
     [ -n "$_child" ] && proc_alive "$_child" && _dead=0
     if [ "$_src" = 124 ] && [ "$_dead" = 1 ]; then ok "safe validator timeout kills process group"
     else bad "safe validator timeout kills process group"; [ "$_dead" = 1 ] || kill "$_child" 2>/dev/null || true; fi
+    # A hang-up (an SSH session closing mid-ping) stops the validator's group too.
+    # shellcheck disable=SC2016 # $$/$1 expand inside the child shell
+    python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 30 --memory-mb 64 --fsize-mb 1 -- \
+        sh -c 'echo $$ > "$1/hup"; exec sleep 30' sh "$_sd" >/dev/null 2>&1 &
+    _sx=$!; _i=0
+    while [ ! -s "$_sd/hup" ] && [ "$_i" -lt 100 ]; do _i=$((_i + 1)); sleep 0.05 2>/dev/null || sleep 1; done
+    kill -HUP "$_sx" 2>/dev/null; _i=0
+    while proc_alive "$(cat "$_sd/hup")" && [ "$_i" -lt 40 ]; do _i=$((_i + 1)); sleep 0.05 2>/dev/null || sleep 1; done
+    if proc_alive "$(cat "$_sd/hup")"; then bad "safe validator stops its group on a hang-up"; kill "$(cat "$_sd/hup")" 2>/dev/null
+    else ok "safe validator stops its group on a hang-up"; fi
+    wait "$_sx" 2>/dev/null
     rm -rf "$_sd"
     if [ "$(uname -s)" = Linux ]; then
         python3 "$SRC/safeexec.py" --user "$(id -un)" --timeout 10 --memory-mb 64 --fsize-mb 1 -- \
@@ -170,6 +181,37 @@ PY
     else
         ok "proxy credentials and keys stay out of child argv"
     fi
+
+    # A failed AmneziaWG update must not leave an older core accepted.
+    _aw="$(mktemp -d)"
+    printf '#!/bin/sh\necho "sing-box version proxy-unifi-awg-1.0.0"\n' > "$_aw/amnezia-box"; chmod 755 "$_aw/amnezia-box"
+    {
+        echo "ABIN='$_aw/amnezia-box'; AWG_CORE_VERSION=1.1.0"
+        echo 'fatal() { exit 1; }; cmd_install_awg() { return 1; }'
+        sed -n '/^_awg_version_ok() {/,/^}/p; /^ensure_awg() {/,/^}/p' "$SRC/proxy-unifi"
+        echo 'ensure_awg'
+    } > "$_aw/e.sh"
+    if sh "$_aw/e.sh" 2>/dev/null; then bad "a failed AmneziaWG update rejects the older core"
+    else ok "a failed AmneziaWG update rejects the older core"; fi
+    rm -rf "$_aw"
+    # A rollback renders the service from the restored settings, not from the
+    # failed operation's values still in memory.
+    _rr="$(mktemp -d)"
+    {
+        echo "SETTINGS='$_rr/settings.env'; SERVICE_FILE='$_rr/unit'; SERVICE_NAME=proxy-unifi; FB_SERVICE_NAME=f"
+        cat <<'SH'
+INGRESS=kernel
+systemctl() { :; }; sub_any() { return 1; }; fw_reconcile() { :; }; write_fallback_timer() { :; }
+write_service() { echo "$INGRESS" > "$SERVICE_FILE"; }
+SH
+        sed -n '/^_uint() {/p; /^_in_range() {/p; /^load_settings() {/,/^}/p; /^restore_runtime_state() {/,/^}/p' "$SRC/proxy-unifi"
+        # shellcheck disable=SC2016 # expands in the generated script
+        echo 'mkdir -p "$1/s"; : > "$1/s/runtime-state"; restore_runtime_state "$1/s"; cat "$SERVICE_FILE"'
+    } > "$_rr/r.sh"
+    printf 'INGRESS="userspace"\n' > "$_rr/settings.env"; : > "$_rr/unit"
+    if [ "$(sh "$_rr/r.sh" "$_rr" 2>/dev/null)" = userspace ]; then ok "a rollback renders the unit from the restored settings"
+    else bad "a rollback renders the unit from the restored settings"; fi
+    rm -rf "$_rr"
 
     _ud="$(mktemp -d)"
     {
@@ -1671,6 +1713,19 @@ with tempfile.TemporaryDirectory() as tmp:
     assert sorted(e["missing"] for e in loaded) == [False, True], loaded
 PY
 
+    # A provider that answers slowly enough never trips a per-read timeout; the
+    # whole fetch still ends at its deadline instead of hanging the refresh.
+    py_case "subscription fetch ends at its deadline" "$SRC" <<'PY'
+import subprocess, sys, time
+code = ("import sys, time; sys.path.insert(0, %r); import mksub; mksub.DEADLINE = 1; "
+        "mksub.fetch_url = lambda *a: time.sleep(30); "
+        "sys.argv = ['mksub.py', 'fetch', '--url', 'https://x.example/']; mksub.main()" % sys.argv[1])
+start = time.time()
+done = subprocess.run([sys.executable, "-c", code], stderr=subprocess.PIPE, timeout=25)
+assert time.time() - start < 6 and done.returncode != 0, (time.time() - start, done)
+assert b"took longer" in done.stderr, done.stderr
+PY
+
     # mkawg: AWG 1.5-3.1 parser, bridge generator, profile catalog, and UI safety.
     py_case "mkawg parser and UI corpus" "$SRC" <<'PY'
 import base64
@@ -2629,6 +2684,10 @@ unifi_client_if() { echo "$_if"; }
 systemctl() { printf "ActiveState=active\nMainPID=%s\n" "$_core"; }
 ping_proxy get' sh "$_pd/lib.sh" "$_lo" "$(cat "$_pd/core.port" 2>/dev/null)" "$_core" 2>&1)"
     _alive=0; kill -0 "$_core" 2>/dev/null && _alive=1
+    # Proxy settings in the environment never route a check around the node.
+    # shellcheck disable=SC2016 # $1 expands inside the child shell.
+    _bypass="$(NO_PROXY='*' no_proxy='*' sh -c '. "$1"; _http_probe --proxy socks5h://127.0.0.1:9 "$PING_URL"; echo "$_rc"' \
+        sh "$_pd/lib.sh" 2>&1)"
     # The fallback watchdog checks a pool node that is not active through a
     # test core built for that node.
     printf '%s' '{"inbounds":[{"tag":"socks","protocol":"socks","listen":"127.0.0.1","port":10808}],"outbounds":[{"protocol":"freedom","tag":"proxy"}]}' \
@@ -2643,7 +2702,7 @@ echo "$_rc $_code"' sh "$_pd/lib.sh" "$_pd/node.json" 2>&1)"
     elif printf '%s\n' "$_dead" | grep -q '^via proxy (HEAD): failed (test core): .' \
          && ! printf '%s\n' "$_dead" | grep -q timeout \
          && printf '%s\n' "$_live" | grep -Eq '^via proxy \(GET\): [0-9]+ ms  \(HTTP 200, live tunnel '"$_lo"'\)$' \
-         && [ "$_alive" = 1 ] && [ "$_node" = "0 200" ]
+         && [ "$_alive" = 1 ] && [ "$_node" = "0 200" ] && [ "$_bypass" != 0 ]
     then ok "proxy ping: a dead server's error, the live tunnel leaves the core running, a pool node's own test core"
     else bad "proxy ping: a dead server's error, the live tunnel leaves the core running, a pool node's own test core (got: $_dead / $_live / core alive $_alive / node $_node)"; fi
     rm -rf "$_pd"
