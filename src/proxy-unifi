@@ -2493,7 +2493,7 @@ restart_service() {
     # A core that cannot come up on the kernel path still serves the tunnel
     # through its own WireGuard: mark the path as failed (ingress_up then falls
     # back) and try once more.
-    ingress_wanted && [ -d "$INGRESS_RUN" ] || { err "health check: $(health_why)"; return 1; }
+    { ingress_wanted && [ -d "$INGRESS_RUN" ]; } || { err "health check: $(health_why)"; return 1; }
     echo 3 > "$INGRESS_FAILS" 2>/dev/null || return 1
     if _restart_healthy; then
         c_ylw "Kernel WireGuard ingress did not come up; Xray's WireGuard serves the tunnel ('proxy status')."
