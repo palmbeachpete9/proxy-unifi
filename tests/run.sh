@@ -468,7 +468,8 @@ SH
     # An ordered iptables model: INPUT keeps rule order, the guard chain keeps
     # its ports, -S prints rules the way iptables does, and every flush is logged.
     cat > "$_fd/fw.sh" <<'SH'
-FW_CHAIN=PROXY_UNIFI_WG; INGRESS_IN_CHAIN=PROXY_UNIFI_IN; WG_PORT=51821; D="$WORK"; FAIL6=0; FAILADD=0
+set -u                                   # as in production: an unset name fails
+FW_CHAIN=PROXY_UNIFI_WG; WG_PORT=51821; D="$WORK"; FAIL6=0; FAILADD=0
 load_settings() { :; }; err() { :; }; have() { command -v "$1" >/dev/null 2>&1; }
 _port_of() { printf '%s\n' "$*" | sed -n 's/.*--dport \([0-9]*\).*/\1/p'; }
 mock_iptables() {
@@ -507,14 +508,12 @@ rm -f "$D/v4.log"; fw_lock || exit 1; [ ! -e "$D/v4.log" ] || exit 1
 # A repair that cannot add the rule keeps the rule already there.
 FAILADD=1; fw_lock; FAILADD=0; fw_is_locked 51821 || exit 1
 # An ACCEPT placed before the guard bypasses it: not reported as locked, and
-# fw_lock puts the guard back in front (only the kernel ingress chain may precede it).
+# fw_lock puts the guard back in front.
 { echo ACCEPT_WG; cat "$D/v4.input"; } > "$D/v4.n"; mv "$D/v4.n" "$D/v4.input"
 if fw_is_locked 51821; then exit 1; fi
 fw_lock && fw_is_locked 51821 || exit 1
 # The old jump stays: deleting it by position could hit a rule UniFi inserted meanwhile.
 [ "$(head -n 1 "$D/v4.input")" = PROXY_UNIFI_WG ] && [ "$(grep -c '^PROXY_UNIFI_WG$' "$D/v4.input")" = 2 ] || exit 1
-{ echo PROXY_UNIFI_IN; cat "$D/v4.input"; } > "$D/v4.n"; mv "$D/v4.n" "$D/v4.input"
-fw_is_locked 51821 || exit 1
 # A new port: its rule is in place before the old one goes.
 WG_PORT=51822; fw_lock && fw_is_locked 51822 || exit 1
 [ "$(cat "$D/v4.chain")" = 51822 ] || exit 1
