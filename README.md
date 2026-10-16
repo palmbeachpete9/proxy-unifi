@@ -233,8 +233,9 @@ autostart, update cores, update geo files, and uninstall.
   atomic state change; failed starts restore the prior working state.
 - **Core integrity:** xray-core is never installed below the upstream security
   fix in `v26.7.11`; that release and the project-owned AWG core use embedded
-  per-architecture hashes. Newer Xray and sing-box releases must match GitHub's
-  asset digest, and newer Xray releases must also match Xray's sidecar checksum.
+  per-architecture hashes. Newer Xray releases must match GitHub's asset digest
+  and Xray's sidecar checksum. sing-box is pinned to `v1.13.21` (1.14.3 does not
+  open its WireGuard port on a Dream Router 7) and must match GitHub's digest.
 
 ## Persistence
 
