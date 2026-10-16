@@ -2290,13 +2290,12 @@ download_engines() {
     [ -n "$_xwant" ] && [ "$(sha256_of "$CACHE/x.zip")" = "$_xwant" ] || return 1
     unzip -oq "$CACHE/x.zip" -d "$CACHE" && chmod +x "$CACHE/xray" \
         && "$CACHE/xray" version >/dev/null 2>&1 || return 1
-    # One API call names the latest stable release and carries its asset digests.
-    curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 \
-        https://api.github.com/repos/SagerNet/sing-box/releases/latest -o "$CACHE/sb-release.json" \
-        || return 1
-    _tag="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("tag_name",""))' \
-        "$CACHE/sb-release.json")"; _v="${_tag#v}"
+    # The release the installer pins; one API call carries its asset digests.
+    _tag="$(sed -n 's/^SINGBOX_TAG="\([^"]*\)"/\1/p' "$SRC/proxy-unifi")"; _v="${_tag#v}"
     [ -n "$_v" ] || return 1
+    curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 \
+        "https://api.github.com/repos/SagerNet/sing-box/releases/tags/$_tag" -o "$CACHE/sb-release.json" \
+        || return 1
     echo "  downloading sing-box $_tag ($_sos-$_sa) ..."
     _sbdir="$CACHE/sing-box-${_v}-${_sos}-${_sa}"
     rm -rf "$_sbdir"

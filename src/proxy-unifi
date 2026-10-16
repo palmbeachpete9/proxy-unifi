@@ -67,6 +67,10 @@ TXN_MARKER="$TXN_ROOT/active"
 
 
 SINGBOX_RELEASES="https://github.com/SagerNet/sing-box/releases"
+# ponytail: pinned, not "latest". sing-box 1.14.3 runs on a Dream Router 7
+# (kernel 5.4) but never opens its WireGuard port; 1.13 does. Raise the pin
+# once a 1.14+ release is checked on a gateway.
+SINGBOX_TAG="v1.13.21"
 AWG_CORE_RELEASES="https://github.com/palmbeachpete9/proxy-unifi/releases"
 AWG_CORE_VERSION="1.1.0"
 AWG_CORE_TAG="awg-core-v${AWG_CORE_VERSION}"
@@ -909,8 +913,7 @@ PYEOF
 cmd_install_singbox() {
     mkdir -p "$BIN_DIR"
     _sa="$(sb_arch)"
-    _tag="$(resolve_latest_tag "$SINGBOX_RELEASES")"
-    [ -n "$_tag" ] || { err "could not resolve sing-box latest version"; return 1; }
+    _tag="$SINGBOX_TAG"
     _ver="${_tag#v}"
     _asset="sing-box-${_ver}-linux-${_sa}.tar.gz"
     _url="$SINGBOX_RELEASES/download/${_tag}/${_asset}"
