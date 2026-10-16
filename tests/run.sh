@@ -587,6 +587,20 @@ ExecStartPre=+/b/proxy-unifi _fw-lock" ] || _fw_ok=0
     [ "$(grep '^ExecStartPre=' "$_ud/unit")" = "$_pre_down" ] || _fw_ok=0
     grep -q '_fw-lock' "$_ud/unit" && _fw_ok=0          # xray must NOT lock a port
     [ "$_fw_ok" = 1 ] && ok "singbox/AWG WG port firewalled (unit)" || bad "singbox/AWG WG port firewalled (unit)"
+    # A failed start says what the health check saw.
+    {
+        cat <<'SH'
+set -eu; SERVICE_NAME=proxy-unifi; WG_PORT=51821
+systemctl() { printf 'MainPID=42\nActiveState=active\n'; }
+ingress_active() { return 1; }
+ss() { echo 'UNCONN 0  0   0.0.0.0:51821  0.0.0.0:*  users:(("sing-box",pid=42,fd=8))'; }
+SH
+        sed -n '/^health_why() {/,/^}/p' "$SRC/proxy-unifi"
+        echo 'health_why'
+    } > "$_ud/why.sh"
+    [ "$(sh "$_ud/why.sh")" = 'MainPID=42 ActiveState=active UDP 51821: UNCONN 0 0 0.0.0.0:51821 0.0.0.0:* users:(("sing-box",pid=42,fd=8)); kernel ingress off' ] \
+        && ok "a failed start reports what the health check saw" \
+        || bad "a failed start reports what the health check saw (got: $(sh "$_ud/why.sh" 2>&1))"
     # Kernel ingress: built before the core, loaded last, torn down after it;
     # only then may the core bind transparent sockets.
     _ki_ok=1

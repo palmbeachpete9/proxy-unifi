@@ -2493,14 +2493,23 @@ restart_service() {
     # A core that cannot come up on the kernel path still serves the tunnel
     # through its own WireGuard: mark the path as failed (ingress_up then falls
     # back) and try once more.
-    ingress_wanted && [ -d "$INGRESS_RUN" ] || return 1
+    ingress_wanted && [ -d "$INGRESS_RUN" ] || { err "health check: $(health_why)"; return 1; }
     echo 3 > "$INGRESS_FAILS" 2>/dev/null || return 1
     if _restart_healthy; then
         c_ylw "Kernel WireGuard ingress did not come up; Xray's WireGuard serves the tunnel ('proxy status')."
         return 0
     fi
     ingress_retry   # it was not the kernel path: a restored configuration tries it again
+    err "health check: $(health_why)"
     return 1
+}
+
+# What the health check saw, for the error a failed start ends with.
+health_why() {
+    _hw_unit="$(systemctl show -p ActiveState -p MainPID "$SERVICE_NAME" 2>/dev/null | tr '\n' ' ')"
+    _hw_port="$(ss -lunp 2>/dev/null | awk -v p=":$WG_PORT" 'index($0, p) { $1 = $1; print }' | head -n 2 | paste -sd '|' -)"
+    if ingress_active; then _hw_ki=on; else _hw_ki=off; fi
+    echo "${_hw_unit}UDP $WG_PORT: ${_hw_port:-no listener}; kernel ingress $_hw_ki"
 }
 
 _restart_healthy() {
