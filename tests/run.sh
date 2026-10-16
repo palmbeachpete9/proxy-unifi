@@ -576,6 +576,8 @@ SH
     [ "$(grep '^ExecStartPre=' "$_ud/unit")" = "$_pre_down
 ExecStartPre=+/b/proxy-unifi _fw-lock" ] || _fw_ok=0
     grep -q '^ExecStopPost=-+/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
+    # sing-box 1.14 exits at start unless it can read interfaces and routes.
+    grep -q '^RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK$' "$_ud/unit" || _fw_ok=0
     ENG=awg      WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
     grep -q '^ExecStart=/b/amnezia-box run -c /c/config.json$' "$_ud/unit" || _fw_ok=0
     [ "$(grep '^ExecStartPre=' "$_ud/unit")" = "$_pre_down

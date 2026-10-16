@@ -1355,7 +1355,9 @@ SystemCallArchitectures=native
 LockPersonality=true
 RestrictRealtime=true
 MemoryDenyWriteExecute=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# AF_NETLINK: sing-box 1.14 exits at start unless it can watch interfaces and
+# routes. Read-only here: the core has no CAP_NET_ADMIN to change them.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 CapabilityBoundingSet=$_caps
 AmbientCapabilities=$_caps
 ReadOnlyPaths=$ROOT
