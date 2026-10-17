@@ -601,6 +601,17 @@ SH
     [ "$(sh "$_ud/why.sh")" = 'MainPID=42 ActiveState=active UDP 51821: UNCONN 0 0 0.0.0.0:51821 0.0.0.0:* users:(("sing-box",pid=42,fd=8)); kernel ingress off' ] \
         && ok "a failed start reports what the health check saw" \
         || bad "a failed start reports what the health check saw (got: $(sh "$_ud/why.sh" 2>&1))"
+    # A test core whose config the generator refused says why.
+    {
+        printf '_cfg=%s\n' "$_ud/ping.json"
+        echo 'err() { echo "error: $*"; }; _ping_cleanup() { :; }'
+        sed -n '/^_probe_fail() {/,/^}/p' "$SRC/proxy-unifi"
+        echo '_probe_fail "could not build test config"'
+    } > "$_ud/pf.sh"
+    printf 'mksingbox: error: unsupported cipher\n' > "$_ud/ping.json.err"
+    [ "$(sh "$_ud/pf.sh")" = "error: could not build test config (unsupported cipher)" ] \
+        && ok "a refused test config names the generator's reason" \
+        || bad "a refused test config names the generator's reason (got: $(sh "$_ud/pf.sh" 2>&1))"
     # Kernel ingress: built before the core, loaded last, torn down after it;
     # only then may the core bind transparent sockets.
     _ki_ok=1

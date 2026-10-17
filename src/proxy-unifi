@@ -2800,8 +2800,15 @@ _free_port() {
 
 _ping_cleanup() {
     [ -n "${_pid:-}" ] && { kill "$_pid" 2>/dev/null || true; wait "$_pid" 2>/dev/null || true; }
-    [ -n "${_cfg:-}" ] && rm -f "$_cfg"
+    [ -n "${_cfg:-}" ] && rm -f "$_cfg" "$_cfg.err"
     _pid=""; _cfg=""; BG_PID=""
+}
+
+# A test config the generator refused: say why, with its first error line.
+_probe_fail() {   # <message>
+    _pf=""; IFS= read -r _pf < "$_cfg.err" 2>/dev/null || true
+    err "$1${_pf:+ (${_pf#*error: })}"
+    _ping_cleanup
 }
 
 # Start a throwaway core that exposes the active outbound on a free loopback
@@ -2821,8 +2828,8 @@ _probe_start() {
         # inbound so we measure latency through the same balancer xray uses live.
         [ -x "$XRAY" ] || { err "xray binary not installed"; _ping_cleanup; return 1; }
         [ -f "${_src:-$POOL_SRC}" ] || { err "no pool profile on disk"; _ping_cleanup; return 1; }
-        py "$MKJSON" socksconfig --profile "${_src:-$POOL_SRC}" --socks-port "$_port" > "$_cfg" 2>/dev/null \
-            || { err "could not build test config"; _ping_cleanup; return 1; }
+        py "$MKJSON" socksconfig --profile "${_src:-$POOL_SRC}" --socks-port "$_port" > "$_cfg" 2>"$_cfg.err" \
+            || { _probe_fail "could not build test config"; return 1; }
         set -- "$XRAY" run -config "$_cfg" -format json
     elif [ "$_e" = "awg" ]; then
         [ -x "$ABIN" ] || { err "AmneziaWG core not installed"; _ping_cleanup; return 1; }
@@ -2832,18 +2839,18 @@ _probe_start() {
         # test URL on the gateway, then carry the resulting connection over AWG.
         _proxy_scheme="socks5"
         py "$MKAWG" build --file "$_awg_profile" --socks-port "$_port" \
-            --loglevel "$(sb_loglevel)" > "$_cfg" 2>/dev/null \
-            || { err "could not build AmneziaWG test config"; _ping_cleanup; return 1; }
+            --loglevel "$(sb_loglevel)" > "$_cfg" 2>"$_cfg.err" \
+            || { _probe_fail "could not build AmneziaWG test config"; return 1; }
         set -- "$ABIN" run -c "$_cfg"
     elif [ "$_e" = "singbox" ]; then
         [ -x "$SBIN" ] || { err "sing-box not installed"; _ping_cleanup; return 1; }
-        py "$MKSB" --link-file "${_src:-$OUTBOUND_LINK}" --socks-port "$_port" > "$_cfg" 2>/dev/null \
-            || { err "could not build test config"; _ping_cleanup; return 1; }
+        py "$MKSB" --link-file "${_src:-$OUTBOUND_LINK}" --socks-port "$_port" > "$_cfg" 2>"$_cfg.err" \
+            || { _probe_fail "could not build test config"; return 1; }
         set -- "$SBIN" run -c "$_cfg"
     else
         [ -x "$XRAY" ] || { err "xray binary not installed"; _ping_cleanup; return 1; }
-        py "$MKXRAY" --link-file "${_src:-$OUTBOUND_LINK}" --socks-port "$_port" > "$_cfg" 2>/dev/null \
-            || { err "could not build test config"; _ping_cleanup; return 1; }
+        py "$MKXRAY" --link-file "${_src:-$OUTBOUND_LINK}" --socks-port "$_port" > "$_cfg" 2>"$_cfg.err" \
+            || { _probe_fail "could not build test config"; return 1; }
         set -- "$XRAY" run -config "$_cfg" -format json
     fi
     ensure_service_user
@@ -3129,7 +3136,11 @@ cmd_bench() {   # [seconds] [url]
     case "$_url" in *[[:space:]]*|*[[:cntrl:]]*) fatal "bench URL must not contain spaces or control characters" ;; esac
     _quota="$(sed -n 's/^CPUQuota=//p' "$SERVICE_FILE" 2>/dev/null)"
     _procs="$(sed -n 's/^Environment=GOMAXPROCS=//p' "$SERVICE_FILE" 2>/dev/null)"
-    if ingress_active; then _ingress="kernel WireGuard"; else _ingress="Xray WireGuard (userspace)"; fi
+    case "$(current_engine)" in
+        singbox) _ingress="sing-box WireGuard (userspace)" ;;
+        awg)     _ingress="AmneziaWG core WireGuard (userspace)" ;;
+        *)       if ingress_active; then _ingress="kernel WireGuard"; else _ingress="Xray WireGuard (userspace)"; fi ;;
+    esac
 
     c_bold "proxy-unifi bench: ${_secs}s per test, ${BENCH_STREAMS} parallel downloads"
     echo "target:  $_url"
