@@ -1808,7 +1808,8 @@ cmd_set() {
             { [ "$val" -ge 576 ] && [ "$val" -le 1500 ]; } || fatal "mtu out of range (576-1500)"
             WG_MTU="$val" ;;
         keepalive)
-            case "$val" in *[!0-9]*) fatal "keepalive must be a number";; esac
+            case "$val" in *[!0-9]*) fatal "keepalive must be a number 0-65535";; esac
+            { [ "${#val}" -le 5 ] && [ "${val:-0}" -le 65535 ]; } || fatal "keepalive must be a number 0-65535"
             WG_KEEPALIVE="${val:-0}" ;;
         dns)
             val="$(printf '%s' "$val" | tr -d ' ')"            # comma-separated, no spaces
@@ -1934,7 +1935,8 @@ cmd_geo_update() {
             || { rm -f "$BIN_DIR/$f.new"; _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "digest lookup failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "could not obtain digest for $f"; }
         verify_sha256 "$BIN_DIR/$f.new" "$_want" \
             || { rm -f "$BIN_DIR/$f.new"; _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "checksum failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "checksum failed for $f"; }
-        mv -f "$BIN_DIR/$f.new" "$BIN_DIR/$f"
+        # The core reads them as the service account; downloads are private (umask 077).
+        { chmod 644 "$BIN_DIR/$f.new" && mv -f "$BIN_DIR/$f.new" "$BIN_DIR/$f"; } || fatal "could not install $f"
     done
     if [ "$_geo_was_active" = 1 ] && ! restart_service; then
         _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "geo runtime check failed and rollback was incomplete"
@@ -2328,8 +2330,7 @@ cmd_menu() {
             19) ( locked_call cmd_geo_update ) ;;
             20) ( if [ -x "$XRAY" ]; then core_version "$XRAY"; else c_ylw "xray-core: not installed"; fi
                   if [ -x "$SBIN" ]; then core_version "$SBIN"; else c_ylw "sing-box: not installed"; fi
-                  if [ -x "$ABIN" ]; then core_version "$ABIN"; else c_ylw "AmneziaWG core: not installed"; fi
-                  echo "proxy-unifi CLI 1.0.0" ) ;;
+                  if [ -x "$ABIN" ]; then core_version "$ABIN"; else c_ylw "AmneziaWG core: not installed"; fi ) ;;
             21) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
                 if [ "${_c:-}" = "y" ]; then ( locked_call cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
             *)  c_red "Invalid selection." ;;

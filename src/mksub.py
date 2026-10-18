@@ -308,19 +308,8 @@ def _ss_engine(parsed):
     """(engine, reason, variant) mirroring direct-import engine routing."""
     if parsed is None:
         return "", "unparseable link", ""
-    try:
-        pairs = parse_qsl(parsed.query, keep_blank_values=True)
-    except ValueError:
-        return "", "malformed query string", ""
-    keys = [key for key, _value in pairs]
-    if len(keys) != len(set(keys)):
-        return "", "duplicate query parameter", ""
-    if any(key != "plugin" for key in keys):
-        return "", "unsupported Shadowsocks query parameter", ""
-    plugin = ""
-    for key, value in pairs:
-        if key == "plugin" and value:
-            plugin = unquote(value).split(";", 1)[0]
+    # The query's other options are the generator check's to judge (node_from_link).
+    plugin = unquote(dict(parse_qsl(parsed.query, keep_blank_values=True)).get("plugin", "")).split(";", 1)[0]
     method, password = shadowsocks_method_password(parsed)
     if not method or not password:
         return "", "unparseable Shadowsocks credentials", ""

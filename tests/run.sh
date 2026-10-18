@@ -313,6 +313,25 @@ SH
         || _awg_install_ok=0
     [ "$_awg_install_ok" = 1 ] && ok "AWG core installer validates and safely promotes archive" \
         || bad "AWG core installer validates and safely promotes archive"
+
+    # A geo update leaves files the service account can read.
+    _gd="$(mktemp -d)"; mkdir -p "$_gd/bin"
+    {
+        cat <<'SH'
+set -eu; umask 077
+BIN_DIR="$WORK/bin"; RUN_DIR="$WORK"; SERVICE_NAME=proxy-unifi; GEO_BACKUP=""
+ensure_run_dir() { :; }; info() { :; }; c_grn() { :; }; systemctl() { return 3; }
+resolve_latest_tag() { echo v1; }; github_asset_digest() { echo x; }; verify_sha256() { :; }
+download_to() { echo data > "$2"; }
+SH
+        sed -n '/^_restore_update_backup() {/,/^}/p; /^cmd_geo_update() {/,/^}/p' "$SRC/proxy-unifi"
+        # shellcheck disable=SC2016 # expands in the child shell
+        echo 'cmd_geo_update; ls -l "$BIN_DIR"/geoip.dat "$BIN_DIR"/geosite.dat | cut -c1-10'
+    } > "$_gd/geo.sh"
+    if [ "$(WORK="$_gd" sh "$_gd/geo.sh" 2>&1 | sort -u)" != "-rw-r--r--" ]; then
+        bad "geo update leaves files the service can read"
+    else ok "geo update leaves files the service can read"; fi
+    rm -rf "$_gd"
     rm -rf "$_ad"
 
     # The installer-wide rollback must restore scripts, all cores, and geo
@@ -797,7 +816,9 @@ compat=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",k32))
 assert compat["recognized"] and compat["engine"]=="xray" and "compatibility" in compat["reason"], compat
 bad=mksub.node_from_link(sslink("2022-blake3-aes-256-gcm",k16))
 assert not bad["recognized"] and "32 bytes" in bad["reason"], bad
-unknown=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",k16,"?uot=1"))
+uot=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",k16,"?uot=1"))
+assert uot["recognized"], uot
+unknown=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",k16,"?foo=1"))
 assert not unknown["recognized"] and "query parameter" in unknown["reason"], unknown
 with tempfile.TemporaryDirectory() as directory:
     path=os.path.join(directory,"catalog.json")
