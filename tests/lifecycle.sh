@@ -270,6 +270,24 @@ printf '1\n%s\n\n0\n' "$BAD_SS2022_LINK" | menu_input >/dev/null 2>&1
 [ "$(cat "$T/root/etc/engine")" = singbox ]
 [ "$(hash_file "$T/root/etc/config.json")" = "$SS_CONFIG_HASH" ]
 [ "$(hash_file "$T/root/etc/link.txt")" = "$SS_LINK_HASH" ]
+# An update or boot rebuilds the active config from the saved link, so generator
+# fixes reach it; a link the generators now refuse keeps the running config.
+python3 - "$T/root/etc/config.json" <<'PY'
+import json, sys
+config = json.load(open(sys.argv[1]))
+config["outbounds"][0]["written_by_an_older_version"] = True
+json.dump(config, open(sys.argv[1], "w"))
+PY
+# (The sandbox has no iptables, so boot recovery stops at the firewall guard.)
+run_cli boot-recover >/dev/null 2>&1 || true
+[ "$(hash_file "$T/root/etc/config.json")" = "$SS_CONFIG_HASH" ]
+cp "$T/root/etc/link.txt" "$T/link.saved"
+sed 's/#SS2022$/?bogus=1#SS2022/' "$T/link.saved" > "$T/root/etc/link.txt"
+run_cli boot-recover > "$T/rebuild.out" 2>&1 || true
+grep -q 'Kept the current config: the saved link does not build with this version (unsupported link' "$T/rebuild.out"
+if grep -q "$(printf '\033')\[0m)\." "$T/rebuild.out"; then exit 1; fi    # no colour codes inside the reason
+[ "$(hash_file "$T/root/etc/config.json")" = "$SS_CONFIG_HASH" ]
+cp "$T/link.saved" "$T/root/etc/link.txt"
 [ ! -e "$T/root/.transactions/active" ] || exit 1
 [ ! -e "$T/root/.lock" ] || exit 1
 

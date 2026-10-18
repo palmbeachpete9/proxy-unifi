@@ -41,6 +41,8 @@ from proxylib import (die, display_width, dispatch_subcommand, is_non_public_hos
                       nested_too_deep, xray_outbound_servers,
                       shadowsocks_method_password, shadowsocks_engine)
 from mkjson import sanitize_provider, validate_profile
+import mksingbox
+import mkxray
 # Network-only modules (ssl, http.client, socket, time, urljoin) are
 # imported lazily inside fetch_url()/_https_get()/_public_ips(); the hot local
 # subcommands (render/extract/match) never touch the
@@ -184,7 +186,21 @@ def _host_port(u):
     try:
         return u.hostname, u.port
     except ValueError:
-        return None, None
+        # A port list (Hysteria2 port hopping) or a bad port: the generator
+        # check in node_from_link decides whether the node is usable.
+        return u.hostname, None
+
+
+def _generator_refusal(link, engine):
+    """The activation generator's error for this link, or ''. The list never
+    offers a node that selecting it would then refuse."""
+    error = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(error):
+            (mksingbox if engine == "singbox" else mkxray).parse_link(link)
+    except SystemExit:
+        return error.getvalue().strip().split("error: ", 1)[-1] or "not supported"
+    return ""
 
 
 def _legacy_vmess(link, scheme):
@@ -466,6 +482,11 @@ def node_from_link(link):
             node["recognized"] = False
             node["reason"] = "non-public provider destination (%s)" % (
                 clean(node["label"], 40) or destination or "not authorized")
+        if node["recognized"] and node["engine"] in ("xray", "singbox"):
+            refusal = _generator_refusal(link, node["engine"])
+            if refusal:
+                node["recognized"] = False
+                node["reason"] = refusal
     except Exception:
         node["recognized"] = False
         node["reason"] = "unparseable node"
