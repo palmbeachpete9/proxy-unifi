@@ -129,6 +129,16 @@ def host_port(u):
         die("invalid port in link (must be 1-65535)")
 
 
+def split_port_list(u):
+    """A Hysteria2 authority may list ports for port hopping, as in
+    'host:443,20000-30000'. Returns (u without them, the list) or (u, '')."""
+    head, at, hostport = u.netloc.rpartition("@")
+    host, colon, ports = hostport.rpartition(":")
+    if colon and ("," in ports or "-" in ports) and not ports.endswith("]"):
+        return u._replace(netloc=head + at + host), ports
+    return u, ""
+
+
 def safe_port(value):
     """Parse a port string/int into 1..65535, dying cleanly on anything else."""
     try:

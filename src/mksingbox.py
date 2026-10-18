@@ -14,17 +14,21 @@ Stdlib only (Python 3.9+).
 
 import argparse
 import json
+import re
 import sys
 from urllib.parse import unquote
 
 from proxylib import (die, flat_query, qg, safe_urlsplit, host_port, safe_port,
-                      valid_host, reject_unknown_query, shadowsocks_credentials,
+                      split_port_list, valid_host, reject_unknown_query, shadowsocks_credentials,
                       add_secret_file_arguments, load_generator_inputs,
                       handle_common_generator_modes, shadowsocks_engine)
 
 
 _TLS_QUERY = {"sni", "peer", "alpn", "insecure", "allowInsecure",
               "allow_insecure", "fp", "fingerprint"}
+# TCP Fast Open. Hysteria2 and TUIC run over QUIC (UDP), where it means nothing,
+# so their links may carry it and it is not used.
+_TFO_QUERY = {"tfo", "fastopen"}
 
 
 def _bool_value(value, label):
@@ -48,10 +52,33 @@ def _tls(sni, q, default_alpn=None):
     if _bool_value(qg(q, "insecure", "allowInsecure", "allow_insecure"),
                    "TLS insecure option"):
         die("TLS insecure verification is not supported")
-    fp = qg(q, "fp", "fingerprint")
-    if fp:
-        tls["utls"] = {"enabled": True, "fingerprint": fp}
+    # fp/fingerprint (uTLS) is not set: these protocols use QUIC, and sing-box
+    # refuses uTLS there only when a connection opens ("unsupported usage for
+    # uTLS"), leaving a tunnel that starts but carries nothing.
     return tls
+
+
+def _port_ranges(spec):
+    """'443,20000-30000' -> ['443:443', '20000:30000'] (sing-box server_ports)."""
+    ranges = []
+    for part in spec.split(","):
+        low, _, high = part.strip().partition("-")
+        low, high = safe_port(low), safe_port(high or low)
+        if low > high:
+            die("hysteria2 port range %d-%d is reversed" % (low, high))
+        ranges.append("%d:%d" % (low, high))
+    if len(ranges) > 16:
+        die("hysteria2 lists too many port ranges")
+    return ranges
+
+
+def _whole_number(value, label, low, high, unit=""):
+    """'100', '100mbps' or '30s' -> 100 / 30, within [low, high]."""
+    match = re.fullmatch(r"(\d{1,7})\s*" + re.escape(unit), value.strip(), re.IGNORECASE) \
+        or re.fullmatch(r"(\d{1,7})", value.strip())
+    if not match or not low <= int(match.group(1)) <= high:
+        die("%s must be a whole number %d-%d" % (label, low, high))
+    return int(match.group(1))
 
 
 def plugin_alias(name):
@@ -66,7 +93,7 @@ def plugin_alias(name):
 def parse_ss(link):
     u, method, password, host, port = shadowsocks_credentials(link)
     query = flat_query(u)
-    reject_unknown_query(query, {"plugin"})
+    reject_unknown_query(query, {"plugin", "uot"} | _TFO_QUERY)
     raw = qg(query, "plugin")
     name = ""
     opts = ""
@@ -85,26 +112,32 @@ def parse_ss(link):
     if name:
         out["plugin"] = plugin_alias(name)
         out["plugin_opts"] = opts
+    if _bool_value(qg(query, "tfo", "fastopen"), "TCP Fast Open option"):
+        out["tcp_fast_open"] = True
+    if _bool_value(qg(query, "uot"), "Shadowsocks uot option"):
+        out["udp_over_tcp"] = True
     return out, host, port
 
 
 def parse_hysteria2(link):
-    u = safe_urlsplit(link)
+    u, listed_ports = split_port_list(safe_urlsplit(link))
     host, port = host_port(u)
-    if port is None:
-        port = 443                       # hysteria2 default port
+    q = flat_query(u)
+    if listed_ports and qg(q, "mport", "ports"):
+        die("hysteria2 lists its hopping ports twice")
+    hop_ports = listed_ports or qg(q, "mport", "ports")
+    hop_ranges = _port_ranges(hop_ports) if hop_ports else []
+    if port is None:                     # hysteria2's default, or the first hopping port
+        port = int(hop_ranges[0].split(":")[0]) if listed_ports else 443
     host = valid_host(host)
     port = safe_port(port)
     auth = unquote(u.username or "")
     if u.password:                       # hysteria2://user:pass@ -> password is after ':'
         auth = auth + ":" + unquote(u.password) if auth else unquote(u.password)
-    q = flat_query(u)
-    reject_unknown_query(q, _TLS_QUERY | {"obfs", "obfs-password", "obfs_password",
-                                          "pinSHA256", "pinsha256", "mport", "ports"})
-    # Reject a multi-port / port-hopping form we don't implement, rather than
-    # silently connecting to a single port.
-    if qg(q, "mport", "ports"):
-        die("hysteria2 port-hopping (mport/ports) is not supported")
+    reject_unknown_query(q, _TLS_QUERY | _TFO_QUERY | {
+        "obfs", "obfs-password", "obfs_password", "pinSHA256", "pinsha256",
+        "mport", "ports", "hop-interval", "hop_interval", "upmbps", "downmbps"})
+    _bool_value(qg(q, "tfo", "fastopen"), "TCP Fast Open option")
     sni = qg(q, "sni", "peer") or host
     tls = _tls(sni, q, default_alpn=["h3"])
     # pinSHA256 is a hex *certificate* fingerprint; sing-box only offers a base64
@@ -114,8 +147,21 @@ def parse_hysteria2(link):
         die("hysteria2 'pinSHA256' certificate pinning is not supported")
     out = {"type": "hysteria2", "tag": "proxy", "server": host, "server_port": port,
            "password": auth, "tls": tls}
+    # Port hopping: the client moves between these server ports.
+    if hop_ranges:
+        out["server_ports"] = hop_ranges
+    hop = qg(q, "hop-interval", "hop_interval")
+    if hop:
+        if not hop_ports:
+            die("hysteria2 hop interval needs port hopping (mport)")
+        out["hop_interval"] = "%ds" % _whole_number(hop, "hysteria2 hop interval", 5, 3600, "s")
+    for name, field in (("upmbps", "up_mbps"), ("downmbps", "down_mbps")):
+        if qg(q, name):
+            out[field] = _whole_number(qg(q, name), "hysteria2 " + name, 1, 100000, "mbps")
     obfs_pw = qg(q, "obfs-password", "obfs_password")
     obfs_type = qg(q, "obfs")
+    if obfs_type.lower() == "none" and not obfs_pw:
+        obfs_type = ""
     if bool(obfs_type) != bool(obfs_pw):
         die("hysteria2 obfs requires both type and password")
     if obfs_type and obfs_pw:
@@ -137,13 +183,16 @@ def parse_tuic(link):
     host = valid_host(host)
     port = safe_port(port)
     q = flat_query(u)
-    reject_unknown_query(q, _TLS_QUERY | {
+    reject_unknown_query(q, _TLS_QUERY | _TFO_QUERY | {
         "congestion_control", "congestion", "udp_relay_mode", "udp_over_stream",
-        "zero_rtt_handshake", "reduce_rtt", "heartbeat", "network",
+        "zero_rtt_handshake", "reduce_rtt", "heartbeat", "network", "disable_sni",
     })
+    _bool_value(qg(q, "tfo", "fastopen"), "TCP Fast Open option")
     sni = qg(q, "sni", "peer") or host
     out = {"type": "tuic", "tag": "proxy", "server": host, "server_port": port,
            "uuid": uuid, "password": password, "tls": _tls(sni, q, default_alpn=["h3"])}
+    if _bool_value(qg(q, "disable_sni"), "tuic disable_sni"):
+        out["tls"]["disable_sni"] = True
     cc = qg(q, "congestion_control", "congestion")
     if cc:
         out["congestion_control"] = cc

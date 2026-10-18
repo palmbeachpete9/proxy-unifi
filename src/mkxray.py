@@ -37,7 +37,7 @@ _COMMON_QUERY = {
     "path", "serviceName", "mode", "authority", "extra", "fm", "seed",
     "mtu", "tti", "user_agent", "idle_timeout", "health_check_timeout",
     "permit_without_stream", "initial_windows_size",
-    "ed", "eh", "packetEncoding",
+    "ed", "eh", "packetEncoding", "tfo", "fastopen",
 }
 _LOCAL_FIELD = {"certificateFile", "keyFile", "masterKeyLog", "socketPath",
                 "unixSocket", "unixSocketPath"}
@@ -58,8 +58,8 @@ def _q_int(q, name, minimum=0, maximum=2147483647):
     return parsed
 
 
-def _q_bool(q, name):
-    value = qg(q, name)
+def _q_bool(q, *names):
+    value = qg(q, *names)
     if value == "":
         return None
     low = value.lower()
@@ -67,7 +67,7 @@ def _q_bool(q, name):
         return True
     if low in ("0", "false", "no"):
         return False
-    die("share-link option '%s' must be true/false or 1/0" % name)
+    die("share-link option '%s' must be true/false or 1/0" % names[0])
 
 
 def _validate_json_option(value, path, depth=0):
@@ -304,6 +304,8 @@ def build_stream(q, security, net, host):
     finalmask = _q_json(q, "fm")
     if finalmask is not None:
         stream["finalmask"] = finalmask
+    if _q_bool(q, "tfo", "fastopen"):
+        stream["sockopt"] = {"tcpFastOpen": True}
     return stream
 
 
@@ -374,7 +376,7 @@ def parse_trojan(link):
 
 def _ss_plugin_name(parsed):
     query = flat_query(parsed)
-    reject_unknown_query(query, {"plugin"})
+    reject_unknown_query(query, {"plugin", "uot", "tfo", "fastopen"})
     raw = qg(query, "plugin")
     if not raw:
         return None
@@ -400,13 +402,13 @@ def parse_ss(link):
     # SIP003-plugin Shadowsocks is handled by sing-box, never by xray.
     if _ss_plugin_name(parsed):
         die("shadowsocks SIP003 plugin links are handled by sing-box, not xray")
-    outbound = {
-        "tag": "proxy",
-        "protocol": "shadowsocks",
-        "settings": {
-            "servers": [{"address": host, "port": port, "method": method, "password": password}]
-        },
-    }
+    server = {"address": host, "port": port, "method": method, "password": password}
+    query = flat_query(parsed)
+    if _q_bool(query, "uot"):
+        server["uot"] = True
+    outbound = {"tag": "proxy", "protocol": "shadowsocks", "settings": {"servers": [server]}}
+    if _q_bool(query, "tfo", "fastopen"):
+        outbound["streamSettings"] = {"sockopt": {"tcpFastOpen": True}}
     return outbound, host, port
 
 
