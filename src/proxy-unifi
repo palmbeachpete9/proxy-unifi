@@ -1935,7 +1935,8 @@ cmd_geo_update() {
             || { rm -f "$BIN_DIR/$f.new"; _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "digest lookup failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "could not obtain digest for $f"; }
         verify_sha256 "$BIN_DIR/$f.new" "$_want" \
             || { rm -f "$BIN_DIR/$f.new"; _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "checksum failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "checksum failed for $f"; }
-        mv -f "$BIN_DIR/$f.new" "$BIN_DIR/$f"
+        # The core reads them as the service account; downloads are private (umask 077).
+        { chmod 644 "$BIN_DIR/$f.new" && mv -f "$BIN_DIR/$f.new" "$BIN_DIR/$f"; } || fatal "could not install $f"
     done
     if [ "$_geo_was_active" = 1 ] && ! restart_service; then
         _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "geo runtime check failed and rollback was incomplete"
