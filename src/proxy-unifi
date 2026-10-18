@@ -3178,13 +3178,12 @@ _require_outbound() {
 cmd_ping() {
     load_settings
     _require_outbound || return 1
-    _mode="${1:-$PING_MODE}"
-    case "$_mode" in
+    case "$PING_MODE" in
         get)  ping_proxy get ;;
         head) ping_proxy head ;;
         tcp)  ping_tcp ;;
         icmp) ping_icmp ;;
-        *) fatal "unknown ping protocol '$_mode' (get|head|tcp|icmp)" ;;
+        *) fatal "unknown ping protocol '$PING_MODE' (get|head|tcp|icmp)" ;;
     esac
 }
 
