@@ -660,6 +660,9 @@ PY
     info "sing-box kernel path: $(printf '%s\n' "$_tcp" | mbit) Mbit/s in this lab"
     check "sing-box: UDP through the kernel path" [ "$(client_udp "$ECHO")" = ok ]
     check "sing-box: UDP to a privileged port (DNS-like)" [ "$(client_udp "$LOW")" = ok ]
+    # What status says about UDP replies from ports the gateway holds applies to sing-box too.
+    check "sing-box: UDP reply on a port the host shares (SO_REUSEADDR)" [ "$(client_udp "$SHARED")" = ok ]
+    check "sing-box: UDP reply on a port the host holds is lost" [ "$(client_udp "$CLASH")" = timeout ]
     _lan="$(client_tcp "$LAN")"
     check "sing-box: LAN TCP on a Policy Table route" [ "${_lan%% *}" -gt 0 ] 2>/dev/null
     check "sing-box: LAN UDP on a Policy Table route" [ "$(client_udp "$ECHO" "$LAN")" = ok ]
