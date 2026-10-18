@@ -2723,7 +2723,8 @@ cmd_geo_update() {
             _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "could not fetch or verify $f, and the geo rollback was incomplete"
             GEO_BACKUP=""
             fatal "could not fetch or verify $f; the previous geo files are kept"; }
-        mv -f "$BIN_DIR/$f.new" "$BIN_DIR/$f"
+        # The core reads them as the service account; downloads are private (umask 077).
+        { chmod 644 "$BIN_DIR/$f.new" && mv -f "$BIN_DIR/$f.new" "$BIN_DIR/$f"; } || fatal "could not install $f"
         GEO_BACKUP="$_backup"   # on_exit restores the files and the service from here
     done
     [ "$_geo_was_active" = 0 ] || restart_service || fatal "geo update failed runtime health checks; rolling back"
