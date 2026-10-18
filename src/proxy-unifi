@@ -1808,7 +1808,8 @@ cmd_set() {
             { [ "$val" -ge 576 ] && [ "$val" -le 1500 ]; } || fatal "mtu out of range (576-1500)"
             WG_MTU="$val" ;;
         keepalive)
-            case "$val" in *[!0-9]*) fatal "keepalive must be a number";; esac
+            case "$val" in *[!0-9]*) fatal "keepalive must be a number 0-65535";; esac
+            { [ "${#val}" -le 5 ] && [ "${val:-0}" -le 65535 ]; } || fatal "keepalive must be a number 0-65535"
             WG_KEEPALIVE="${val:-0}" ;;
         dns)
             val="$(printf '%s' "$val" | tr -d ' ')"            # comma-separated, no spaces
@@ -2328,8 +2329,7 @@ cmd_menu() {
             19) ( locked_call cmd_geo_update ) ;;
             20) ( if [ -x "$XRAY" ]; then core_version "$XRAY"; else c_ylw "xray-core: not installed"; fi
                   if [ -x "$SBIN" ]; then core_version "$SBIN"; else c_ylw "sing-box: not installed"; fi
-                  if [ -x "$ABIN" ]; then core_version "$ABIN"; else c_ylw "AmneziaWG core: not installed"; fi
-                  echo "proxy-unifi CLI 1.0.0" ) ;;
+                  if [ -x "$ABIN" ]; then core_version "$ABIN"; else c_ylw "AmneziaWG core: not installed"; fi ) ;;
             21) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
                 if [ "${_c:-}" = "y" ]; then ( locked_call cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
             *)  c_red "Invalid selection." ;;

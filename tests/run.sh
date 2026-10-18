@@ -797,7 +797,9 @@ compat=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",k32))
 assert compat["recognized"] and compat["engine"]=="xray" and "compatibility" in compat["reason"], compat
 bad=mksub.node_from_link(sslink("2022-blake3-aes-256-gcm",k16))
 assert not bad["recognized"] and "32 bytes" in bad["reason"], bad
-unknown=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",k16,"?uot=1"))
+uot=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",k16,"?uot=1"))
+assert uot["recognized"], uot
+unknown=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",k16,"?foo=1"))
 assert not unknown["recognized"] and "query parameter" in unknown["reason"], unknown
 with tempfile.TemporaryDirectory() as directory:
     path=os.path.join(directory,"catalog.json")
