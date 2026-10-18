@@ -7,16 +7,19 @@
 # pair stands in for the tunnel and the rest of the path is the same. Uses its
 # own names, addresses and chains; never touches /data or systemd.
 #
-# Usage: ingress-lab.sh /path/to/xray. Prints "PASS name", "FAIL name" and
+# Usage: ingress-lab.sh /path/to/xray [/path/to/sing-box]. With sing-box, a
+# sing-box core then takes the same path. Prints "PASS name", "FAIL name" and
 # "INFO text" lines; exits 77 when this host cannot run it.
 set -eu
 
-if [ $# -ne 1 ] || [ ! -x "$1" ]; then echo "usage: ingress-lab.sh /path/to/xray" >&2; exit 2; fi
+if [ $# -lt 1 ] || [ $# -gt 2 ] || [ ! -x "$1" ] || { [ $# = 2 ] && [ ! -x "$2" ]; }; then
+    echo "usage: ingress-lab.sh /path/to/xray [/path/to/sing-box]" >&2; exit 2
+fi
 [ "$(id -u)" = 0 ] || { echo "INFO needs root"; exit 77; }
 for _tool in ip iptables ss curl python3; do
     command -v "$_tool" >/dev/null 2>&1 || { echo "INFO needs $_tool"; exit 77; }
 done
-XRAY_SRC="$1"
+XRAY_SRC="$1"; SB_SRC="${2:-}"
 REPO="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 NS=pu-lab; CLIENT=pu-lab-client; LAN=pu-lab-lan; OTHER=pu-lab-oth
 # LAN route mode stands in for a UniFi Policy Table route: LAN traffic marked
@@ -102,6 +105,7 @@ sed \
     -e "s|^INGRESS_LR_SRC=.*|INGRESS_LR_SRC=\"169.254.78.10\"|" \
     -e "s|^HOST_MOUNT_NS=.*|HOST_MOUNT_NS=\"/proc/$$/ns/mnt\"|" \
     -e "s|^FW_CHAIN=.*|FW_CHAIN=\"PU_LAB_WG\"|" \
+    -e "s|^SERVICE_GROUP=.*|SERVICE_GROUP=\"$(getent group 65534 | cut -d: -f1)\"|" \
     "$REPO/src/proxy-unifi" > "$T/cli"
 # Without kernel WireGuard, a veth pair into the client namespace is the tunnel.
 # LAB_FAIL makes the tunnel step fail, to exercise the fallback.
@@ -253,19 +257,18 @@ BULK="$(cat "$T/state/bulk")"; ECHO="$(cat "$T/state/echo")"
 CLASH="$(cat "$T/state/clash")"; SHARED="$(cat "$T/state/shared")"; FIXED="$(cat "$T/state/fixed")"; LOW="$(cat "$T/state/low")"
 SERVICE="$(cat "$T/state/service")"
 
-start_core() {  # <overlay>: the core runs unprivileged, with the unit's capabilities only
+run_core() {  # <command...>: the core runs unprivileged, with the unit's capabilities only
     if command -v setpriv >/dev/null 2>&1; then
         XRAY_LOCATION_ASSET="$T/root/bin" setpriv --reuid=65534 --regid=65534 --clear-groups \
             --inh-caps=-all,+net_raw,+net_bind_service --ambient-caps=-all,+net_raw,+net_bind_service \
-            --bounding-set=-all,+net_raw,+net_bind_service \
-            "$T/root/bin/xray" run -config "$T/root/etc/config.json" -config "$1" > "$T/core.log" 2>&1 &
+            --bounding-set=-all,+net_raw,+net_bind_service "$@" > "$T/core.log" 2>&1 &
     else
         info "setpriv missing: the core runs as root"
-        XRAY_LOCATION_ASSET="$T/root/bin" "$T/root/bin/xray" run \
-            -config "$T/root/etc/config.json" -config "$1" > "$T/core.log" 2>&1 &
+        XRAY_LOCATION_ASSET="$T/root/bin" "$@" > "$T/core.log" 2>&1 &
     fi
     echo $! > "$T/state/core.pid"; PIDS="$PIDS $!"
 }
+start_core() { run_core "$T/root/bin/xray" run -config "$T/root/etc/config.json" -config "$1"; }  # <overlay>
 stop_core() {
     kill "$(cat "$T/state/core.pid")" 2>/dev/null || true
     wait "$(cat "$T/state/core.pid")" 2>/dev/null || true
@@ -600,4 +603,90 @@ if [ "$MODE" = wireguard ]; then
     stop_core
 fi
 cli _ingress-down >/dev/null 2>&1
+
+# 6. A sing-box core on the same path: a tproxy inbound under its WireGuard
+# endpoint's tag, and that endpoint again when the kernel path is refused.
+client_link() {  # the UniFi side again, after a new _ingress-up
+    if [ "$MODE" = wireguard ]; then
+        # A fresh peer handshakes at once instead of after its session times out.
+        _server="$(cat "$T/root/etc/wg/wg_public.key")"
+        ip netns exec "$CLIENT" wg set "$CDEV" peer "$_server" remove
+        ip netns exec "$CLIENT" wg set "$CDEV" peer "$_server" endpoint "127.0.0.1:$WG_PORT" allowed-ips 0.0.0.0/0
+    elif ip -n "$CLIENT" link show "$CDEV" >/dev/null 2>&1; then
+        ip -n "$CLIENT" addr add 10.7.0.2/32 dev "$CDEV"
+        ip -n "$CLIENT" link set "$CDEV" mtu 1340 up
+        ip -n "$CLIENT" route add 10.7.0.1/32 dev "$CDEV"
+        ip -n "$CLIENT" route add default via 10.7.0.1 dev "$CDEV"
+    fi
+}
+if [ -n "$SB_SRC" ]; then
+    info "sing-box: $("$SB_SRC" version | head -n 1)"
+    cp "$SB_SRC" "$T/root/bin/sing-box"; chmod 755 "$T/root/bin/sing-box"
+    [ "$MODE" = wireguard ] || { ip netns del "$CLIENT"; ip netns add "$CLIENT"; ip -n "$CLIENT" link set lo up; }
+    printf 'singbox' > "$T/root/etc/engine"
+    # Like mksingbox's config; the proxy is a direct route to loopback.
+    python3 - "$T/root/etc/config.json" "$WG_PORT" "$(cat "$T/root/etc/wg/wg_private.key")" \
+        "$(cat "$T/root/etc/wg/unifi_public.key")" <<'PY'
+import json, sys
+path, port, secret, peer = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+json.dump({
+    "log": {"level": "info"},
+    "endpoints": [{"type": "wireguard", "tag": "wg-in", "system": False, "mtu": 1340,
+                   "address": ["10.7.0.1/32"], "private_key": secret, "listen_port": port,
+                   "peers": [{"public_key": peer, "allowed_ips": ["0.0.0.0/0", "::/0"]}]}],
+    "outbounds": [{"type": "direct", "tag": "proxy"}],
+    "route": {"rules": [{"inbound": ["wg-in"], "action": "route-options", "override_address": "127.0.0.1"},
+                        {"inbound": ["wg-in"], "outbound": "proxy"}], "final": "proxy"},
+}, open(path, "w"))
+PY
+    hook _ingress-up > "$T/up.log" 2>&1 && _up=0 || _up=$?
+    sed 's/^/INFO   /' "$T/up.log"
+    check "sing-box: ingress-up succeeds" sh -c "[ $_up = 0 ] && [ -f '$T/run/kernel-ingress' ]"
+    check "sing-box: its config swaps the WireGuard endpoint for a tproxy inbound" \
+        python3 - "$T/run/ingress.json" "$HOST_IP" "$PORT" <<'PY'
+import json, sys
+config = json.load(open(sys.argv[1]))
+assert not config["endpoints"]
+assert config["inbounds"] == [{"type": "tproxy", "tag": "wg-in", "listen": sys.argv[2],
+                               "listen_port": int(sys.argv[3])}], config["inbounds"]
+PY
+    check "sing-box: only the core's group reads its config (it holds the keys)" \
+        [ "$(stat -c '%a %g' "$T/run/ingress.json")" = "640 65534" ]
+    client_link
+    run_core "$T/root/bin/sing-box" run -c "$T/run/ingress.json"
+    check "sing-box: unprivileged core binds the transparent listener" wait_listen -ltn "$HOST_IP:$PORT"
+    _tcp="$(client_tcp)"
+    check "sing-box: TCP through the kernel path" [ "${_tcp%% *}" -gt 0 ] 2>/dev/null
+    info "sing-box kernel path: $(printf '%s\n' "$_tcp" | mbit) Mbit/s in this lab"
+    check "sing-box: UDP through the kernel path" [ "$(client_udp "$ECHO")" = ok ]
+    check "sing-box: UDP to a privileged port (DNS-like)" [ "$(client_udp "$LOW")" = ok ]
+    _lan="$(client_tcp "$LAN")"
+    check "sing-box: LAN TCP on a Policy Table route" [ "${_lan%% *}" -gt 0 ] 2>/dev/null
+    check "sing-box: LAN UDP on a Policy Table route" [ "$(client_udp "$ECHO" "$LAN")" = ok ]
+    if [ "$MODE" = wireguard ]; then
+        check "sing-box: UniFi-side handshake" \
+            sh -c "ip netns exec $NS wg show $WGDEV latest-handshakes | awk '{ exit !(\$2 > 0) }'"
+    fi
+    cli status > "$T/status.out" 2>&1 || true
+    check "sing-box: status reports the kernel path" grep -q '^ingress:   kernel WireGuard -> sing-box' "$T/status.out"
+    stop_core
+    cli _ingress-down >/dev/null 2>&1
+    [ "$MODE" = wireguard ] || { ip netns del "$CLIENT"; ip netns add "$CLIENT"; ip -n "$CLIENT" link set lo up; }
+
+    LAB_FAIL=1 cli _ingress-up > "$T/fallback.log" 2>&1 && _up=0 || _up=$?
+    check "sing-box: fallback runs the config as imported" \
+        sh -c "[ $_up = 0 ] && cmp -s '$T/root/etc/config.json' '$T/run/ingress.json' && [ ! -e '$T/run/kernel-ingress' ]"
+    check "sing-box: fallback keeps its port guard" iptables -C PU_LAB_WG -p udp --dport "$WG_PORT" ! -i lo -j DROP
+    if [ "$MODE" = wireguard ]; then
+        client_link
+        run_core "$T/root/bin/sing-box" run -c "$T/run/ingress.json"
+        check "sing-box: fallback core holds the WireGuard port" wait_listen -lun ":$WG_PORT"
+        check "sing-box: UDP through its own WireGuard" [ "$(client_udp "$ECHO")" = ok ]
+        _tcp="$(client_tcp)"
+        check "sing-box: TCP through its own WireGuard" [ "${_tcp%% *}" -gt 0 ] 2>/dev/null
+        info "sing-box userspace path: $(printf '%s\n' "$_tcp" | mbit) Mbit/s in this lab"
+        stop_core
+    fi
+    cli _ingress-down >/dev/null 2>&1
+fi
 [ "$FAILED" = 0 ] || { sed 's/^/INFO core: /' "$T/core.log" 2>/dev/null | tail -20; exit 1; }

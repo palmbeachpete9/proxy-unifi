@@ -84,7 +84,7 @@ XRAY_MIN_SAFE_TAG="v26.7.11"
 CORE_GOMEMLIMIT="384MiB"
 # Kernel WireGuard ingress (see "Kernel WireGuard ingress" below).
 INGRESS_RUN="/run/proxy-unifi"                  # root-owned tmpfs state, gone after a reboot
-INGRESS_OVERLAY="$INGRESS_RUN/ingress.json"     # Xray inbound overlay for the running core
+INGRESS_OVERLAY="$INGRESS_RUN/ingress.json"     # Xray: inbound overlay; sing-box: its whole config
 INGRESS_ACTIVE="$INGRESS_RUN/kernel-ingress"    # present while the kernel path is up
 INGRESS_ERROR="$INGRESS_RUN/kernel-ingress.error"
 FB_STATE="$INGRESS_RUN/fallback.state"         # the watchdog's counters, in RAM
@@ -95,7 +95,7 @@ INGRESS_VETH="pu-veth0"                         # root-namespace end of the veth
 INGRESS_VETH_NS="pu-veth1"
 INGRESS_HOST_IP="169.254.77.1"
 INGRESS_NS_IP="169.254.77.2"
-INGRESS_PORT="41820"                            # Xray's transparent listener on INGRESS_HOST_IP
+INGRESS_PORT="41820"                            # the core's transparent listener on INGRESS_HOST_IP
 INGRESS_TABLE="7707"
 INGRESS_PREF="10"
 INGRESS_TP_CHAIN="PROXY_UNIFI_TP"
@@ -105,7 +105,7 @@ INGRESS_LR="pu-lr0"                             # LAN route veth, root end (LAN_
 INGRESS_LR_NS="pu-lr1"
 INGRESS_LR_HOST_IP="169.254.77.5"
 INGRESS_LR_NS_IP="169.254.77.6"
-INGRESS_LR_SRC="169.254.77.10"                  # LAN route traffic's source towards Xray
+INGRESS_LR_SRC="169.254.77.10"                  # LAN route traffic's source towards the core
 INGRESS_MTU="1500"                              # the veth pairs; the tunnel's MTU is set per route
 INGRESS_RT_METRIC="1"                           # wins over UniFi's own route in its client table
 HOST_MOUNT_NS="/proc/1/ns/mnt"                  # the mount namespace named netns live in
@@ -1289,7 +1289,8 @@ write_service() {
     # an Xray core in kernel mode instead builds that path before it starts,
     # loads the resulting overlay last, and may bind transparent sockets. Those
     # include UDP reply sockets on the remote port (DNS 53, QUIC 443), which
-    # need CAP_NET_BIND_SERVICE below 1024.
+    # need CAP_NET_BIND_SERVICE below 1024. sing-box in kernel mode does the
+    # same, from the config copy the hook writes (see ingress_overlay).
     _fwpre="ExecStartPre=-+$BIN_DIR/proxy-unifi _ingress-down"; _fwpost=""
     _overlay=""; _caps=""
     if ingress_wanted; then
@@ -1305,9 +1306,12 @@ ExecStartPre=+$BIN_DIR/proxy-unifi _fw-lock"
             _fwpost="ExecStopPost=-+$BIN_DIR/proxy-unifi _fw-unlock" ;;
         singbox)
             _exec="$SBIN run -c $CONFIG"; _cond="$CONFIG"
+            [ -z "$_overlay" ] || _exec="$SBIN run -c $INGRESS_OVERLAY"
             _fwpre="$_fwpre
 ExecStartPre=+$BIN_DIR/proxy-unifi _fw-lock"
-            _fwpost="ExecStopPost=-+$BIN_DIR/proxy-unifi _fw-unlock" ;;
+            [ -z "$_fwpost" ] || _fwpost="$_fwpost
+"
+            _fwpost="${_fwpost}ExecStopPost=-+$BIN_DIR/proxy-unifi _fw-unlock" ;;
         xraypool)
             _cond="$POOL_DIR/99-overlay.json"
             # -confdir loads after every -config, so name the parts in order.
@@ -1471,7 +1475,7 @@ fw_reconcile() {
 }
 
 # --------------------------------------------------------------------------
-# Kernel WireGuard ingress (INGRESS=kernel, Xray engines)
+# Kernel WireGuard ingress (INGRESS=kernel, Xray and sing-box engines)
 # --------------------------------------------------------------------------
 # Xray's WireGuard inbound decrypts in userspace through gVisor, one packet per
 # system call. On a UCG-Ultra that cost ~400 us of CPU per downloaded packet and
@@ -1488,7 +1492,8 @@ fw_reconcile() {
 # from the veth is routed locally and TPROXY hands it to Xray's dokodemo-door
 # inbound, which takes over the WireGuard inbound's tag, so routing rules and
 # the UniFi-side configuration stay the same. Any failed step falls back to
-# Xray's own WireGuard inbound for that start.
+# Xray's own WireGuard inbound for that start. A sing-box core gets the same
+# path through its tproxy inbound in place of its WireGuard endpoint.
 
 _ingress_ipv4() {   # <address[/32]>: print the bare IPv4 address, or fail
     _ia="${1%/32}"
@@ -1504,16 +1509,16 @@ _ingress_ipv4() {   # <address[/32]>: print the bare IPv4 address, or fail
 
 ingress_supported() { have ip && have wg && have iptables; }
 
-# Whether the settings and the gateway allow the kernel path for an Xray core,
-# and whether the current core uses it (it still falls back to Xray's WireGuard
-# if the gateway refuses any step when the core starts).
+# Whether the settings and the gateway allow the kernel path, and whether the
+# current core uses it (it still falls back to the core's own WireGuard if the
+# gateway refuses any step when the core starts).
 ingress_configured() {
     [ "$INGRESS" = kernel ] && [ "$WG_LISTEN" = 127.0.0.1 ] || return 1
     _ingress_ipv4 "$XRAY_ADDR" >/dev/null && _ingress_ipv4 "$UNIFI_ADDR" >/dev/null || return 1
     ingress_supported
 }
 ingress_wanted() {
-    case "$(current_engine)" in xray|xraypool) ingress_configured ;; *) return 1 ;; esac
+    case "$(current_engine)" in xray|xraypool|singbox) ingress_configured ;; *) return 1 ;; esac
 }
 
 ingress_active() { [ -f "$INGRESS_ACTIVE" ]; }
@@ -1532,8 +1537,8 @@ _mount_ns_state() {
 
 # A core that keeps failing on the kernel path must not keep the tunnel down:
 # after three failures in a row that were never seen healthy (or one failed
-# health check after a restart, see restart_service), ingress_up uses Xray's
-# own WireGuard until a reboot, a start by hand, or a new configuration.
+# health check after a restart, see restart_service), ingress_up uses the
+# core's own WireGuard until a reboot, a start by hand, or a new configuration.
 _ingress_count_failure() {
     _cf="$(cat "$INGRESS_FAILS" 2>/dev/null)" || _cf=0
     _uint "$_cf" || _cf=0
@@ -1613,19 +1618,48 @@ print()
 PYEOF
 }
 
-# validate_ingress_overlay <config.json>...: before a profile is installed,
-# check that Xray loads its kernel-mode overlay (only when kernel mode is
-# configured; the configs in the order Xray loads them). A profile that cannot
-# use the kernel path still works on Xray's WireGuard, which the service falls
-# back to, so this warns instead of refusing an import or a subscription refresh.
+# ingress_singbox_for <config.json>: print the sing-box config for the kernel
+# path. sing-box merges extra configs by appending, so no overlay can drop the
+# WireGuard endpoint: this is the whole config with a tproxy inbound under the
+# endpoint's tag instead. Its only outbound is the proxy, so no direct route
+# needs the private-target guard Xray's overlay adds.
+ingress_singbox_for() {
+    py - "$INGRESS_HOST_IP" "$INGRESS_PORT" "$1" <<'PYEOF'
+import json, sys
+with open(sys.argv[3], encoding="utf-8") as source:
+    config = json.load(source)
+endpoints = config.get("endpoints") or []
+wireguard = [e for e in endpoints if isinstance(e, dict) and e.get("type") == "wireguard" and e.get("tag")]
+if len(wireguard) != 1 or not isinstance(config.get("inbounds") or [], list):
+    sys.exit("expected one tagged WireGuard endpoint")
+config["endpoints"] = [e for e in endpoints if e is not wireguard[0]]
+config["inbounds"] = (config.get("inbounds") or []) + [{
+    "type": "tproxy", "tag": wireguard[0]["tag"],
+    "listen": sys.argv[1], "listen_port": int(sys.argv[2])}]
+json.dump(config, sys.stdout, indent=2)
+print()
+PYEOF
+}
+
+# validate_ingress_overlay xray|singbox <config.json>...: before a profile is
+# installed, check that the core loads its kernel-mode config (only when kernel
+# mode is configured; Xray's configs in the order it loads them). A profile that
+# cannot use the kernel path still works on the core's own WireGuard, which the
+# service falls back to, so this warns instead of refusing an import or a
+# subscription refresh.
 validate_ingress_overlay() {
     ingress_configured || return 0
+    _vo_core="$1"; shift
     _vo="$(mktemp "$ETC_DIR/.ingress.XXXXXX")" || fatal "could not create temp file"
     _vo_why=""
-    if ! _vo_err="$(ingress_overlay_for "$@" 2>&1 >"$_vo")"; then
+    if [ "$_vo_core" = singbox ]; then _vo_gen=ingress_singbox_for; else _vo_gen=ingress_overlay_for; fi
+    if ! _vo_err="$("$_vo_gen" "$@" 2>&1 >"$_vo")"; then
         _vo_why="${_vo_err:-no overlay}"
     elif ! { chown root:"$SERVICE_GROUP" "$_vo" && chmod 640 "$_vo"; }; then
         _vo_why="could not check the overlay"
+    elif [ "$_vo_core" = singbox ]; then
+        validate_as_service "$SBIN" check -c "$_vo" >/dev/null 2>&1 \
+            || _vo_why="sing-box rejected the kernel-mode config"
     else
         for _vo_cfg in "$@"; do set -- "$@" -config "$_vo_cfg"; shift; done
         validate_as_service "$XRAY" run -test -format json "$@" -config "$_vo" >/dev/null 2>&1 \
@@ -1634,13 +1668,25 @@ validate_ingress_overlay() {
     rm -f "$_vo"
     [ -n "$_vo_why" ] || return 0
     c_ylw "warning: this profile cannot use kernel WireGuard ingress ($_vo_why);"
-    c_ylw "the service runs it on Xray's WireGuard instead."
+    c_ylw "the service runs it on the core's own WireGuard instead."
 }
 
 # ingress_overlay kernel|userspace: write the overlay the core loads last. The
-# userspace overlay is empty, which keeps the WireGuard inbound.
+# userspace overlay is empty, which keeps the WireGuard inbound. sing-box runs
+# its whole config from there instead: as imported, or for the kernel path. It
+# holds the keys, so like the imported config only the core's group reads it.
 ingress_overlay() {
     mkdir -p "$INGRESS_RUN" && chmod 755 "$INGRESS_RUN" || return 1
+    if [ "$(current_engine)" = singbox ]; then
+        if [ "$1" = kernel ]; then
+            _io_json="$(ingress_singbox_for "$CONFIG" 2>&1)" || { _ingress_failed="$_io_json"; return 1; }
+        else
+            _io_json="$(cat "$CONFIG")" || return 1
+        fi
+        printf '%s\n' "$_io_json" | atomic_write "$INGRESS_OVERLAY" 640 \
+            && chown root:"$SERVICE_GROUP" "$INGRESS_OVERLAY"
+        return
+    fi
     if [ "$1" = kernel ]; then
         if [ "$(current_engine)" = xraypool ]; then
             _io_json="$(ingress_overlay_for "$POOL_DIR/01-provider.json" "$POOL_DIR/99-overlay.json" 2>&1)"
@@ -1951,8 +1997,8 @@ ingress_down() {
     return 0
 }
 
-# ExecStartPre of an Xray core: bring the kernel path up, or fall back to Xray's
-# WireGuard inbound. Fails only if no overlay can be written at all.
+# ExecStartPre of a kernel-capable core: bring the kernel path up, or fall back
+# to the core's own WireGuard. Fails only if no overlay can be written at all.
 ingress_up() {
     ingress_down
     rm -f "$INGRESS_ERROR"
@@ -1966,13 +2012,13 @@ ingress_up() {
     if _uint "$_iu_fails" && [ "$_iu_fails" -ge 3 ]; then
         _ingress_failed="the core did not come up on the kernel path ('proxy restart' tries again)"
     elif _ingress_setup && ingress_overlay kernel && : > "$INGRESS_ACTIVE"; then
-        echo "proxy-unifi: kernel WireGuard ingress up ($INGRESS_WG in netns $INGRESS_NS -> Xray $INGRESS_HOST_IP:$INGRESS_PORT)"
+        echo "proxy-unifi: kernel WireGuard ingress up ($INGRESS_WG in netns $INGRESS_NS -> $(engine_label) $INGRESS_HOST_IP:$INGRESS_PORT)"
         _iu_ports="$(ingress_udp_conflicts)" || _iu_ports=""
         [ -z "$_iu_ports" ] || echo "proxy-unifi: replies from remote UDP ports the gateway itself listens on cannot reach tunnel clients: $_iu_ports"
         return 0
     fi
     _ingress_failed="${_ingress_failed:-setup failed}"
-    echo "proxy-unifi: kernel WireGuard ingress unavailable, using Xray's WireGuard: $_ingress_failed" >&2
+    echo "proxy-unifi: kernel WireGuard ingress unavailable, using $(engine_label)'s own WireGuard: $_ingress_failed" >&2
     ingress_down
     fw_unlock
     printf '%s\n' "$_ingress_failed" | atomic_write "$INGRESS_ERROR" 644 || true
@@ -2136,6 +2182,7 @@ _build_config_file() {
             chown root:"$SERVICE_GROUP" "$tmpcfg"; chmod 640 "$tmpcfg"
             validate_as_service "$SBIN" check -c "$tmpcfg" >/dev/null 2>&1 \
                 || fatal "sing-box rejected the generated config"
+            validate_ingress_overlay singbox "$tmpcfg"
         fi
     else
         set --
@@ -2153,7 +2200,7 @@ _build_config_file() {
             chown root:"$SERVICE_GROUP" "$tmpcfg"; chmod 640 "$tmpcfg"
             validate_as_service "$XRAY" run -test -config "$tmpcfg" -format json >/dev/null 2>&1 \
                 || fatal "xray rejected the generated config (-test failed)"
-            validate_ingress_overlay "$tmpcfg"
+            validate_ingress_overlay xray "$tmpcfg"
         fi
     fi
     [ -s "$tmpcfg" ] || fatal "generated config is empty"
@@ -2245,7 +2292,7 @@ _build_pool() {
     chown root:"$SERVICE_GROUP" "$_stage"/*.json; chmod 640 "$_stage"/*.json
     validate_as_service "$XRAY" run -test -confdir "$_stage" >/dev/null 2>&1 \
         || fatal "xray rejected the pool profile (-test failed)"
-    validate_ingress_overlay "$_stage/01-provider.json" "$_stage/99-overlay.json"
+    validate_ingress_overlay xray "$_stage/01-provider.json" "$_stage/99-overlay.json"
     ensure_run_dir
     _old_pool="$RUN_DIR/pool.old"
     rm -rf "$_old_pool"
@@ -2405,17 +2452,17 @@ cmd_status() {
     else
         echo "wg listen: $(wg_endpoint)  mtu=${WG_MTU}"
     fi
-    if [ "$_eng" = "xray" ] || [ "$_eng" = "xraypool" ]; then
+    if [ "$_eng" != awg ]; then
         if ingress_active; then
             _st_hs="$(ingress_handshake_age)" || _st_hs=""
-            echo "ingress:   kernel WireGuard -> Xray transparent proxy${_st_hs:+ (last handshake $_st_hs)}"
+            echo "ingress:   kernel WireGuard -> $(engine_label) transparent proxy${_st_hs:+ (last handshake $_st_hs)}"
             echo "lan route: $(ingress_rt_status)"
             if [ "$(id -u)" = 0 ]; then
                 _st_udp="$(ingress_udp_conflicts)" || _st_udp=""
                 [ -z "$_st_udp" ] || echo "udp note:  replies from remote ports $_st_udp cannot reach tunnel clients"
             fi
         elif [ "$INGRESS" = userspace ]; then
-            echo "ingress:   userspace (Xray WireGuard, as configured)"
+            echo "ingress:   userspace ($(engine_label)'s own WireGuard, as configured)"
         elif [ "$act" = active ] && [ -s "$INGRESS_ERROR" ]; then
             c_ylw "ingress:   userspace; kernel setup failed: $(cat "$INGRESS_ERROR")"
         elif ! ingress_wanted; then
@@ -2427,7 +2474,7 @@ cmd_status() {
         fi
         ingress_active || [ "$LAN_ROUTE" = off ] || echo "lan route: on, inactive until kernel WireGuard ingress runs"
     else
-        echo "ingress:   userspace ($(engine_label)'s own WireGuard; kernel ingress and LAN route need an Xray-based node)"
+        echo "ingress:   userspace (AmneziaWG has its own WireGuard; kernel ingress and LAN route need an Xray or sing-box node)"
     fi
     if have ss; then
         if socket_listening "$WG_PORT"; then c_grn "udp/${WG_PORT}: listening"; else c_ylw "udp/${WG_PORT}: not listening"; fi
@@ -2518,7 +2565,7 @@ restart_service() {
     { ingress_wanted && [ -d "$INGRESS_RUN" ]; } || { err "health check: $(health_why)"; return 1; }
     echo 3 > "$INGRESS_FAILS" 2>/dev/null || return 1
     if _restart_healthy; then
-        c_ylw "Kernel WireGuard ingress did not come up; Xray's WireGuard serves the tunnel ('proxy status')."
+        c_ylw "Kernel WireGuard ingress did not come up; $(engine_label)'s own WireGuard serves the tunnel ('proxy status')."
         return 0
     fi
     ingress_retry   # it was not the kernel path: a restored configuration tries it again
@@ -2636,9 +2683,9 @@ PYEOF
         if [ "$key" = ingress ] && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
             if ingress_active; then c_grn "Kernel WireGuard ingress is active."
             elif [ -s "$INGRESS_ERROR" ]; then
-                c_ylw "Kernel setup failed ($(cat "$INGRESS_ERROR")); Xray's WireGuard is serving the tunnel."
+                c_ylw "Kernel setup failed ($(cat "$INGRESS_ERROR")); $(engine_label)'s own WireGuard is serving the tunnel."
             elif [ "$val" = kernel ]; then
-                c_ylw "Kernel WireGuard is not in use: it needs an Xray link or profile, the ip, wg and"
+                c_ylw "Kernel WireGuard is not in use: it needs an Xray or sing-box node, the ip, wg and"
                 c_ylw "iptables tools, WireGuard listening on 127.0.0.1, and IPv4 tunnel addresses."
             fi
         fi
@@ -3229,8 +3276,8 @@ EOF
         else
             echo "Line 3 is well below line 2: the gateway's WireGuard-to-proxy hop is the limit."
             case "$(current_engine)" in
-                xray|xraypool) ingress_active || c_ylw "Kernel WireGuard ingress is not active ('proxy status' says why)." ;;
-                *) c_ylw "Kernel WireGuard ingress needs an Xray-based node; this one runs $(engine_label)'s own WireGuard." ;;
+                awg) c_ylw "Kernel WireGuard ingress needs an Xray or sing-box node; AmneziaWG runs its own WireGuard." ;;
+                *) ingress_active || c_ylw "Kernel WireGuard ingress is not active ('proxy status' says why)." ;;
             esac
         fi
         echo "(Line 3 also decrypts the test downloads on the gateway; LAN devices may get a bit more.)"
@@ -3437,10 +3484,7 @@ menu_wg_settings() {
     echo "  3. DNS resolvers   (current: $INNER_DNS)"
     echo "  4. Ingress         (current: $INGRESS)"
     echo "  5. LAN route       (current: $LAN_ROUTE)"
-    case "$(current_engine)" in
-        xray|xraypool) : ;;
-        *) echo "     (4 and 5 take effect with Xray-based nodes; the active node runs $(engine_label).)" ;;
-    esac
+    [ "$(current_engine)" != awg ] || echo "     (4 and 5 take effect with Xray and sing-box nodes, not AmneziaWG.)"
     printf 'Please select a setting for modification [1-5]: '
     read -r _w || true
     echo
@@ -3451,11 +3495,11 @@ menu_wg_settings() {
            if [ -n "${_v:-}" ]; then locked_call cmd_set mtu "$_v"; else c_ylw "Unchanged."; fi ;;
         3) printf 'Tunnel DNS (comma-separated, empty to reset to 8.8.8.8) [%s]: ' "$INNER_DNS"; read -r _v || true
            locked_call cmd_set dns "${_v:-}" ;;
-        4) echo "kernel:    the gateway's kernel WireGuard hands connections to Xray (fast)."
-           echo "userspace: Xray's own WireGuard (slower; the fallback if kernel setup fails)."
+        4) echo "kernel:    the gateway's kernel WireGuard hands connections to the core (fast)."
+           echo "userspace: the core's own WireGuard (slower; the fallback if kernel setup fails)."
            printf 'WireGuard ingress, kernel or userspace [%s]: ' "$INGRESS"; read -r _v || true
            if [ -n "${_v:-}" ]; then locked_call cmd_set ingress "$_v"; else c_ylw "Unchanged."; fi ;;
-        5) echo "on:  Policy Table traffic to the VPN client is routed to Xray without WireGuard"
+        5) echo "on:  Policy Table traffic to the VPN client is routed to the core without WireGuard"
            echo "     (kernel ingress only; UniFi's firewall sees pu-lr0 as its egress interface)."
            echo "off: that traffic is encrypted into the WireGuard tunnel as before."
            printf 'LAN route, on or off [%s]: ' "$LAN_ROUTE"; read -r _v || true

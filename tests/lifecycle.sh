@@ -260,7 +260,7 @@ grep -q '^INGRESS="userspace"$' "$T/root/etc/settings.env"
 grep -q '^ExecStart=.*/xray run -config [^ ]*/config.json$' "$T/proxy-unifi.service"
 grep -q '^ExecStartPre=-+.*/proxy-unifi _ingress-down$' "$T/proxy-unifi.service"
 grep -q '^AmbientCapabilities=$' "$T/proxy-unifi.service"
-run_cli status | grep -q '^ingress:   userspace (Xray WireGuard, as configured)$'
+run_cli status | grep -q "^ingress:   userspace (Xray's own WireGuard, as configured)$"
 printf '9\n4\nfast\n\n0\n' | menu_input > "$T/ingress.out" 2>&1
 grep -q 'ingress must be kernel|userspace' "$T/ingress.out"
 grep -q '^INGRESS="userspace"$' "$T/root/etc/settings.env"
@@ -295,7 +295,10 @@ PY
 )"
 printf '1\n%s\n\n0\n' "$SS2022_LINK" | menu_input >/dev/null
 [ "$(cat "$T/root/etc/engine")" = singbox ]
-grep -q '^ExecStart=.*/sing-box run -c .*/config.json$' "$T/proxy-unifi.service"
+# Kernel ingress: sing-box runs the config its hook writes, behind its port guard.
+grep -q "^ExecStart=.*/sing-box run -c $T/run/ingress.json\$" "$T/proxy-unifi.service"
+[ "$(grep '^ExecStartPre=' "$T/proxy-unifi.service" | sed 's|=.*/proxy-unifi |=|')" = "ExecStartPre=_ingress-up
+ExecStartPre=_fw-lock" ]
 python3 - "$T/root/etc/config.json" <<'PY'
 import json,sys
 cfg=json.load(open(sys.argv[1],encoding="utf-8"))

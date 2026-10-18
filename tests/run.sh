@@ -629,6 +629,15 @@ SH
     grep -q '^NoNewPrivileges=true$' "$_ud/unit" || _ki_ok=0
     KERNEL=1 ENG=xraypool WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
     grep -q '^ExecStart=/b/xray run -config /c/pool/01-provider.json -config /c/pool/99-overlay.json -config /run/x/ingress.json$' "$_ud/unit" || _ki_ok=0
+    # sing-box runs the config the hook writes, behind its port guard as before.
+    KERNEL=1 ENG=singbox WORK="$_ud" sh "$_ud/h.sh" 2>/dev/null
+    [ "$(grep '^ExecStartPre=' "$_ud/unit")" = 'ExecStartPre=+/b/proxy-unifi _ingress-up
+ExecStartPre=+/b/proxy-unifi _fw-lock' ] || _ki_ok=0
+    [ "$(grep '^ExecStopPost=' "$_ud/unit")" = 'ExecStopPost=-+/b/proxy-unifi _ingress-down
+ExecStopPost=-+/b/proxy-unifi _fw-unlock' ] || _ki_ok=0
+    grep -q '^ExecStart=/b/sing-box run -c /run/x/ingress.json$' "$_ud/unit" || _ki_ok=0
+    grep -q '^ConditionPathExists=/c/config.json$' "$_ud/unit" || _ki_ok=0
+    grep -q '^AmbientCapabilities=CAP_NET_RAW CAP_NET_BIND_SERVICE$' "$_ud/unit" || _ki_ok=0
     [ "$_ki_ok" = 1 ] && ok "kernel WireGuard ingress wired into the unit" \
         || bad "kernel WireGuard ingress wired into the unit"
     # The core's parallelism comes from GOMAXPROCS (no quota, default weight in
@@ -727,7 +736,7 @@ SH
     fi
     rm -rf "$_fd"
 
-    # Kernel ingress only for Xray cores on loopback with single IPv4 tunnel
+    # Kernel ingress only for Xray and sing-box cores on loopback with single IPv4 tunnel
     # addresses and the tools present.
     _kd="$(mktemp -d)"
     {
@@ -743,8 +752,8 @@ for bad in "" 10.7.0.1/24 10.7.0 10.7.0.1.5 10.7.0.256 fd00::1 10.7.0.1,10.7.0.2
     if _ingress_ipv4 "$bad" >/dev/null; then echo "accepted '$bad'"; exit 1; fi
 done
 INGRESS=kernel; WG_LISTEN=127.0.0.1; XRAY_ADDR=10.7.0.1/32; UNIFI_ADDR=10.7.0.2/32
-for ENG in xray xraypool; do ingress_wanted || exit 1; done
-for ENG in singbox awg; do if ingress_wanted; then exit 1; fi; done
+for ENG in xray xraypool singbox; do ingress_wanted || exit 1; done
+ENG=awg; if ingress_wanted; then exit 1; fi
 ENG=xray
 if INGRESS=userspace ingress_wanted; then exit 1; fi
 if WG_LISTEN=0.0.0.0 ingress_wanted; then exit 1; fi
@@ -837,24 +846,28 @@ SH
     rm -f "$_kd/active"
 
     # A profile the kernel path cannot take is still imported (with a warning);
-    # the service then runs it on Xray's WireGuard.
+    # the service then runs it on the core's own WireGuard.
     {
         cat <<'SH'
-ETC_DIR="$WORK"; SERVICE_GROUP="$(id -gn)"; XRAY=/x
+ETC_DIR="$WORK"; SERVICE_GROUP="$(id -gn)"; XRAY=/x; SBIN=/s
 chown() { :; }   # the CLI hands the overlay to root; CI does not run as root
 ingress_configured() { return 0; }
 ingress_overlay_for() { [ "${OVERLAY:-1}" = 1 ] || { echo "no tagged inbound" >&2; return 1; }; echo '{}'; }
-validate_as_service() { [ "${LOADS:-1}" = 1 ]; }
+ingress_singbox_for() { echo '{}'; }
+validate_as_service() { [ "${LOADS:-1}" = 1 ] && [ "$1" = "${CORE:-/x}" ]; }
 fatal() { echo "fatal $*"; exit 9; }
 c_ylw() { echo "$*"; }
 SH
         fn_src validate_ingress_overlay
         cat <<'SH'
-[ -z "$(validate_ingress_overlay a.json b.json)" ] || exit 1
-_out="$(OVERLAY=0 validate_ingress_overlay a.json)" || exit 1
-case "$_out" in *"(no tagged inbound)"*"Xray's WireGuard"*) : ;; *) exit 1 ;; esac
-_out="$(LOADS=0 validate_ingress_overlay a.json)" || exit 1
+[ -z "$(validate_ingress_overlay xray a.json b.json)" ] || exit 1
+_out="$(OVERLAY=0 validate_ingress_overlay xray a.json)" || exit 1
+case "$_out" in *"(no tagged inbound)"*"core's own WireGuard"*) : ;; *) exit 1 ;; esac
+_out="$(LOADS=0 validate_ingress_overlay xray a.json)" || exit 1
 case "$_out" in *"(xray rejected the kernel-mode overlay)"*) : ;; *) exit 1 ;; esac
+[ -z "$(CORE=/s validate_ingress_overlay singbox a.json)" ] || exit 1
+_out="$(CORE=/s LOADS=0 validate_ingress_overlay singbox a.json)" || exit 1
+case "$_out" in *"(sing-box rejected the kernel-mode config)"*) : ;; *) exit 1 ;; esac
 for _left in "$WORK"/.ingress.*; do [ ! -e "$_left" ] || exit 1; done   # no temp overlay left
 SH
     } > "$_kd/validate.sh"
@@ -862,7 +875,7 @@ SH
     else bad "an unsuitable profile is imported with a warning"; fi
 
     # A core that fails its health check on the kernel path is restarted once on
-    # Xray's WireGuard; if that fails too, the next start tries the kernel again.
+    # the core's own WireGuard; if that fails too, the next start tries the kernel again.
     {
         cat <<'SH'
 CONFIG="$WORK/config.json"; POOL_DIR="$WORK/pool"; SERVICE_NAME=proxy-unifi
@@ -2664,6 +2677,27 @@ assert not any(guarded(o) for o in empty["outbounds"]), empty["outbounds"]
 PY
     then ok "xray loads the kernel ingress overlay (link and pool)"
     else bad "xray loads the kernel ingress overlay (link and pool)"; fi
+    # sing-box: the kernel-mode config swaps the WireGuard endpoint for a tproxy
+    # inbound under its tag, and sing-box accepts it.
+    {
+        echo 'py() { python3 "$@"; }'
+        echo 'INGRESS_HOST_IP=169.254.77.1; INGRESS_PORT=41820'
+        fn_src ingress_singbox_for
+    } > "$_d/sb-kernel.sh"
+    # shellcheck disable=SC2016 # $1-$3 expand inside the child shell.
+    if gs "hysteria2://pw@h:443?sni=h" \
+       && sh -c '. "$1"; ingress_singbox_for "$2" > "$3"' sh "$_d/sb-kernel.sh" "$_d/s.json" "$_d/sb-kernel.json" \
+       && "$SG" check -c "$_d/sb-kernel.json" >/dev/null 2>&1 \
+       && python3 - "$_d/s.json" "$_d/sb-kernel.json" <<'PY'
+import json, sys
+before, after = (json.load(open(p)) for p in sys.argv[1:])
+assert not after["endpoints"], after["endpoints"]
+assert after["inbounds"] == [{"type": "tproxy", "tag": "wg-in", "listen": "169.254.77.1",
+                              "listen_port": 41820}], after["inbounds"]
+assert (after["route"], after["outbounds"]) == (before["route"], before["outbounds"])
+PY
+    then ok "sing-box loads its kernel ingress config"
+    else bad "sing-box loads its kernel ingress config"; fi
     # proxy ping's pool core answers before the balancer's first health check
     # finishes: until then leastLoad sends everything to the fallback, here a
     # blackhole. The health check's target answers only after the ping.
@@ -2836,9 +2870,9 @@ echo "$_rc $_code"' sh "$_pd/lib.sh" "$_pd/node.json" 2>&1)"
     if [ "${PROXY_UNIFI_QUICK:-}" = 1 ]; then
         _lab="INFO deferred: PROXY_UNIFI_QUICK=1"; _lab_rc=77
     elif [ "$(id -u)" = 0 ]; then
-        _lab="$(sh "$ROOT/tests/ingress-lab.sh" "$XR" 2>&1)"; _lab_rc=$?
+        _lab="$(sh "$ROOT/tests/ingress-lab.sh" "$XR" "$SG" 2>&1)"; _lab_rc=$?
     elif [ "${PROXY_UNIFI_LAB:-}" = 1 ] && sudo -n true 2>/dev/null; then
-        _lab="$(sudo -n sh "$ROOT/tests/ingress-lab.sh" "$XR" 2>&1)"; _lab_rc=$?
+        _lab="$(sudo -n sh "$ROOT/tests/ingress-lab.sh" "$XR" "$SG" 2>&1)"; _lab_rc=$?
     else
         _lab="INFO needs root (or PROXY_UNIFI_LAB=1 with sudo)"; _lab_rc=77
     fi

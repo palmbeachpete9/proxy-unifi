@@ -65,10 +65,10 @@ everything through the selected proxy or AWG outbound. Proxy-link modes need no
 remote WireGuard server; AWG mode connects to the remote AmneziaWG peer in the
 selected profile.
 
-## Kernel WireGuard ingress (Xray)
+## Kernel WireGuard ingress (Xray and sing-box)
 
-For xray-core links and JSON profiles, the gateway's kernel terminates the UniFi
-VPN Client's WireGuard by default; Xray no longer does it. Xray's own WireGuard
+For xray-core and sing-box links and JSON profiles, the gateway's kernel
+terminates the UniFi VPN Client's WireGuard by default; the core no longer does it. Xray's own WireGuard
 decrypts in userspace, one packet at a time: on a UCG-Ultra that held the tunnel
 near 35 Mbit/s while the proxy outbound alone reached ~350 Mbit/s. On the same
 gateway, the kernel path measured ~180 Mbit/s at half the CPU.
@@ -76,16 +76,18 @@ gateway, the kernel path measured ~180 Mbit/s at half the CPU.
 The kernel WireGuard device uses the same port, keys and MTU, so nothing changes
 in the UniFi VPN Client. It lives in a private network namespace; decrypted
 traffic leaves through a veth pair, and TPROXY hands every TCP and UDP connection
-to Xray, which routes it exactly as before (same inbound tag and sniffing).
+to the core, which routes it exactly as before (same inbound tag; Xray keeps its
+sniffing). sing-box runs a copy of its config with a `tproxy` inbound in place of
+its WireGuard endpoint. AmneziaWG profiles keep their own WireGuard.
 
 - **Fallback:** if any setup step fails, or the core does not come up on this
   path (a failed health check after a restart, or three failures in a row), the
-  service runs Xray's own WireGuard instead. `proxy status` shows the path in use
+  service runs the core's own WireGuard instead. `proxy status` shows the path in use
   and why; `proxy restart` tries the kernel path again.
 - **Switch:** `proxy` → WireGuard settings → Ingress (`kernel` or `userspace`).
 - **Firewall rewrites:** if the UniFi controller rewrites the firewall or routing
   rules, the guard timer restores them within 30 seconds.
-- **UDP replies from ports the gateway listens on:** Xray answers transparent UDP
+- **UDP replies from ports the gateway listens on:** the core answers transparent UDP
   from the remote address and port, which fails for ports the gateway itself holds
   (UniFi's STUN on 3478, for example). Those replies are lost; `proxy status`
   lists the ports. TCP is unaffected.
@@ -93,12 +95,13 @@ to Xray, which routes it exactly as before (same inbound tag and sniffing).
   transparent sockets require, and `CAP_NET_BIND_SERVICE`, so it can answer UDP
   from remote ports below 1024 (DNS, QUIC).
 - **Private addresses:** as with Xray's WireGuard inbound, direct (freedom) routes
-  refuse private and loopback targets for tunnel clients.
+  refuse private and loopback targets for tunnel clients. sing-box configs have
+  no direct route: everything goes to the proxy.
 - **LAN route (on by default):** `proxy set lan-route off|on`, or the menu
   under WireGuard settings. LAN traffic that a Policy Table route sends to this
   VPN Client is routed into a second proxy-unifi veth pair instead of being
   encrypted, and
-  reaches Xray without both WireGuard passes, in full-size packets. UniFi still processes it first: its
+  reaches the core without both WireGuard passes, in full-size packets. UniFi still processes it first: its
   marking, NAT (DNS interception, hotspot), its other routing tables, and its
   FORWARD firewall. The firewall sees `pu-lr0` instead of `wgclt` as the egress
   interface, so rules written for the VPN zone's interface do not match; rules by
@@ -265,8 +268,8 @@ their order, and the timing:
 
 Custom timing sets each value (and the seconds per check) yourself. A switch
 applies the node like choosing it by hand, so open connections are reset; with
-Xray nodes on kernel ingress that takes about 1-3 s, while sing-box nodes
-(Hysteria2, TUIC) make the UniFi VPN Client reconnect, up to ~15 s. Choosing a
+nodes on kernel ingress that takes about 1-3 s, while a node on its core's own
+WireGuard makes the UniFi VPN Client reconnect, up to ~15 s. Choosing a
 node yourself (a link, a subscription node, a JSON or AmneziaWG profile) asks
 first and then turns fallback off; the pool is kept. If the problem is between
 UniFi and the core rather than the node, the watchdog does not switch and
