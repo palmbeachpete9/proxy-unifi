@@ -673,10 +673,12 @@ PY
     cli _ingress-down >/dev/null 2>&1
     [ "$MODE" = wireguard ] || { ip netns del "$CLIENT"; ip netns add "$CLIENT"; ip -n "$CLIENT" link set lo up; }
 
-    LAB_FAIL=1 cli _ingress-up > "$T/fallback.log" 2>&1 && _up=0 || _up=$?
+    # The unit's hooks in their order: the kernel path (refused), then the guard.
+    LAB_FAIL=1 cli _ingress-up > "$T/fallback.log" 2>&1 && cli _fw-lock >> "$T/fallback.log" 2>&1 \
+        && _up=0 || _up=$?
     check "sing-box: fallback runs the config as imported" \
         sh -c "[ $_up = 0 ] && cmp -s '$T/root/etc/config.json' '$T/run/ingress.json' && [ ! -e '$T/run/kernel-ingress' ]"
-    check "sing-box: fallback keeps its port guard" iptables -C PU_LAB_WG -p udp --dport "$WG_PORT" ! -i lo -j DROP
+    check "sing-box: its own WireGuard port is guarded" iptables -C PU_LAB_WG -p udp --dport "$WG_PORT" ! -i lo -j DROP
     if [ "$MODE" = wireguard ]; then
         client_link
         run_core "$T/root/bin/sing-box" run -c "$T/run/ingress.json"

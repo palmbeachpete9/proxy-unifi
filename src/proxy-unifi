@@ -1680,11 +1680,10 @@ ingress_overlay() {
     if [ "$(current_engine)" = singbox ]; then
         if [ "$1" = kernel ]; then
             _io_json="$(ingress_singbox_for "$CONFIG" 2>&1)" || { _ingress_failed="$_io_json"; return 1; }
+            printf '%s\n' "$_io_json" | atomic_write "$INGRESS_OVERLAY" 640
         else
-            _io_json="$(cat "$CONFIG")" || return 1
-        fi
-        printf '%s\n' "$_io_json" | atomic_write "$INGRESS_OVERLAY" 640 \
-            && chown root:"$SERVICE_GROUP" "$INGRESS_OVERLAY"
+            atomic_write "$INGRESS_OVERLAY" 640 < "$CONFIG"
+        fi && chown root:"$SERVICE_GROUP" "$INGRESS_OVERLAY"
         return
     fi
     if [ "$1" = kernel ]; then
