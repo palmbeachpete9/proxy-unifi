@@ -270,6 +270,7 @@ def run_once(pool, state, active, cfg, probe, apply, now):
     reason = "#%d back online" % (target + 1)
     done, why = apply(target, reason)
     if done:
+        state["tunnel"] = "ok"         # judged on the core that was just replaced
         log.append("switch #%d -> #%d (%s)" % (apos + 1, target + 1, reason))
     else:
         _record(state, pool[target], False, 0, "could not apply: %s" % why, now)

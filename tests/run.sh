@@ -1586,6 +1586,14 @@ probe, apply = world([True, False, True], applied)
 for _ in range(3):
     fb.run_once(pool, state, on3, cfg, probe, apply, 0)
 assert [a[0] for a in applied] == [0], (applied, state)
+# the run that returns judged the tunnel of the core it replaced: not kept
+state, applied = fb.load_state("/nonexistent"), []
+probe, apply = world([True, False, True], applied)
+def live_down(i, kind):
+    return (False, 0, "timeout") if kind == "live" else probe(i, kind)
+for _ in range(3):
+    fb.run_once(pool, state, on3, cfg, live_down, apply, 0)
+assert [a[0] for a in applied] == [0] and state["tunnel"] == "ok", (applied, state)
 # a recovering higher entry holds back a lower one that is already online
 state, applied = fb.load_state("/nonexistent"), []
 state["nodes"][key(0)] = {"fails": 0, "oks": 1, "at": 0, "ms": 0, "err": ""}
