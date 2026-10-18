@@ -1362,8 +1362,21 @@ EOF
         || fatal "could not start firewall guard timer"
 }
 
+# Rebuild the active link's config with this version's generators, so a fix in
+# them reaches a running node with an update or reboot. A link they now refuse
+# keeps the config it runs with.
+rebuild_active_config() {
+    case "$(current_engine)" in xray|singbox) : ;; *) return 0 ;; esac
+    [ -s "$OUTBOUND_LINK" ] && [ -f "$CONFIG" ] || return 0
+    ensure_run_dir
+    ( _build_config_file "$OUTBOUND_LINK" ) >/dev/null 2>"$RUN_DIR/rebuild.err" && return 0
+    _rb="$(head -n 1 "$RUN_DIR/rebuild.err" | tr -d '\033' | sed 's/\[[0-9;]*m//g')"
+    c_ylw "Kept the current config: the saved link does not build with this version (${_rb#*error: })."
+}
+
 boot_recover() {
     install_service
+    rebuild_active_config
     if { [ -f "$CONFIG" ] || [ -f "$POOL_DIR/99-overlay.json" ]; } \
         && [ "$(cat "$AUTOSTART_FILE" 2>/dev/null || echo enabled)" != "disabled" ]; then
         restart_service || fatal "service failed its boot recovery health check"
