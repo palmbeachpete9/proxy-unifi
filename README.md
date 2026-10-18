@@ -280,11 +280,11 @@ switch" in the menu.
 
 The second menu block manages standalone AmneziaWG 1.5, 2.0, 3.0, and 3.1 client
 configurations. Choose **Create a new profile**, enter a display name, paste the
-configuration into `nano`, and save with `Ctrl+X`, `Y`, `Enter`. Saved profiles
+configuration into the editor, and save (in `nano`: `Ctrl+X`, `Y`, `Enter`). Saved profiles
 can be listed, selected and activated, edited, renamed, or deleted; `*` marks the
 active profile. Cyrillic, CJK text, and emoji are preserved, with a display-only
-fallback for limited UniFi SSH terminals. `nano` is required only for the create
-and edit actions; all other proxy-unifi features remain available without it.
+fallback for limited UniFi SSH terminals. The editor is `nano` when the gateway
+has it, otherwise `vi`, which UniFi OS ships; the menu says how to save in it.
 
 AWG runs entirely in userspace. It does not create a kernel interface, change
 gateway policy routes, require `/dev/net/tun`, or replace the persistent UniFi

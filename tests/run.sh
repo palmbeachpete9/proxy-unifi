@@ -874,6 +874,23 @@ SH
     if WORK="$_kd" sh "$_kd/validate.sh"; then ok "an unsuitable profile is imported with a warning"
     else bad "an unsuitable profile is imported with a warning"; fi
 
+    # AmneziaWG profiles open in nano, or in vi where the gateway has no nano.
+    {
+        cat <<'SH'
+have() { case "$1" in nano) [ "$NANO" = 1 ] ;; vi) [ "$VI" = 1 ] ;; *) return 1 ;; esac; }
+fatal() { echo "fatal $*"; exit 9; }
+SH
+        fn_src awg_editor
+        cat <<'SH'
+NANO=1 VI=1; awg_editor create; [ "$AWG_EDITOR" = nano ] && [ "$AWG_SAVE" = "press Ctrl+X, Y, Enter" ] || exit 1
+NANO=0; awg_editor edit; [ "$AWG_EDITOR" = vi ] || exit 1
+case "$AWG_SAVE" in *":wq"*) : ;; *) exit 1 ;; esac
+VI=0; [ "$(awg_editor edit)" = "fatal an editor (nano or vi) is required to edit AmneziaWG profiles" ] || exit 1
+SH
+    } > "$_kd/editor.sh"
+    if sh "$_kd/editor.sh"; then ok "AmneziaWG profiles open in nano, else vi"
+    else bad "AmneziaWG profiles open in nano, else vi"; fi
+
     # A core that fails its health check on the kernel path is restarted once on
     # the core's own WireGuard; if that fails too, the next start tries the kernel again.
     {
