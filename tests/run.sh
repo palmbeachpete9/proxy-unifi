@@ -560,6 +560,24 @@ SH
     fi
     rm -rf "$_fd"
 
+    # AmneziaWG profiles open in nano, or in vi where the gateway has no nano.
+    _ed="$(mktemp -d)"
+    {
+        cat <<'SH'
+have() { case "$1" in nano) [ "$NANO" = 1 ] ;; vi) [ "$VI" = 1 ] ;; *) return 1 ;; esac; }
+fatal() { echo "fatal $*"; exit 9; }
+SH
+        sed -n '/^awg_editor() {/,/^}/p' "$SRC/proxy-unifi"
+        cat <<'SH'
+NANO=1 VI=1; awg_editor create; [ "$AWG_EDITOR" = nano ] && [ "$AWG_SAVE" = "press Ctrl+X, Y, Enter" ] || exit 1
+NANO=0; awg_editor edit; [ "$AWG_EDITOR" = vi ] || exit 1
+case "$AWG_SAVE" in *":wq"*) : ;; *) exit 1 ;; esac
+VI=0; [ "$(awg_editor edit)" = "fatal an editor (nano or vi) is required to edit AmneziaWG profiles" ] || exit 1
+SH
+    } > "$_ed/editor.sh"
+    if sh "$_ed/editor.sh"; then ok "AmneziaWG profiles open in nano, else vi"
+    else bad "AmneziaWG profiles open in nano, else vi"; fi
+    rm -rf "$_ed"
     if [ -n "$_sc_log" ]; then
         if wait "$_sc_pid"; then ok "shellcheck"
         else bad "shellcheck"; cat "$_sc_log"; fi

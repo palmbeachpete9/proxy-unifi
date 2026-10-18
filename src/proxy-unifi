@@ -2568,27 +2568,35 @@ awg_details() {
     echo "Private and preshared keys are intentionally hidden."
 }
 
+# The profile editor: nano when the gateway has it, otherwise vi, which UniFi OS
+# ships. Sets AWG_EDITOR and AWG_SAVE (how to save and close in it).
+awg_editor() {   # <create|edit>
+    if have nano; then AWG_EDITOR="nano"; AWG_SAVE="press Ctrl+X, Y, Enter"
+    elif have vi; then AWG_EDITOR="vi"; AWG_SAVE="press i to start typing; when done, press Esc, type :wq and press Enter"
+    else fatal "an editor (nano or vi) is required to $1 AmneziaWG profiles"; fi
+}
+
 awg_edit_until_valid() {
     _awg_draft="$1"
     while true; do
-        nano "$_awg_draft" || return 1
+        "$AWG_EDITOR" "$_awg_draft" || return 1
         [ -s "$_awg_draft" ] || { c_ylw "The profile is empty."; return 1; }
         if py "$MKAWG" validate --file "$_awg_draft" >/dev/null; then return 0; fi
-        printf 'Reopen nano and correct the profile? [Y/n]: '
+        printf 'Reopen the editor and correct the profile? [Y/n]: '
         read -r _awg_retry || true
         case "${_awg_retry:-y}" in y|Y|yes|YES) : ;; *) return 1 ;; esac
     done
 }
 
 menu_awg_create() {
-    have nano || fatal "nano is required to create AmneziaWG profiles"
+    awg_editor create
     printf 'Display name: '; read -r _awg_name || true
     [ -n "${_awg_name:-}" ] || { c_ylw "Cancelled."; return; }
     _awg_name="$(py "$MKAWG" name --value "$_awg_name")" || fatal "invalid display name"
     awg_secure_dirs
     EDIT_DRAFT="$(mktemp "$AWG_DRAFT_DIR/new.XXXXXX.conf")" || fatal "could not create editor draft"
     chmod 600 "$EDIT_DRAFT"
-    echo "Paste the AmneziaWG config into nano, then press Ctrl+X, Y, Enter."
+    echo "Paste the AmneziaWG config into $AWG_EDITOR; to save, $AWG_SAVE."
     if awg_edit_until_valid "$EDIT_DRAFT"; then
         locked_call awg_commit_new "$_awg_name" "$EDIT_DRAFT"
     else
@@ -2598,7 +2606,7 @@ menu_awg_create() {
 }
 
 menu_awg_edit() {
-    have nano || fatal "nano is required to edit AmneziaWG profiles"
+    awg_editor edit
     awg_choose 'Profile number to edit: ' allow || return
     _awg_id="$AWG_PICK_ID"; _awg_path="$AWG_PICK_PATH"
     _awg_hash="$(sha256_of "$_awg_path")"; [ -n "$_awg_hash" ] || fatal "could not fingerprint profile"
@@ -2606,6 +2614,7 @@ menu_awg_edit() {
     EDIT_DRAFT="$(mktemp "$AWG_DRAFT_DIR/edit.XXXXXX.conf")" || fatal "could not create editor draft"
     cp -p "$_awg_path" "$EDIT_DRAFT" || fatal "could not prepare profile editor"
     chmod 600 "$EDIT_DRAFT"
+    echo "The profile opens in $AWG_EDITOR; to save, $AWG_SAVE."
     if awg_edit_until_valid "$EDIT_DRAFT"; then
         locked_call awg_commit_edit "$_awg_id" "$EDIT_DRAFT" "$_awg_hash"
     else
