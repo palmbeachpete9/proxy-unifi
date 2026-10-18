@@ -2,7 +2,7 @@
 # install.sh - installer for proxy-unifi on UniFi Cloud Gateways / UniFi OS devices.
 #
 # Usage (on the gateway, via SSH as root):
-#   curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/experimental/install.sh | sh
 # or, from a local clone:
 #   ./install.sh
 #
@@ -11,8 +11,11 @@
 set -eu
 umask 077
 
-REPO_RAW="${PROXY_UNIFI_RAW:-https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/main}"
 PROJECT_REPO="palmbeachpete9/proxy-unifi"
+# The branch this installer belongs to (main's says main). PROXY_UNIFI_COMMIT
+# pins the run to one commit of it, as the CLI's updates do.
+BRANCH="${PROXY_UNIFI_BRANCH:-experimental}"
+REPO_RAW="${PROXY_UNIFI_RAW:-https://raw.githubusercontent.com/$PROJECT_REPO/$BRANCH}"
 ROOT="/data/proxy-unifi"
 BIN_DIR="$ROOT/bin"
 ONBOOT_DIR="/data/on_boot.d"
@@ -38,8 +41,11 @@ SERVICE_STATE_BACKUP="$WORKDIR/service-state-backup"
 SERVICE_STATE_MARKER="$WORKDIR/service-state-active"
 # Every installed program file (on_boot.sh is handled apart) and systemd unit.
 SCRIPTS="proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkfallback.py proxylib.py safeexec.py"
+# The auto-update service is left out: an update runs inside it, and restoring
+# its state would start the unit that is waiting for this installer.
 UNITS="proxy-unifi.service proxy-unifi-refresh.service proxy-unifi-refresh.timer proxy-unifi-guard.service
-       proxy-unifi-guard.timer proxy-unifi-fallback.service proxy-unifi-fallback.timer"
+       proxy-unifi-guard.timer proxy-unifi-fallback.service proxy-unifi-fallback.timer
+       proxy-unifi-autoupdate.timer"
 
 snapshot_service_state() {
     mkdir -p "$SERVICE_STATE_BACKUP"
@@ -200,9 +206,13 @@ preflight() {
 
     # Pin every project file in this install run to one immutable commit so CDN
     # caching or a branch update cannot produce a mixed-version package.
-    if [ -z "${PROXY_UNIFI_RAW:-}" ]; then
+    if [ -z "${PROXY_UNIFI_RAW:-}" ] && [ -n "${PROXY_UNIFI_COMMIT:-}" ]; then
+        _sha="$PROXY_UNIFI_COMMIT"
+        case "$_sha" in *[!0-9a-f]*) _sha="" ;; esac
+        [ "${#_sha}" = 40 ] || { echo "PROXY_UNIFI_COMMIT must be a full commit id" >&2; return 1; }
+    elif [ -z "${PROXY_UNIFI_RAW:-}" ]; then
         _meta="$WORKDIR/proxy-unifi-commit.json"
-        bounded_curl "https://api.github.com/repos/${PROJECT_REPO}/commits/main" \
+        bounded_curl "https://api.github.com/repos/${PROJECT_REPO}/commits/${BRANCH}" \
             "$_meta" 2097152 || return 1
         _sha="$("$PYTHON" - "$_meta" <<'PY'
 import json,sys
@@ -211,6 +221,8 @@ print(value if len(value)==40 and all(c in "0123456789abcdef" for c in value) el
 PY
 )"
         [ -n "$_sha" ] || { echo "could not resolve immutable project commit" >&2; return 1; }
+    fi
+    if [ -n "${_sha:-}" ]; then
         printf '%s\n' "https://raw.githubusercontent.com/${PROJECT_REPO}/${_sha}" > "$WORKDIR/repo-raw"
         printf '%s\n' "https://cdn.jsdelivr.net/gh/${PROJECT_REPO}@${_sha}" > "$WORKDIR/repo-cdn"
         printf '%s\n' "$_sha" > "$WORKDIR/repo-sha"
@@ -442,9 +454,14 @@ printf '\n  Installing proxy-unifi\n\n'
 run_step "Checking gateway prerequisites" preflight
 run_step "Preparing boot persistence" ensure_unifi_common
 run_step "Installing files"           install_files
-run_step "Updating proxy cores"       "$BIN_DIR/proxy-unifi" update
+run_step "Updating proxy cores"       "$BIN_DIR/proxy-unifi" _update
 run_step "Installing service"         "$BIN_DIR/proxy-unifi" boot-recover
 rm -f "$PROMOTION_MARKER" "$SERVICE_STATE_MARKER" || { red "Could not commit installation transaction."; exit 1; }
+# What the CLI's updates compare against: the branch, and the commit or "local"
+# for a copy installed from a clone or an unpinned PROXY_UNIFI_RAW.
+_installed=local
+[ -n "$SCRIPT_DIR" ] || _installed="$(cat "$WORKDIR/repo-sha" 2>/dev/null || echo local)"
+printf '%s %s\n' "$BRANCH" "$_installed" > "$ROOT/version" || true
 printf '\n'
 grn "Installed."
 cat <<'EOF'
@@ -465,6 +482,6 @@ unifi.ui.com -> Settings -> VPN -> VPN Client -> Create New -> Type: WireGuard
 
 4. Success!
 
-Run: "proxy help" for direct commands
+Everything, updates included, is in the "proxy" menu.
 
 EOF

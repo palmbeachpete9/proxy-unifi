@@ -1885,6 +1885,72 @@ PY
 
     # A provider that answers slowly enough never trips a per-read timeout; the
     # whole fetch still ends at its deadline instead of hanging the refresh.
+    # Updates take the branch's own newest commit whose tests passed long enough
+    # ago, never a commit a merge brought in from the other branch.
+    _ud2="$(mktemp -d)"
+    { echo 'PROJECT_REPO=o/r; py() { python3 "$@"; }'; fn_src update_candidate; } > "$_ud2/lib.sh"
+    py_case "updates pick the newest tested commit of the branch's own line" "$_ud2/lib.sh" <<'PY'
+import http.server, json, os, subprocess, sys, threading, time
+lib = sys.argv[1]
+now = time.time()
+def stamp(hours_ago):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - hours_ago * 3600))
+H, M1, X1, M2 = ("%040x" % n for n in (1, 2, 3, 4))
+def made(hours_ago):
+    return {"committer": {"date": stamp(hours_ago)}}
+history = [{"sha": H, "parents": [{"sha": M1}, {"sha": X1}], "commit": made(3)},
+           {"sha": X1, "parents": [{"sha": M2}], "commit": made(31)},
+           {"sha": M1, "parents": [{"sha": M2}], "commit": made(31)},
+           {"sha": M2, "parents": [], "commit": made(61)}]
+lookups = []
+checks = {}
+class Api(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/repos/o/r/commits/main":
+            body = {"sha": H}
+        elif self.path.startswith("/repos/o/r/commits?sha=%s" % H):
+            body = history
+        elif self.path.endswith("/check-runs?per_page=100"):
+            sha = self.path.split("/")[5]
+            lookups.append(sha)
+            if checks.get(sha) == "error":
+                self.send_response(500); self.end_headers(); return
+            body = {"check_runs": checks.get(sha, [])}
+        else:
+            self.send_response(404); self.end_headers(); return
+        data = json.dumps(body).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers()
+        self.wfile.write(data)
+    def log_message(self, *args):
+        pass
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Api)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+os.environ["PROXY_UNIFI_GITHUB_API"] = "http://127.0.0.1:%d" % server.server_address[1]
+def passed(hours_ago, conclusion="success"):
+    return [{"status": "completed", "conclusion": "success", "completed_at": stamp(hours_ago + 1)},
+            {"status": "completed", "conclusion": conclusion, "completed_at": stamp(hours_ago)}]
+def pick(min_age_hours, installed="unknown"):
+    done = subprocess.run(["sh", "-c", '. "$0"; update_candidate main "$1" "$2"', lib,
+                           str(int(min_age_hours * 3600)), installed],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    return done.returncode, done.stdout.strip()
+checks.update({H: passed(2), X1: passed(30), M1: passed(30), M2: passed(60)})
+assert pick(24) == (0, M1), pick(24)                 # the head is too new; X1 is the other branch's
+assert lookups == [M1], lookups                      # a commit made since the cutoff needs no lookup
+assert pick(0) == (0, H), pick(0)                    # a manual update needs no wait
+assert pick(24, installed=M1) == (0, ""), pick(24, M1)    # already there
+assert pick(24, installed=H) == (0, ""), pick(24, H)      # never back to an older one
+checks[M1] = passed(30, "failure")
+assert pick(24) == (0, M2), pick(24)                 # failed tests are skipped
+checks[H] = [{"status": "in_progress", "conclusion": None, "completed_at": None}]
+assert pick(0) == (0, M2), pick(0)                   # unfinished tests do not count
+checks[H] = []
+assert pick(0) == (0, M2), pick(0)                   # nor does a commit without tests
+checks[H] = "error"
+assert pick(0)[0] != 0, pick(0)                      # GitHub trouble is an error, not "up to date"
+PY
+    rm -rf "$_ud2"
+
     py_case "subscription fetch ends at its deadline" "$SRC" <<'PY'
 import subprocess, sys, tempfile, time
 url = tempfile.NamedTemporaryFile("w", suffix=".url", delete=False)

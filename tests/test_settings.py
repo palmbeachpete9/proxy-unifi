@@ -36,7 +36,7 @@ COMMITTED = {
     "PING_URL": "https://example.com/health", "PING_TIMEOUT": "9",
     "SUB_REFRESH_HOURS": "12", "SUB_USER_AGENT": "Current/1.0", "FALLBACK": "on",
     "FB_INTERVAL": "40", "FB_DOWN": "4", "FB_UP": "6", "FB_TIMEOUT": "8",
-    "FB_RETURN": "off",
+    "FB_RETURN": "off", "AUTO_UPDATE": "on",
 }
 
 

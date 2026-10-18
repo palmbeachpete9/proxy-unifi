@@ -26,7 +26,7 @@ firmware upgrades via [unifi-common](https://github.com/unifi-utilities/unifi-co
 SSH into your gateway as `root` and run:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/experimental/install.sh | sh
 ```
 
 After the script finishes the installation, run `proxy` for the management menu:
@@ -82,14 +82,14 @@ its WireGuard endpoint. AmneziaWG profiles keep their own WireGuard.
 
 - **Fallback:** if any setup step fails, or the core does not come up on this
   path (a failed health check after a restart, or three failures in a row), the
-  service runs the core's own WireGuard instead. `proxy status` shows the path in use
-  and why; `proxy restart` tries the kernel path again.
+  service runs the core's own WireGuard instead. **Check status** shows the path in use
+  and why; **Restart** tries the kernel path again.
 - **Switch:** `proxy` → WireGuard settings → Ingress (`kernel` or `userspace`).
 - **Firewall rewrites:** if the UniFi controller rewrites the firewall or routing
   rules, the guard timer restores them within 30 seconds.
 - **UDP replies from ports the gateway listens on:** the core answers transparent UDP
   from the remote address and port, which fails for ports the gateway itself holds
-  (UniFi's STUN on 3478, for example). Those replies are lost; `proxy status`
+  (UniFi's STUN on 3478, for example). Those replies are lost; **Check status**
   lists the ports. TCP is unaffected.
 - **Privilege:** only in this mode, the core gets `CAP_NET_RAW`, which
   transparent sockets require, and `CAP_NET_BIND_SERVICE`, so it can answer UDP
@@ -97,8 +97,7 @@ its WireGuard endpoint. AmneziaWG profiles keep their own WireGuard.
 - **Private addresses:** as with Xray's WireGuard inbound, direct (freedom) routes
   refuse private and loopback targets for tunnel clients. sing-box configs have
   no direct route: everything goes to the proxy.
-- **LAN route (on by default):** `proxy set lan-route off|on`, or the menu
-  under WireGuard settings. LAN traffic that a Policy Table route sends to this
+- **LAN route (on by default):** in the menu under WireGuard settings. LAN traffic that a Policy Table route sends to this
   VPN Client is routed into a second proxy-unifi veth pair instead of being
   encrypted, and
   reaches the core without both WireGuard passes, in full-size packets. UniFi still processes it first: its
@@ -109,10 +108,10 @@ its WireGuard endpoint. AmneziaWG profiles keep their own WireGuard.
   forwarded into the pair come back from it, and UniFi's FORWARD chain (its
   threat blocklists included) decides on them as on replies from `wgclt`. Traffic the gateway itself sends
   through the VPN client (such as UniFi's DNS forwarder for it) takes the pair
-  too, and only its replies reach the gateway. `proxy status` shows `lan route` with how many TCP connections
+  too, and only its replies reach the gateway. **Check status** shows `lan route` with how many TCP connections
   UniFi's firewall let through; it reports `blocked` if strict reverse-path
   filtering (`rp_filter=1`) rules the mode out.
-- **Measure:** the third line of `proxy bench` tests the full tunnel through the
+- **Measure:** the third line of the **Speed test** tests the full tunnel through the
   gateway's own VPN Client.
 - **Installing an older version:** versions without this mode cannot remove it,
   and it would keep the WireGuard port. Run `systemctl stop proxy-unifi` first
@@ -273,7 +272,7 @@ WireGuard makes the UniFi VPN Client reconnect, up to ~15 s. Choosing a
 node yourself (a link, a subscription node, a JSON or AmneziaWG profile) asks
 first and then turns fallback off; the pool is kept. If the problem is between
 UniFi and the core rather than the node, the watchdog does not switch and
-`proxy status` says so. Every switch is logged (`proxy logs`) and shown as "Last
+**Check status** says so. Every switch is logged (**View logs**) and shown as "Last
 switch" in the menu.
 
 ## AmneziaWG profiles
@@ -309,23 +308,18 @@ the DNS advertised to UniFi remains the global value under **WireGuard settings*
 
 ## Usage
 
-Run `proxy` for the interactive menu, or use the direct commands:
+Run `proxy`: everything is in its menu.
 
-| Command | Description |
-|---|---|
-| `proxy` | Main menu |
-| `proxy status` | Engine, configured server, and listener status |
-| `proxy ping [...]` | Test the link — `...` = `get`·`head`·`tcp`·`icmp` (default `get`) |
-| `proxy bench [s] [url]` | Throughput of the WAN alone, of the active outbound alone (no WireGuard), and of the full tunnel through the gateway's VPN Client, with gateway and core CPU use |
-| `proxy start` · `stop` · `restart` | Service controls |
-| `proxy logs [args]` | Service logs (passed to `journalctl`) |
-| `proxy help` | Show help |
-| `proxy update` | Updates xray, installed sing-box/AWG cores, and bundled geo files |
-| `proxy geo-update` | Updates the independent routing geo database |
-
-The menu covers: single links, subscriptions, the fallback pool, AmneziaWG profiles, Xray JSON profiles, UniFi WireGuard config,
-regenerate keys, change port/MTU/DNS/ingress, ping test + protocol, enable/disable
-autostart, update cores, update geo files, and uninstall.
+- **Connections:** a single link, subscriptions, the fallback pool, AmneziaWG
+  profiles, and Xray JSON profiles; the current server and config.
+- **UniFi side:** the WireGuard VPN Client config, new keys, and the WireGuard
+  settings (port, MTU, DNS, ingress, LAN route, keepalive, log level).
+- **Tests:** the ping test and its protocol, and the **Speed test**: the WAN
+  alone, the active outbound alone (no WireGuard), and the full tunnel through
+  the gateway's VPN Client, with gateway and core CPU use.
+- **Service:** start, stop, restart, status, logs, and autostart.
+- **Updates:** proxy-unifi, the proxy cores, the geo files, automatic updates,
+  and version info (see [Update](#update)). Then **Uninstall**.
 
 ## Notes
 
@@ -356,10 +350,25 @@ every boot.
 
 ## Update
 
-To update client functionality (pull files from GitHub), simply run the script again:
+The menu's **Updates** entry updates proxy-unifi, the proxy cores (Xray,
+sing-box, AmneziaWG), and the geo files. **Update proxy-unifi now** installs the
+newest version of the branch you installed (`main` or `experimental`) whose
+GitHub tests passed; each update does nothing when you already have it.
+
+**Automatic updates** are off until you turn them on there. Once on, the gateway
+checks daily around 04:00: it installs a new proxy-unifi version 24 hours after
+its tests passed (time to catch a bad version before it reaches routers), then
+updates the cores. An update restarts the tunnel once, for a few seconds; a day
+with nothing new restarts nothing. **Check status** shows the version you run
+and how the last automatic update ended; **View logs** has the details.
+
+Every update runs the installer of the version it installs: it checks the
+gateway, backs up the scripts, cores and services, and restores them all if any
+step, the tunnel's health check included, fails. Running the install command
+again does the same by hand:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/experimental/install.sh | sh
 ```
 
 Remote installer files are pinned to one immutable GitHub commit for each run.

@@ -41,6 +41,8 @@ sed \
     -e "s|^GUARD_TIMER_FILE=.*|GUARD_TIMER_FILE=\"$T/proxy-unifi-guard.timer\"|" \
     -e "s|^FB_SERVICE_FILE=.*|FB_SERVICE_FILE=\"$T/proxy-unifi-fallback.service\"|" \
     -e "s|^FB_TIMER_FILE=.*|FB_TIMER_FILE=\"$T/proxy-unifi-fallback.timer\"|" \
+    -e "s|^AU_SERVICE_FILE=.*|AU_SERVICE_FILE=\"$T/proxy-unifi-autoupdate.service\"|" \
+    -e "s|^AU_TIMER_FILE=.*|AU_TIMER_FILE=\"$T/proxy-unifi-autoupdate.timer\"|" \
     -e "s|^ONBOOT_DST=.*|ONBOOT_DST=\"$T/on_boot.sh\"|" \
     -e "s|^PROXY_LINK=\"/usr/bin/proxy\"|PROXY_LINK=\"$T/proxy\"|" \
     -e "s|^INGRESS_RUN=.*|INGRESS_RUN=\"$T/run\"|" \
@@ -191,6 +193,9 @@ menu_input() {
         PATH="$T/mock-bin:$PATH" \
         "$T/root/bin/proxy-unifi"
 }
+# The menu entries the checks use (the menu is the only user interface).
+menu_status() { printf '15\n\n0\n' | menu_input; }
+svc() { case "$1" in start) printf '12\n\n0\n' ;; stop) printf '13\n\n0\n' ;; esac | menu_input >/dev/null; }
 hash_file() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | awk '{print $1}'
@@ -219,8 +224,8 @@ positions=[plain.index(label) for label in
             " 5. Import an Xray JSON profile")]
 assert positions == sorted(positions), positions
 numbers=[int(x) for x in re.findall(r"│\s+([0-9]+)\. ", plain)]
-assert numbers == list(range(23)), numbers
-assert "[0-22]" in plain and "Fallback:   off" in plain
+assert numbers == list(range(22)), numbers
+assert "[0-21]" in plain and "Fallback:   off" in plain
 PY
 
 LINK='vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.1.1.1:443?security=none&type=tcp#test'
@@ -249,9 +254,9 @@ printf '1\n%s\n\n0\n' "${LINK%#test}&unknownSemantic=x#bad" | menu_input >/dev/n
 [ ! -e "$T/root/.lock" ] || exit 1
 
 # Settings maintenance must not start a service that was deliberately stopped.
-run_cli stop >/dev/null
+svc stop
 printf '9\n1\n51822\n\n0\n' | menu_input >/dev/null
-if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
+if menu_status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
 grep -q '"port": 51822' "$T/root/etc/config.json"
 
 # The ingress setting switches the unit between both paths and rejects others.
@@ -260,27 +265,28 @@ grep -q '^INGRESS="userspace"$' "$T/root/etc/settings.env"
 grep -q '^ExecStart=.*/xray run -config [^ ]*/config.json$' "$T/proxy-unifi.service"
 grep -q '^ExecStartPre=-+.*/proxy-unifi _ingress-down$' "$T/proxy-unifi.service"
 grep -q '^AmbientCapabilities=$' "$T/proxy-unifi.service"
-run_cli status | grep -q "^ingress:   userspace (Xray's own WireGuard, as configured)$"
+menu_status | grep -q "^ingress:   userspace (Xray's own WireGuard, as configured)$"
 printf '9\n4\nfast\n\n0\n' | menu_input > "$T/ingress.out" 2>&1
 grep -q 'ingress must be kernel|userspace' "$T/ingress.out"
 grep -q '^INGRESS="userspace"$' "$T/root/etc/settings.env"
 printf '9\n4\nkernel\n\n0\n' | menu_input >/dev/null
 grep -q '^INGRESS="kernel"$' "$T/root/etc/settings.env"
 grep -q '^ExecStartPre=+.*/proxy-unifi _ingress-up$' "$T/proxy-unifi.service"
-if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
+if menu_status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
 
 # LAN route mode is a persisted on/off setting, from the menu and the CLI, also
 # while the service runs.
-run_cli start >/dev/null
+svc start
 printf '9\n5\non\n\n0\n' | menu_input >/dev/null
 grep -q '^LAN_ROUTE="on"$' "$T/root/etc/settings.env"
-run_cli status | grep -q '^lan route: on, inactive until kernel WireGuard ingress runs$'
-if run_cli set lan-route maybe >/dev/null 2>&1; then exit 1; fi
+menu_status | grep -q '^lan route: on, inactive until kernel WireGuard ingress runs$'
+printf '9\n5\nmaybe\n\n0\n' | menu_input > "$T/lan-route.out" 2>&1
+grep -q 'lan-route must be on|off' "$T/lan-route.out"
 grep -q '^LAN_ROUTE="on"$' "$T/root/etc/settings.env"
-run_cli set lan-route off >/dev/null
+printf '9\n5\noff\n\n0\n' | menu_input >/dev/null
 grep -q '^LAN_ROUTE="off"$' "$T/root/etc/settings.env"
-if run_cli status | grep -q '^lan route:'; then exit 1; fi
-run_cli stop >/dev/null
+if menu_status | grep -q '^lan route:'; then exit 1; fi
+svc stop
 
 # Standards-compliant SS2022 switches to the existing sing-box core, preserves
 # the UniFi-facing WG identity, and rolls back atomically on an invalid key.
@@ -310,7 +316,7 @@ assert cfg["route"]["final"]=="proxy"
 PY
 [ "$(hash_file "$T/root/etc/wg/wg_private.key")" = "$SS_WG_PRIVATE_HASH" ]
 [ "$(hash_file "$T/root/etc/wg/unifi_public.key")" = "$SS_UNIFI_PUBLIC_HASH" ]
-run_cli status > "$T/ss2022-status.out"
+menu_status > "$T/ss2022-status.out"
 grep -q '^engine:    singbox$' "$T/ss2022-status.out"
 grep -q '^protocol:  Shadowsocks 2022$' "$T/ss2022-status.out"
 SS_CONFIG_HASH="$(hash_file "$T/root/etc/config.json")"
@@ -485,7 +491,7 @@ assert "outbounds" not in cfg
 PY
 [ "$(hash_file "$T/root/etc/wg/wg_private.key")" = "$WG_PRIVATE_HASH" ]
 [ "$(hash_file "$T/root/etc/wg/unifi_public.key")" = "$UNIFI_PUBLIC_HASH" ]
-run_cli status > "$T/awg-status.out"
+menu_status > "$T/awg-status.out"
 grep -q '^engine:    awg$' "$T/awg-status.out"
 printf '6\n\n0\n' | menu_input > "$T/awg-details.out"
 grep -q '^Protocol:       AmneziaWG 1.5$' "$T/awg-details.out"
@@ -498,7 +504,7 @@ printf '4\n6\n1\ny\n\n0\n' | menu_input >/dev/null
 [ ! -e "$T/root/etc/config.json" ]
 [ ! -e "$T/root/etc/engine" ]
 [ "$(find "$T/root/etc/awg/profiles" -name '*.conf' -type f | wc -l | tr -d ' ')" = 0 ]
-if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
+if menu_status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
 
 # A stale AWG marker must never make profile maintenance replace or stop a
 # different authoritative engine. Simulate damaged legacy state around edit and
@@ -513,14 +519,14 @@ printf '4\n4\n1\n\n0\n' | menu_input >/dev/null
 [ "$(cat "$T/root/etc/engine")" = xray ]
 [ "$(hash_file "$T/root/etc/config.json")" = "$STALE_CONFIG_HASH" ]
 [ ! -e "$T/root/etc/awg/selected" ]
-run_cli status 2>/dev/null | grep -q '^service:   active'
+menu_status 2>/dev/null | grep -q '^service:   active'
 printf '%s' "$STALE_ID" > "$T/root/etc/awg/selected"
 printf '4\n6\n1\ny\n\n0\n' | menu_input >/dev/null
 [ "$(cat "$T/root/etc/engine")" = xray ]
 [ "$(hash_file "$T/root/etc/config.json")" = "$STALE_CONFIG_HASH" ]
 [ ! -e "$T/root/etc/awg/selected" ]
 [ ! -e "$STALE_CONF" ]
-run_cli status 2>/dev/null | grep -q '^service:   active'
+menu_status 2>/dev/null | grep -q '^service:   active'
 
 # An invalid on-disk profile remains editable and deletable from the CLI.
 BAD_ID=33333333-3333-4333-8333-333333333333
@@ -537,11 +543,34 @@ printf '4\n6\n1\ny\n\n0\n' | menu_input >/dev/null
 [ ! -e "$T/root/.lock" ] || exit 1
 
 # The benchmark validates its arguments before starting any download or core.
-if run_cli bench 1 > "$T/bench.out" 2>&1; then exit 1; fi
+printf '19\n1\n\n\n0\n' | menu_input > "$T/bench.out" 2>&1
 grep -q 'bench duration must be 5-' "$T/bench.out"
-if run_cli bench 5 'ftp://example.com/x' > "$T/bench.out" 2>&1; then exit 1; fi
+printf '19\n5\nftp://example.com/x\n\n0\n' | menu_input > "$T/bench.out" 2>&1
 grep -q 'bench URL must start with http:// or https://' "$T/bench.out"
-run_cli help | grep -q '^  proxy bench '
+# Only the menu takes people's commands.
+if run_cli status > "$T/gone.out" 2>&1; then exit 1; fi
+grep -q "proxy has no command 'status': run 'proxy' for the menu" "$T/gone.out"
+# Automatic updates are off until turned on under Updates; the daily timer is
+# there either way and does nothing while they are off.
+grep -q '^AUTO_UPDATE="off"' "$T/root/etc/settings.env"
+menu_status | grep -q '^updates:   automatic off'
+grep -q '^OnCalendar=\*-\*-\* 04:00:00$' "$T/proxy-unifi-autoupdate.timer"
+grep -q 'proxy-unifi _auto-update$' "$T/proxy-unifi-autoupdate.service"
+[ -f "$STATE/enabled_proxy-unifi-autoupdate_timer" ]
+run_cli _auto-update
+[ ! -e "$T/root/auto-update.last" ]
+printf '20\n4\n\n0\n' | menu_input >/dev/null
+grep -q '^AUTO_UPDATE="on"' "$T/root/etc/settings.env"
+menu_status | grep -q '^updates:   automatic on'
+printf '20\n4\n\n0\n' | menu_input >/dev/null
+grep -q '^AUTO_UPDATE="off"' "$T/root/etc/settings.env"
+# Keepalive and log level are in the WireGuard settings menu.
+printf '9\n6\n30\n\n0\n' | menu_input >/dev/null
+grep -q '^WG_KEEPALIVE="30"' "$T/root/etc/settings.env"
+printf '9\n6\n99999999\n\n0\n' | menu_input >/dev/null 2>&1
+grep -q '^WG_KEEPALIVE="30"' "$T/root/etc/settings.env"
+printf '9\n7\ninfo\n\n0\n' | menu_input >/dev/null
+grep -q '^LOGLEVEL="info"' "$T/root/etc/settings.env"
 
 # Several subscriptions: choose the subscription, then the node. A second one
 # is placed by hand (the sandbox has no network).
@@ -665,7 +694,7 @@ grep -q '@1.1.1.1:' "$T/root/etc/link.txt"
 grep -q 'switch #1 -> #2' "$T/fb-run.out"
 grep -q '#1 offline after 3 failed checks: timeout' "$T/root/fallback.last"
 grep -q '^FALLBACK="on"' "$T/root/etc/settings.env"      # a watchdog switch keeps it on
-run_cli status | grep -q '^fallback:  on, active #2 of 2'
+menu_status | grep -q '^fallback:  on, active #2 of 2'
 # a held lock skips the run: not even a check is recorded
 echo "ok 40" > "$STATE/probe_2_$(printf %.8s "$idb")"
 FB_STATE_HASH="$(hash_file "$T/run/fallback.state")"
@@ -674,17 +703,17 @@ run_cli fallback-check >/dev/null
 [ "$(hash_file "$T/run/fallback.state")" = "$FB_STATE_HASH" ]
 kill "$(cat "$T/root/.lock/pid")"; rm -rf "$T/root/.lock"
 # a stopped service is never started by a run
-run_cli stop >/dev/null; run_cli fallback-check >/dev/null
-if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
-run_cli start >/dev/null
+svc stop; run_cli fallback-check >/dev/null
+if menu_status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
+svc start
 # a stale switch is refused: the expected active node is not the real one
 if run_cli _fallback-apply 2 "$idb" "$(printf '0%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64)" >/dev/null 2>&1; then exit 1; fi
 grep -q '@1.1.1.1:' "$T/root/etc/link.txt"
 # ... nor when the user stopped the service meanwhile (it stays stopped),
-run_cli stop >/dev/null
+svc stop
 if run_cli _fallback-apply 2 "$idb" "$ida" >/dev/null 2>&1; then exit 1; fi
-if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
-run_cli start >/dev/null
+if menu_status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
+svc start
 # ... nor to a node that left the pool meanwhile.
 cp "$T/root/etc/fallback.json" "$T/pool.keep"
 python3 "$T/root/bin/mkfallback.py" remove --pool "$T/root/etc/fallback.json" --position 1
@@ -692,11 +721,11 @@ if run_cli _fallback-apply 2 "$idb" "$ida" >/dev/null 2>&1; then exit 1; fi
 cp "$T/pool.keep" "$T/root/etc/fallback.json"
 grep -q '@1.1.1.1:' "$T/root/etc/link.txt"
 # importing a link by hand turns fallback off and keeps the pool
-run_cli status | grep -q '^fallback:  on, active #2 of 2'
+menu_status | grep -q '^fallback:  on, active #2 of 2'
 printf '1\ny\n%s\n\n0\n' "$LINK" | menu_input >/dev/null 2>&1
 grep -q '^FALLBACK="off"' "$T/root/etc/settings.env"
 [ -s "$T/root/etc/fallback.json" ]
-run_cli status | grep -q '^fallback:  off'
+menu_status | grep -q '^fallback:  off'
 [ ! -e "$T/root/.lock" ] || exit 1
 
 # The fallback menu and its wizard: 2 nodes (two-b, then two-a), keep the
@@ -709,9 +738,9 @@ printf '3\n1\n2\n2\n1\n\n2\ny\ny\n\n0\n' | menu_input > "$T/fb-wizard.out" 2>&1
 grep -q '^FALLBACK="on"' "$T/root/etc/settings.env"
 [ -f "$STATE/enabled_proxy-unifi-fallback_timer" ]
 grep -q '@1.0.0.1:' "$T/root/etc/link.txt"
-# The watchdog's switches and errors reach the journal and 'proxy logs'.
+# The watchdog's switches and errors reach the journal and View logs.
 grep -q '^SyslogLevel=notice$' "$T/proxy-unifi-fallback.service"
-run_cli logs -n 5 | grep -q -- '-u proxy-unifi -u proxy-unifi-fallback -n 5'
+printf '16\n5\n\n0\n' | menu_input | grep -q -- '-u proxy-unifi -u proxy-unifi-fallback -u proxy-unifi-autoupdate -n 5 --no-pager'
 printf '0\n' | menu_input > "$T/menu-on.out" 2>&1
 grep -q 'Fallback:   on, active #1 of 2' "$T/menu-on.out"
 # choosing a node by hand asks first: "n" changes nothing, "y" turns fallback

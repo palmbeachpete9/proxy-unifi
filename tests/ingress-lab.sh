@@ -449,7 +449,7 @@ if [ "$MODE" = wireguard ]; then
     check "UniFi-side handshake" sh -c "ip netns exec $NS wg show $WGDEV latest-handshakes | awk '{ exit !(\$2 > 0) }'"
 fi
 
-cli status > "$T/status.out" 2>&1 || true
+printf '15\n\n0\n' | cli > "$T/status.out" 2>&1 || true   # the menu's Check status
 check "status reports the kernel path" grep -q '^ingress:   kernel WireGuard' "$T/status.out"
 check "status reports the guarded port" grep -q "^wg listen: 0.0.0.0:$WG_PORT (loopback only" "$T/status.out"
 check "status names a clashing service port" grep -q "^udp note: .* $FIXED/python" "$T/status.out"
@@ -516,7 +516,7 @@ else:
 PY
 )"
 check "the gateway's own traffic through the client gets its replies" [ "$_own" = ok ]
-cli status > "$T/status.out" 2>&1 || true
+printf '15\n\n0\n' | cli > "$T/status.out" 2>&1 || true   # the menu's Check status
 check "status reports LAN route mode" grep -q "^lan route: on via table $UTABLE ([1-9]" "$T/status.out"
 
 # 2. The guard timer restores rules a firewall reload removed. Without the
@@ -667,7 +667,7 @@ PY
         check "sing-box: UniFi-side handshake" \
             sh -c "ip netns exec $NS wg show $WGDEV latest-handshakes | awk '{ exit !(\$2 > 0) }'"
     fi
-    cli status > "$T/status.out" 2>&1 || true
+    printf '15\n\n0\n' | cli > "$T/status.out" 2>&1 || true   # the menu's Check status
     check "sing-box: status reports the kernel path" grep -q '^ingress:   kernel WireGuard -> sing-box' "$T/status.out"
     stop_core
     cli _ingress-down >/dev/null 2>&1
