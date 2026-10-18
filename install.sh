@@ -11,8 +11,11 @@
 set -eu
 umask 077
 
-REPO_RAW="${PROXY_UNIFI_RAW:-https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/main}"
 PROJECT_REPO="palmbeachpete9/proxy-unifi"
+# The branch this installer belongs to (experimental's says experimental).
+# PROXY_UNIFI_COMMIT pins the run to one commit of it, as the CLI's updates do.
+BRANCH="${PROXY_UNIFI_BRANCH:-main}"
+REPO_RAW="${PROXY_UNIFI_RAW:-https://raw.githubusercontent.com/$PROJECT_REPO/$BRANCH}"
 ROOT="/data/proxy-unifi"
 BIN_DIR="$ROOT/bin"
 ONBOOT_DIR="/data/on_boot.d"
@@ -36,9 +39,11 @@ PROMOTION_BACKUP="$WORKDIR/bin-backup"
 SERVICE_STATE_BACKUP="$WORKDIR/service-state-backup"
 SERVICE_STATE_MARKER="$WORKDIR/service-state-active"
 
+# The auto-update service is left out: an update runs inside it, and restoring
+# its state would start the unit that is waiting for this installer.
 snapshot_service_state() {
     mkdir -p "$SERVICE_STATE_BACKUP"
-    for _unit in proxy-unifi.service proxy-unifi-refresh.service proxy-unifi-refresh.timer proxy-unifi-guard.service proxy-unifi-guard.timer; do
+    for _unit in proxy-unifi.service proxy-unifi-refresh.service proxy-unifi-refresh.timer proxy-unifi-guard.service proxy-unifi-guard.timer proxy-unifi-autoupdate.timer; do
         if [ -e "/etc/systemd/system/$_unit" ]; then
             : > "$SERVICE_STATE_BACKUP/$_unit.present"
             cp -p "/etc/systemd/system/$_unit" "$SERVICE_STATE_BACKUP/$_unit" || return 1
@@ -54,7 +59,7 @@ restore_service_state() {
     [ -f "$SERVICE_STATE_MARKER" ] || return 0
     [ -f "$SERVICE_STATE_BACKUP/snapshotted" ] || return 0
     systemctl daemon-reload >/dev/null 2>&1 || return 1
-    for _unit in proxy-unifi.service proxy-unifi-refresh.service proxy-unifi-refresh.timer proxy-unifi-guard.service proxy-unifi-guard.timer; do
+    for _unit in proxy-unifi.service proxy-unifi-refresh.service proxy-unifi-refresh.timer proxy-unifi-guard.service proxy-unifi-guard.timer proxy-unifi-autoupdate.timer; do
         if [ ! -f "$SERVICE_STATE_BACKUP/$_unit.present" ]; then
             systemctl disable --now "$_unit" >/dev/null 2>&1 || true
             rm -f "/etc/systemd/system/$_unit"
@@ -184,9 +189,13 @@ preflight() {
 
     # Pin every project file in this install run to one immutable commit so CDN
     # caching or a branch update cannot produce a mixed-version package.
-    if [ -z "${PROXY_UNIFI_RAW:-}" ] && have curl; then
+    if [ -z "${PROXY_UNIFI_RAW:-}" ] && [ -n "${PROXY_UNIFI_COMMIT:-}" ]; then
+        _sha="$PROXY_UNIFI_COMMIT"
+        case "$_sha" in *[!0-9a-f]*) _sha="" ;; esac
+        [ "${#_sha}" = 40 ] || { echo "PROXY_UNIFI_COMMIT must be a full commit id" >&2; return 1; }
+    elif [ -z "${PROXY_UNIFI_RAW:-}" ] && have curl; then
         _meta="$WORKDIR/proxy-unifi-commit.json"
-        bounded_curl https://api.github.com/repos/palmbeachpete9/proxy-unifi/commits/main \
+        bounded_curl "https://api.github.com/repos/${PROJECT_REPO}/commits/${BRANCH}" \
             "$_meta" 2097152 || return 1
         _sha="$("$PYTHON" - "$_meta" <<'PY'
 import json,sys
@@ -195,8 +204,10 @@ print(value if len(value)==40 and all(c in "0123456789abcdef" for c in value) el
 PY
 )"
         [ -n "$_sha" ] || { echo "could not resolve immutable project commit" >&2; return 1; }
-        printf '%s\n' "https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/${_sha}" > "$WORKDIR/repo-raw"
-        printf '%s\n' "https://cdn.jsdelivr.net/gh/palmbeachpete9/proxy-unifi@${_sha}" > "$WORKDIR/repo-cdn"
+    fi
+    if [ -n "${_sha:-}" ]; then
+        printf '%s\n' "https://raw.githubusercontent.com/${PROJECT_REPO}/${_sha}" > "$WORKDIR/repo-raw"
+        printf '%s\n' "https://cdn.jsdelivr.net/gh/${PROJECT_REPO}@${_sha}" > "$WORKDIR/repo-cdn"
         printf '%s\n' "$_sha" > "$WORKDIR/repo-sha"
     fi
 }
@@ -435,9 +446,14 @@ printf '\n  Installing proxy-unifi\n\n'
 run_step "Checking gateway prerequisites" preflight
 run_step "Preparing boot persistence" ensure_unifi_common
 run_step "Installing files"           install_files
-run_step "Updating proxy cores"       "$BIN_DIR/proxy-unifi" update
+run_step "Updating proxy cores"       "$BIN_DIR/proxy-unifi" _update
 run_step "Installing service"         install_and_verify_service
 rm -f "$PROMOTION_MARKER" "$SERVICE_STATE_MARKER" || { red "Could not commit installation transaction."; exit 1; }
+# What the CLI's updates compare against: the branch, and the commit or "local"
+# for a copy installed from a clone or an unpinned PROXY_UNIFI_RAW.
+_installed=local
+[ -n "$SCRIPT_DIR" ] || _installed="$(cat "$WORKDIR/repo-sha" 2>/dev/null || echo local)"
+printf '%s %s\n' "$BRANCH" "$_installed" > "$ROOT/version" || true
 printf '\n'
 grn "Installed."
 cat <<'EOF'
@@ -458,6 +474,6 @@ unifi.ui.com -> Settings -> VPN -> VPN Client -> Create New -> Type: WireGuard
 
 4. Success!
 
-Run: "proxy help" for direct commands
+Everything, updates included, is in the "proxy" menu.
 
 EOF
