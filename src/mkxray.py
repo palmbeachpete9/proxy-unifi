@@ -19,7 +19,6 @@ mksingbox.py. Stdlib only (Python 3.9+) so it runs on the gateway as shipped.
 import argparse
 import ipaddress
 import json
-import re
 import sys
 from urllib.parse import unquote
 
@@ -27,7 +26,8 @@ from proxylib import (die, b64decode_any, flat_query, qg, safe_urlsplit,
                       host_port, safe_port, valid_host, reject_unknown_query,
                       shadowsocks_credentials, add_secret_file_arguments,
                       load_generator_inputs, handle_common_generator_modes,
-                      validate_xhttp_download_settings, shadowsocks_engine)
+                      validate_xhttp_download_settings, shadowsocks_engine,
+                      bool_option, LOCAL_PATH_FIELDS, PATHLIKE_KEY)
 
 
 _COMMON_QUERY = {
@@ -39,10 +39,6 @@ _COMMON_QUERY = {
     "permit_without_stream", "initial_windows_size",
     "ed", "eh", "packetEncoding", "tfo", "fastopen",
 }
-_LOCAL_FIELD = {"certificateFile", "keyFile", "masterKeyLog", "socketPath",
-                "unixSocket", "unixSocketPath"}
-_PATHLIKE_KEY = re.compile(
-    r"(?:File|FilePath|SocketPath|KeyLog)$|(?:^|_)(?:file|file_path|socket_path|key_log)$")
 
 
 def _q_int(q, name, minimum=0, maximum=2147483647):
@@ -59,15 +55,7 @@ def _q_int(q, name, minimum=0, maximum=2147483647):
 
 
 def _q_bool(q, *names):
-    value = qg(q, *names)
-    if value == "":
-        return None
-    low = value.lower()
-    if low in ("1", "true", "yes"):
-        return True
-    if low in ("0", "false", "no"):
-        return False
-    die("share-link option '%s' must be true/false or 1/0" % names[0])
+    return bool_option(qg(q, *names), "share-link option '%s'" % names[0])
 
 
 def _validate_json_option(value, path, depth=0):
@@ -79,7 +67,7 @@ def _validate_json_option(value, path, depth=0):
         for key, child in value.items():
             if not isinstance(key, str):
                 die("share-link JSON option contains a non-string key")
-            if (key in _LOCAL_FIELD or _PATHLIKE_KEY.search(key)) \
+            if (key in LOCAL_PATH_FIELDS or PATHLIKE_KEY.search(key)) \
                     and child not in (None, "", []):
                 die("share-link JSON option contains an unsafe local path field")
             if key in ("unixSettings", "dsSettings") and child not in (None, "", {}):
@@ -226,26 +214,18 @@ def build_stream(q, security, net, host):
                     "request": {"path": [path] if path else ["/"], "headers": {"Host": req_host}},
                 }
             }
-    elif net == "ws":
-        ws = {"path": path or "/"}
-        if host_hdr:
-            ws["headers"] = {"Host": host_hdr}
+    elif net in ("ws", "httpupgrade"):
+        settings = {"path": path or "/"}
+        if host_hdr and net == "ws":
+            settings["headers"] = {"Host": host_hdr}
+        elif host_hdr:
+            settings["host"] = host_hdr
         early = _q_int(q, "ed", 0, 1048576)
         if early is not None:
-            ws["maxEarlyData"] = early
+            settings["maxEarlyData"] = early
         if qg(q, "eh"):
-            ws["earlyDataHeaderName"] = qg(q, "eh")
-        stream["wsSettings"] = ws
-    elif net == "httpupgrade":
-        hu = {"path": path or "/"}
-        if host_hdr:
-            hu["host"] = host_hdr
-        early = _q_int(q, "ed", 0, 1048576)
-        if early is not None:
-            hu["maxEarlyData"] = early
-        if qg(q, "eh"):
-            hu["earlyDataHeaderName"] = qg(q, "eh")
-        stream["httpupgradeSettings"] = hu
+            settings["earlyDataHeaderName"] = qg(q, "eh")
+        stream[net + "Settings"] = settings
     elif net == "grpc":
         grpc = {"serviceName": qg(q, "serviceName", "path", default="")}
         mode = qg(q, "mode")
@@ -255,19 +235,15 @@ def build_stream(q, security, net, host):
             grpc["multiMode"] = mode == "multi"
         if "authority" in q:
             grpc["authority"] = q["authority"]
-        for qname, cname, maximum in (
-                ("user_agent", "user_agent", None),
-                ("idle_timeout", "idle_timeout", 86400),
-                ("health_check_timeout", "health_check_timeout", 86400),
-                ("initial_windows_size", "initial_windows_size", 16777216)):
-            if qname in q and q[qname] != "":
-                if qname == "user_agent":
-                    if len(q[qname]) > 512 or any(ord(ch) < 0x20 or ord(ch) == 0x7f
-                                                  for ch in q[qname]):
-                        die("gRPC user_agent is too long or contains control characters")
-                    grpc[cname] = q[qname]
-                else:
-                    grpc[cname] = _q_int(q, qname, 0, maximum)
+        agent = qg(q, "user_agent")
+        if agent:
+            if len(agent) > 512 or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in agent):
+                die("gRPC user_agent is too long or contains control characters")
+            grpc["user_agent"] = agent
+        for name, maximum in (("idle_timeout", 86400), ("health_check_timeout", 86400),
+                              ("initial_windows_size", 16777216)):
+            if qg(q, name):
+                grpc[name] = _q_int(q, name, 0, maximum)
         permit = _q_bool(q, "permit_without_stream")
         if permit is not None:
             grpc["permit_without_stream"] = permit
@@ -377,10 +353,7 @@ def parse_trojan(link):
 def _ss_plugin_name(parsed):
     query = flat_query(parsed)
     reject_unknown_query(query, {"plugin", "uot", "tfo", "fastopen"})
-    raw = qg(query, "plugin")
-    if not raw:
-        return None
-    return raw.split(";", 1)[0] if ";" in raw else raw
+    return qg(query, "plugin").split(";", 1)[0] or None
 
 
 def ss_info(link):
@@ -391,10 +364,6 @@ def ss_info(link):
     if not engine:
         die(reason or "unsupported Shadowsocks link")
     return engine, variant
-
-
-def ss_engine(link):
-    return ss_info(link)[0]
 
 
 def parse_ss(link):

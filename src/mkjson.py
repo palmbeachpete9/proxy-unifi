@@ -26,9 +26,13 @@ Subcommands:
   overlay   --profile P.json --out-overlay O.json --out-provider Q.json
             --port N --secret-key-file F --peer-pubkey-file F
             [--address A] [--mtu N] [--loglevel L]
-                 -> write sanitized provider + WG overlay; print a one-line summary
+                 -> write the sanitized provider and the WG overlay
   info      --profile P.json
                  -> print 'members<TAB>strategy<TAB>tag<TAB>label' for catalog use
+  socksconfig --profile P.json --socks-port N
+                 -> a runnable config behind a local SOCKS port (ping, bench)
+  firstserver --profile P.json
+                 -> print 'host<TAB>port' of the first proxy server
 """
 
 import argparse
@@ -42,7 +46,8 @@ from urllib.parse import urlsplit
 from proxylib import (die, valid_host, safe_port, xray_outbound_servers,
                       is_non_public_host as _is_non_public,
                       validate_xhttp_download_settings, nested_too_deep,
-                      dispatch_subcommand)
+                      dispatch_subcommand, LOCAL_PATH_FIELDS as _FORBIDDEN_KEYS,
+                      PATHLIKE_KEY as _PATHLIKE_KEY)
 
 
 MAX_PROFILE_BYTES = 2000000
@@ -50,8 +55,6 @@ MAX_DEPTH = 64
 MAX_OUTBOUNDS = 256
 MAX_BALANCERS = 64
 MIN_PROBE_SECONDS = 5.0
-_FORBIDDEN_KEYS = {"certificateFile", "keyFile", "masterKeyLog",
-                   "socketPath", "unixSocket", "unixSocketPath"}
 # Xray matches JSON field names case-insensitively, with Unicode folding (the
 # long s "ſ" counts as "s"). Every field this module validates or strips must
 # arrive spelled exactly as it reads it, or a copy spelled differently
@@ -72,8 +75,6 @@ for _name in ("log", "api", "dns", "routing", "policy", "inbounds", "outbounds",
               "dsSettings", "certificateFile", "keyFile", "masterKeyLog", "socketPath",
               "unixSocket", "unixSocketPath"):
     _CHECKED_FIELDS.setdefault(_name.casefold(), set()).add(_name)
-_PATHLIKE_KEY = re.compile(
-    r"(?:File|FilePath|SocketPath|KeyLog)$|(?:^|_)(?:file|file_path|socket_path|key_log)$")
 
 
 def _load(path):
@@ -483,11 +484,8 @@ def sanitize_provider(cfg):
         out["log"] = log
         # absolute access/error log paths from a desktop export won't exist on
         # UniFi and make Xray fail; drop them, keep loglevel.
-        for k in ("access", "error"):
-            if k in log:
-                del log[k]
-        if "dnsLog" in log:
-            del log["dnsLog"]
+        for k in ("access", "error", "dnsLog"):
+            log.pop(k, None)
     return out
 
 
@@ -518,12 +516,8 @@ def build_overlay(args, primary_tag, sniffing):
     }
     # reuse the provider inbound's sniffing so destination-based routing keeps
     # working; fall back to a sensible default.
-    if isinstance(sniffing, dict):
-        inbound["sniffing"] = sniffing
-    else:
-        inbound["sniffing"] = {"enabled": True,
-                               "destOverride": ["http", "tls", "quic"],
-                               "routeOnly": True}
+    inbound["sniffing"] = sniffing if isinstance(sniffing, dict) else {
+        "enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True}
     return {"log": {"loglevel": args.loglevel}, "inbounds": [inbound]}
 
 
@@ -549,9 +543,6 @@ def cmd_overlay(args):
             json.dump(overlay, fh, ensure_ascii=False)
     except Exception as e:
         die("could not write output: %s" % e)
-    members, strat, _ = _balancer_info(cfg)
-    sys.stdout.write("ok\ttag=%s\tmembers=%s\tstrategy=%s\n"
-                     % (primary_tag, members, strat or "-"))
 
 
 def _outbound_server(ob):
@@ -608,18 +599,12 @@ def cmd_info(args):
     cfg = _load(args.profile)
     validate_profile(cfg)
     members, strat, btag = _balancer_info(cfg)
-    label = ""
-    if isinstance(cfg.get("remarks"), str):
-        label = cfg["remarks"]
+    label = cfg["remarks"] if isinstance(cfg.get("remarks"), str) else ""
     sys.stdout.write("%s\t%s\t%s\t%s\n"
                      % (members, strat or "-", btag or "-", label))
 
 
 def main():
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
     ap = argparse.ArgumentParser(description="Xray JSON profile (balancer/pool) overlay builder")
     sub = ap.add_subparsers(dest="cmd")
 

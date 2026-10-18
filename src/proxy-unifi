@@ -1,8 +1,8 @@
 #!/bin/sh
-# proxy-unifi - GUI-less Xray-core proxy client (VLESS/Trojan/Shadowsocks) for UniFi Cloud Gateways.
+# proxy-unifi - GUI-less proxy/VPN client (Xray, sing-box, AmneziaWG) for UniFi Cloud Gateways.
 #
-# It runs an Xray WireGuard inbound that the gateway's *native* WireGuard VPN
-# Client connects to over loopback, and forwards everything out a proxy server.
+# The gateway's *native* WireGuard VPN Client connects over loopback to a core
+# that forwards everything through a proxy server or an AmneziaWG peer.
 # Because the tunnel is a real, controller-managed WireGuard VPN Client, it shows
 # up in the UniFi UI (VPN -> VPN Client) and in Policy Engine -> Policy Table.
 #
@@ -49,7 +49,6 @@ AWG_DRAFT_DIR="$ROOT/.awg-drafts"            # root-only editor scratch space
 SERVICE_NAME="proxy-unifi"
 SERVICE_USER="proxy-unifi"
 SERVICE_GROUP="proxy-unifi"
-# (no RUN_DIR: xray runs under systemd, no pidfile needed)
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 REFRESH_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}-refresh.service"
 REFRESH_TIMER_FILE="/etc/systemd/system/${SERVICE_NAME}-refresh.timer"
@@ -277,12 +276,7 @@ core_version() {
     }
 }
 
-wg_endpoint() {
-    case "$WG_LISTEN" in
-        *:*) printf '[%s]:%s' "$WG_LISTEN" "$WG_PORT" ;;
-        *)   printf '%s:%s' "$WG_LISTEN" "$WG_PORT" ;;
-    esac
-}
+wg_endpoint() { format_endpoint "$WG_LISTEN" "$WG_PORT"; }
 
 format_endpoint() {
     case "$1" in
@@ -325,13 +319,10 @@ py() {
     # Force UTF-8 I/O regardless of the gateway's locale (UniFi OS often runs
     # with LANG unset / C locale). Without this, printing multi-byte text -- e.g.
     # Cyrillic / CJK subscription labels -- can get mangled.
-    PYTHONUTF8=1 PYTHONIOENCODING=utf-8 _py_run "$@"
-}
-_py_run() {
     _pr="$(py_bin)" || fatal "python3 is required but was not found on this gateway."
-    "$_pr" "$@"
+    PYTHONUTF8=1 PYTHONIOENCODING=utf-8 "$_pr" "$@"
 }
-# The interpreter _py_run would use, for callers that must exec it directly.
+# The interpreter py runs, for callers that must exec it directly.
 py_bin() {
     if have python3; then echo python3
     elif have python; then echo python
@@ -914,48 +905,58 @@ with tarfile.open(src,"r:gz") as archive:
 PYEOF
 }
 
-cmd_install_singbox() {
+# Swap a verified, staged core binary in for <live>, back to the previous one
+# if the new binary does not run.
+_swap_core() {   # <staged> <live>
+    _sc="$(basename "$2")"
+    if [ -x "$2" ]; then
+        { cp -p "$2" "$2.bak.new" && mv -f "$2.bak.new" "$2.bak"; } || { err "could not back up $_sc"; return 1; }
+    fi
+    { install -m 0755 "$1" "$2.new" && mv -f "$2.new" "$2"; } || { rm -f "$2.new"; err "could not install $_sc"; return 1; }
+    if ! "$2" version >/dev/null 2>&1; then
+        if [ -f "$2.bak" ]; then mv -f "$2.bak" "$2"; else rm -f "$2"; fi
+        err "the new $_sc did not run; the previous version is kept"
+        return 1
+    fi
+    rm -f "$2.bak"
+}
+
+# Download, verify and stage a core archive, check the active config with the
+# new binary when its engine runs, then swap it in.
+_install_core() {   # <label> <live binary> <archive URL> <sha256> <version text> <engine>
     mkdir -p "$BIN_DIR"
-    _sa="$(sb_arch)"
-    _tag="$SINGBOX_TAG"
-    _ver="${_tag#v}"
-    _asset="sing-box-${_ver}-linux-${_sa}.tar.gz"
-    _url="$SINGBOX_RELEASES/download/${_tag}/${_asset}"
     ensure_run_dir
-    _tmp="$RUN_DIR/singbox"; mkdir -p "$_tmp"
-    info "downloading sing-box ${_tag} (${_sa}) ..."
-    download_to "$_url" "$_tmp/sb.tgz" 262144000 || { rm -rf "$_tmp"; err "sing-box download failed"; return 1; }
-    _want="$(github_asset_digest SagerNet/sing-box "$_tag" "$_asset" 2>/dev/null)" \
-        || { rm -rf "$_tmp"; err "could not obtain sing-box's GitHub asset digest"; return 1; }
-    verify_sha256 "$_tmp/sb.tgz" "$_want" \
-        || { rm -rf "$_tmp"; err "sing-box checksum verification failed"; return 1; }
-    safe_untar "$_tmp/sb.tgz" "$_tmp" || { rm -rf "$_tmp"; err "could not safely extract sing-box"; return 1; }
-    _b="$(find "$_tmp" -name sing-box -type f -print -quit)"
-    [ -n "$_b" ] || { rm -rf "$_tmp"; err "sing-box binary not found in archive"; return 1; }
-    chmod 0755 "$_b"
-    # verify the staged binary runs
-    "$_b" version >/dev/null 2>&1 || { rm -rf "$_tmp"; err "downloaded sing-box binary did not run"; return 1; }
-    # D15: if sing-box is the active engine and we have a config, validate it
-    # against the NEW binary before switching; keep a backup for rollback.
-    if [ -x "$SBIN" ] && [ "$(current_engine)" = "singbox" ] && [ -f "$CONFIG" ]; then
-        prepare_service_permissions
-        chown root:"$SERVICE_GROUP" "$RUN_DIR" "$_tmp" 2>/dev/null || true
-        chmod 750 "$RUN_DIR" "$_tmp" 2>/dev/null || true
-        validate_as_service "$_b" check -c "$CONFIG" >/dev/null 2>&1 \
-            || { rm -rf "$_tmp"; err "the new sing-box rejects your current config; keeping the old version"; return 1; }
+    _ic="$RUN_DIR/core"; rm -rf "$_ic"; mkdir -p "$_ic"
+    _ic_why=""
+    if ! download_to "$3" "$_ic/core.tgz" 262144000; then _ic_why="$1 download failed"
+    elif ! verify_sha256 "$_ic/core.tgz" "$4"; then _ic_why="$1 checksum verification failed"
+    elif ! safe_untar "$_ic/core.tgz" "$_ic"; then _ic_why="could not safely extract $1"
+    elif ! _ic_bin="$(find "$_ic" -name "$(basename "$2")" -type f -print -quit)" || [ -z "$_ic_bin" ]; then
+        _ic_why="$1 binary not found in the archive"
+    elif ! chmod 0755 "$_ic_bin" || ! "$_ic_bin" version 2>/dev/null | grep -q "$5"; then
+        _ic_why="the downloaded $1 does not run or has an unexpected version"
+    elif [ -x "$2" ] && [ "$(current_engine)" = "$6" ] && [ -f "$CONFIG" ] && ! {
+            prepare_service_permissions
+            chown root:"$SERVICE_GROUP" "$RUN_DIR" "$_ic" 2>/dev/null; chmod 750 "$RUN_DIR" "$_ic" 2>/dev/null
+            validate_as_service "$_ic_bin" check -c "$CONFIG" >/dev/null 2>&1; }; then
+        _ic_why="the new $1 rejects the active config; keeping the old version"
+    elif _swap_core "$_ic_bin" "$2"; then
+        rm -rf "$_ic"
+        c_grn "$1 installed: $(core_version "$2")"
+        return 0
     fi
-    if [ -x "$SBIN" ]; then
-        cp -p "$SBIN" "$SBIN.bak.new" || { rm -rf "$_tmp"; err "could not back up sing-box"; return 1; }
-        mv -f "$SBIN.bak.new" "$SBIN.bak"
-    fi
-    install -m 0755 "$_b" "$SBIN.new" || { rm -rf "$_tmp"; rm -f "$SBIN.new"; err "could not install sing-box binary"; return 1; }
-    mv -f "$SBIN.new" "$SBIN" || { rm -rf "$_tmp"; err "could not activate sing-box binary"; return 1; }
-    if ! "$SBIN" version >/dev/null 2>&1; then
-        [ -f "$SBIN.bak" ] && mv -f "$SBIN.bak" "$SBIN"
-        rm -rf "$_tmp"; err "new sing-box failed to run; rolled back to the previous version"; return 1
-    fi
-    rm -rf "$_tmp"
-    c_grn "sing-box installed: $(core_version "$SBIN")"
+    rm -rf "$_ic"
+    [ -z "$_ic_why" ] || err "$_ic_why"
+    return 1
+}
+
+cmd_install_singbox() {
+    _sa="$(sb_arch)"; _asset="sing-box-${SINGBOX_TAG#v}-linux-${_sa}.tar.gz"
+    info "downloading sing-box ${SINGBOX_TAG} (${_sa}) ..."
+    _want="$(github_asset_digest SagerNet/sing-box "$SINGBOX_TAG" "$_asset" 2>/dev/null)" \
+        || { err "could not obtain sing-box's GitHub asset digest"; return 1; }
+    _install_core sing-box "$SBIN" "$SINGBOX_RELEASES/download/$SINGBOX_TAG/$_asset" "$_want" \
+        "version ${SINGBOX_TAG#v}" singbox
 }
 
 ensure_singbox() {
@@ -963,49 +964,15 @@ ensure_singbox() {
     [ -x "$SBIN" ] || fatal "sing-box is required for this link but could not be installed"
 }
 
+# The AmneziaWG-enabled core is a separately pinned build: upstream publishes
+# no Linux binaries for its AWG endpoint branch.
 cmd_install_awg() {
-    mkdir -p "$BIN_DIR"
     _aa="$(sb_arch)"
-    _asset="proxy-unifi-amnezia-box-${AWG_CORE_VERSION}-linux-${_aa}.tar.gz"
-    _url="$AWG_CORE_RELEASES/download/${AWG_CORE_TAG}/${_asset}"
-    ensure_run_dir
-    _tmp="$RUN_DIR/amnezia-box"; mkdir -p "$_tmp"
+    _want="$(awg_core_sha256 "$_aa")" || { err "no pinned AmneziaWG core digest for $_aa"; return 1; }
     info "downloading AmneziaWG core ${AWG_CORE_VERSION} (${_aa}) ..."
-    download_to "$_url" "$_tmp/core.tgz" 262144000 \
-        || { rm -rf "$_tmp"; err "AmneziaWG core download failed"; return 1; }
-    _want="$(awg_core_sha256 "$_aa")" \
-        || { rm -rf "$_tmp"; err "no pinned AmneziaWG core digest for $_aa"; return 1; }
-    verify_sha256 "$_tmp/core.tgz" "$_want" \
-        || { rm -rf "$_tmp"; err "AmneziaWG core checksum verification failed"; return 1; }
-    safe_untar "$_tmp/core.tgz" "$_tmp" \
-        || { rm -rf "$_tmp"; err "could not safely extract the AmneziaWG core"; return 1; }
-    _b="$(find "$_tmp" -name amnezia-box -type f -print -quit)"
-    [ -n "$_b" ] || { rm -rf "$_tmp"; err "AmneziaWG core binary not found in archive"; return 1; }
-    chmod 0755 "$_b"
-    "$_b" version 2>/dev/null | grep -q "version proxy-unifi-awg-${AWG_CORE_VERSION}" \
-        || { rm -rf "$_tmp"; err "downloaded AmneziaWG core has an unexpected version"; return 1; }
-    if [ -x "$ABIN" ] && [ "$(current_engine)" = "awg" ] && [ -f "$CONFIG" ]; then
-        prepare_service_permissions
-        chown root:"$SERVICE_GROUP" "$RUN_DIR" "$_tmp" 2>/dev/null || true
-        chmod 750 "$RUN_DIR" "$_tmp" 2>/dev/null || true
-        validate_as_service "$_b" check -c "$CONFIG" >/dev/null 2>&1 \
-            || { rm -rf "$_tmp"; err "the new AmneziaWG core rejects the active profile; keeping the old version"; return 1; }
-    fi
-    if [ -x "$ABIN" ]; then
-        cp -p "$ABIN" "$ABIN.bak.new" || { rm -rf "$_tmp"; err "could not back up the AmneziaWG core"; return 1; }
-        mv -f "$ABIN.bak.new" "$ABIN.bak"
-    fi
-    install -m 0755 "$_b" "$ABIN.new" \
-        || { rm -rf "$_tmp"; rm -f "$ABIN.new"; err "could not stage the AmneziaWG core"; return 1; }
-    mv -f "$ABIN.new" "$ABIN" \
-        || { rm -rf "$_tmp"; err "could not activate the AmneziaWG core"; return 1; }
-    if ! "$ABIN" version >/dev/null 2>&1; then
-        if [ -f "$ABIN.bak" ]; then mv -f "$ABIN.bak" "$ABIN"; else rm -f "$ABIN"; fi
-        rm -rf "$_tmp"; err "new AmneziaWG core failed to run; rolled back"; return 1
-    fi
-    rm -f "$ABIN.bak"
-    rm -rf "$_tmp"
-    c_grn "AmneziaWG core installed: $(core_version "$ABIN")"
+    _install_core "AmneziaWG core" "$ABIN" \
+        "$AWG_CORE_RELEASES/download/$AWG_CORE_TAG/proxy-unifi-amnezia-box-${AWG_CORE_VERSION}-linux-${_aa}.tar.gz" \
+        "$_want" "version proxy-unifi-awg-${AWG_CORE_VERSION}" awg
 }
 
 _awg_version_ok() {
@@ -1087,8 +1054,7 @@ PYEOF
     "$tmp/xray" version >/dev/null 2>&1 || fatal "downloaded xray binary did not run"
     # D15: if a config already exists, validate it against the NEW binary before
     # switching, and keep a backup of the working binary so we can roll back.
-    _had_xray=0; [ -x "$XRAY" ] && _had_xray=1
-    if [ "$_had_xray" = 1 ] && { [ -f "$CONFIG" ] || [ -f "$POOL_DIR/99-overlay.json" ]; }; then
+    if [ -x "$XRAY" ] && { [ -f "$CONFIG" ] || [ -f "$POOL_DIR/99-overlay.json" ]; }; then
         prepare_service_permissions
         chown root:"$SERVICE_GROUP" "$RUN_DIR" "$tmp" 2>/dev/null || true
         chmod 750 "$RUN_DIR" "$tmp" 2>/dev/null || true
@@ -1100,30 +1066,13 @@ PYEOF
                 || fatal "the new xray-core rejects your current config; keeping the old version"
         fi
     fi
-    if [ "$_had_xray" = 1 ]; then
-        cp -p "$XRAY" "$XRAY.bak.new" || fatal "could not back up xray-core"
-        mv -f "$XRAY.bak.new" "$XRAY.bak"
-    fi
-    install -m 0755 "$tmp/xray" "$XRAY.new" || fatal "could not stage xray binary"
-    mv -f "$XRAY.new" "$XRAY" || fatal "could not install xray binary"
-    if ! "$XRAY" version >/dev/null 2>&1; then
-        # roll back to the previous binary
-        [ -f "$XRAY.bak" ] && mv -f "$XRAY.bak" "$XRAY"
-        fatal "new xray-core failed to run; rolled back to the previous version"
-    fi
+    _swap_core "$tmp/xray" "$XRAY" || fatal "xray-core was not updated"
     # geo data ships inside the xray zip, so it refreshes on every core update.
-    if [ -f "$tmp/geoip.dat" ]; then
-        if ! install -m 0644 "$tmp/geoip.dat" "$BIN_DIR/geoip.dat.new" \
-            || ! mv -f "$BIN_DIR/geoip.dat.new" "$BIN_DIR/geoip.dat"; then
-            fatal "could not install geoip.dat"
-        fi
-    fi
-    if [ -f "$tmp/geosite.dat" ]; then
-        if ! install -m 0644 "$tmp/geosite.dat" "$BIN_DIR/geosite.dat.new" \
-            || ! mv -f "$BIN_DIR/geosite.dat.new" "$BIN_DIR/geosite.dat"; then
-            fatal "could not install geosite.dat"
-        fi
-    fi
+    for _g in geoip.dat geosite.dat; do
+        [ -f "$tmp/$_g" ] || continue
+        { install -m 0644 "$tmp/$_g" "$BIN_DIR/$_g.new" && mv -f "$BIN_DIR/$_g.new" "$BIN_DIR/$_g"; } \
+            || fatal "could not install $_g"
+    done
     rm -rf "$tmp"
     c_grn "xray-core installed: $(core_version "$XRAY")"
     # sing-box (~48 MB) is only needed for SS2022, ss+obfs/v2ray-plugin,
@@ -1138,9 +1087,7 @@ PYEOF
     else
         info "sing-box not installed (fetched automatically on the first SS2022/hysteria2/tuic/ss+obfs link)."
     fi
-    # The AmneziaWG-enabled core is likewise on-demand. It is a separately
-    # pinned build because upstream does not publish Linux binaries for its AWG
-    # endpoint branch.
+    # The AmneziaWG core is likewise on demand.
     if [ -x "$ABIN" ]; then
         if ! cmd_install_awg; then
             [ "${_STRICT_UPDATE:-0}" = 1 ] && fatal "AmneziaWG core update failed; update transaction aborted"
@@ -1903,22 +1850,46 @@ ingress_rt_status() {
     echo "on via table $_rs_tbl (${_rs_syn:-0} TCP connections passed UniFi's firewall)"
 }
 
-# Root-namespace rules: TPROXY every TCP/UDP packet from the veth to Xray, admit
-# from the veth only the TCP/UDP that TPROXY marked for Xray and ICMP, keep Xray's
-# listener off every other interface, never forward from the veth (no tunnel
-# traffic may bypass the proxy), and deliver the veth's traffic locally.
-_ingress_rules_ok() {
+# Root-namespace rules: TPROXY every TCP/UDP packet from the veth to the core,
+# admit from the veth only the TCP/UDP that TPROXY marked for the core and ICMP,
+# keep the core's listener off every other interface, never forward from the
+# veth (no tunnel traffic may bypass the proxy), and deliver the veth's traffic
+# locally.
+#
+# Should the TPROXY rule ever be lost, the veth's TCP and UDP would reach every
+# service the gateway runs on a wildcard address (everything from the veth is
+# delivered locally). Only what TPROXY handed to the core carries its mark (no
+# xt_socket needed, which UniFi kernels lack); besides it only ICMP, errors
+# included, gets in, no other protocol. The project's chains, in order, one
+# rule per line: <table> <chain> <rule...>.
+_ingress_chain_rules() {
     _ir_tp="-j TPROXY --on-ip $INGRESS_HOST_IP --on-port $INGRESS_PORT --tproxy-mark $INGRESS_MARK"
-    # shellcheck disable=SC2086 # _ir_tp is a fixed list of words
+    cat <<EOF
+mangle $INGRESS_TP_CHAIN -p tcp $_ir_tp
+mangle $INGRESS_TP_CHAIN -p udp $_ir_tp
+filter $INGRESS_IN_CHAIN -i $INGRESS_VETH -m mark --mark $INGRESS_MARK -j ACCEPT
+filter $INGRESS_IN_CHAIN -i $INGRESS_VETH -p icmp -j ACCEPT
+filter $INGRESS_IN_CHAIN -i $INGRESS_VETH -j DROP
+filter $INGRESS_IN_CHAIN -p tcp --dport $INGRESS_PORT -j DROP
+filter $INGRESS_IN_CHAIN -p udp --dport $INGRESS_PORT -j DROP
+EOF
+}
+
+# -C checks every chain rule, -A appends them (the chains are new or flushed).
+_ingress_chain_each() {   # -C|-A
+    while read -r _ce_t _ce_c _ce_r; do
+        # shellcheck disable=SC2086 # a rule is a fixed list of words
+        if [ "$1" = -C ]; then iptables -t "$_ce_t" -C "$_ce_c" $_ce_r 2>/dev/null || return 1
+        else _ingress_step iptables -t "$_ce_t" -A "$_ce_c" $_ce_r || return 1; fi
+    done <<EOF
+$(_ingress_chain_rules)
+EOF
+}
+
+_ingress_rules_ok() {
     iptables -t mangle -C PREROUTING -i "$INGRESS_VETH" -j "$INGRESS_TP_CHAIN" 2>/dev/null \
-        && iptables -t mangle -C "$INGRESS_TP_CHAIN" -p tcp $_ir_tp 2>/dev/null \
-        && iptables -t mangle -C "$INGRESS_TP_CHAIN" -p udp $_ir_tp 2>/dev/null \
+        && _ingress_chain_each -C \
         && _input_first iptables "$INGRESS_IN_CHAIN" "$FW_CHAIN" \
-        && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -m mark --mark "$INGRESS_MARK" -j ACCEPT 2>/dev/null \
-        && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p icmp -j ACCEPT 2>/dev/null \
-        && iptables -C "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -j DROP 2>/dev/null \
-        && iptables -C "$INGRESS_IN_CHAIN" -p tcp --dport "$INGRESS_PORT" -j DROP 2>/dev/null \
-        && iptables -C "$INGRESS_IN_CHAIN" -p udp --dport "$INGRESS_PORT" -j DROP 2>/dev/null \
         && iptables -C FORWARD -i "$INGRESS_VETH" -j DROP 2>/dev/null \
         && ip rule show 2>/dev/null | grep -q "^$INGRESS_PREF:.* iif $INGRESS_VETH .*lookup $INGRESS_TABLE" \
         && ip route show table "$INGRESS_TABLE" 2>/dev/null | grep -q '^local default dev lo' \
@@ -1926,29 +1897,14 @@ _ingress_rules_ok() {
 }
 
 _ingress_rules_add() {
-    _ir_tp="-j TPROXY --on-ip $INGRESS_HOST_IP --on-port $INGRESS_PORT --tproxy-mark $INGRESS_MARK"
     iptables -t mangle -N "$INGRESS_TP_CHAIN" 2>/dev/null \
         || _ingress_step iptables -t mangle -F "$INGRESS_TP_CHAIN" || return 1
-    # shellcheck disable=SC2086 # _ir_tp is a fixed list of words
-    _ingress_step iptables -t mangle -A "$INGRESS_TP_CHAIN" -p tcp $_ir_tp || return 1
-    # shellcheck disable=SC2086
-    _ingress_step iptables -t mangle -A "$INGRESS_TP_CHAIN" -p udp $_ir_tp || return 1
+    iptables -N "$INGRESS_IN_CHAIN" 2>/dev/null \
+        || _ingress_step iptables -F "$INGRESS_IN_CHAIN" || return 1
+    _ingress_chain_each -A || return 1
     iptables -t mangle -C PREROUTING -i "$INGRESS_VETH" -j "$INGRESS_TP_CHAIN" 2>/dev/null \
         || _ingress_step iptables -t mangle -I PREROUTING 1 -i "$INGRESS_VETH" \
             -j "$INGRESS_TP_CHAIN" || return 1
-    iptables -N "$INGRESS_IN_CHAIN" 2>/dev/null \
-        || _ingress_step iptables -F "$INGRESS_IN_CHAIN" || return 1
-    # Should the TPROXY rule ever be lost, the veth's TCP and UDP would reach
-    # every service the gateway runs on a wildcard address (everything from the
-    # veth is delivered locally). Only what TPROXY handed to Xray carries its
-    # mark (no xt_socket needed, which UniFi kernels lack); besides it only
-    # ICMP, errors included, gets in, no other protocol.
-    _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -m mark --mark "$INGRESS_MARK" \
-        -j ACCEPT || return 1
-    _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -p icmp -j ACCEPT || return 1
-    _ingress_step iptables -A "$INGRESS_IN_CHAIN" -i "$INGRESS_VETH" -j DROP || return 1
-    _ingress_step iptables -A "$INGRESS_IN_CHAIN" -p tcp --dport "$INGRESS_PORT" -j DROP || return 1
-    _ingress_step iptables -A "$INGRESS_IN_CHAIN" -p udp --dport "$INGRESS_PORT" -j DROP || return 1
     _input_first iptables "$INGRESS_IN_CHAIN" "$FW_CHAIN" \
         || _ingress_step iptables -I INPUT 1 -j "$INGRESS_IN_CHAIN" || return 1
     iptables -C FORWARD -i "$INGRESS_VETH" -j DROP 2>/dev/null \
@@ -2181,12 +2137,10 @@ _build_config_file() {
             --peer-pubkey-file "$WG_DIR/unifi_public.key" --port "$WG_PORT" \
             --address "$XRAY_ADDR" --mtu "$WG_MTU" --loglevel "$(sb_loglevel)" \
             > "$tmpcfg" || fatal "config generation failed (check the link)"
-        if [ -x "$SBIN" ]; then
-            chown root:"$SERVICE_GROUP" "$tmpcfg"; chmod 640 "$tmpcfg"
-            validate_as_service "$SBIN" check -c "$tmpcfg" >/dev/null 2>&1 \
-                || fatal "sing-box rejected the generated config"
-            validate_ingress_overlay singbox "$tmpcfg"
-        fi
+        chown root:"$SERVICE_GROUP" "$tmpcfg"; chmod 640 "$tmpcfg"
+        validate_as_service "$SBIN" check -c "$tmpcfg" >/dev/null 2>&1 \
+            || fatal "sing-box rejected the generated config"
+        validate_ingress_overlay singbox "$tmpcfg"
     else
         set --
         [ -n "$INNER_DNS" ] && set -- --dns "$INNER_DNS"
@@ -2207,9 +2161,16 @@ _build_config_file() {
         fi
     fi
     [ -s "$tmpcfg" ] || fatal "generated config is empty"
-    mv -f "$tmpcfg" "$CONFIG" || fatal "could not install config"
-    chown root:"$SERVICE_GROUP" "$CONFIG"; chmod 640 "$CONFIG"
-    printf '%s' "$_eng" | atomic_write "$ENGINE_FILE" 600 || fatal "could not write engine marker"
+    _activate_config "$tmpcfg" "$_eng"
+}
+
+# Make a validated candidate the running config of <engine> (none for a pool).
+_activate_config() {   # <candidate or -> <engine>
+    if [ "$1" != - ]; then
+        mv -f "$1" "$CONFIG" || fatal "could not install config"
+        chown root:"$SERVICE_GROUP" "$CONFIG"; chmod 640 "$CONFIG"
+    fi
+    printf '%s' "$2" | atomic_write "$ENGINE_FILE" 600 || fatal "could not write engine marker"
     rm -f "$SERVER_CACHE" 2>/dev/null || true   # server changed -> drop the menu cache
     # Refresh the systemd unit so ExecStart matches the (possibly changed) engine.
     if [ -f "$SERVICE_FILE" ]; then
@@ -2217,13 +2178,14 @@ _build_config_file() {
     fi
 }
 
+_awg_valid_id() {
+    case "$1" in ????????-????-????-????-????????????) : ;; *) return 1 ;; esac
+    case "$1" in *[!0-9a-f-]*) return 1 ;; esac
+}
+
 awg_selected_profile() {
     _asp_id="$(cat "$AWG_SELECTED" 2>/dev/null || true)"
-    case "$_asp_id" in
-        ????????-????-????-????-????????????) : ;;
-        *) return 1 ;;
-    esac
-    case "$_asp_id" in *[!0-9a-f-]*) return 1 ;; esac
+    _awg_valid_id "$_asp_id" || return 1
     _asp_path="$AWG_PROFILES_DIR/${_asp_id}.conf"
     [ -f "$_asp_path" ] && [ ! -L "$_asp_path" ] || return 1
     printf '%s\n' "$_asp_path"
@@ -2250,13 +2212,7 @@ _build_awg_profile() {
     chown root:"$SERVICE_GROUP" "$_tmpcfg"; chmod 640 "$_tmpcfg"
     validate_as_service "$ABIN" check -c "$_tmpcfg" >/dev/null 2>&1 \
         || fatal "the AmneziaWG core rejected this profile"
-    mv -f "$_tmpcfg" "$CONFIG" || fatal "could not install AmneziaWG config"
-    chown root:"$SERVICE_GROUP" "$CONFIG"; chmod 640 "$CONFIG"
-    printf 'awg' | atomic_write "$ENGINE_FILE" 600 || fatal "could not write engine marker"
-    rm -f "$SERVER_CACHE" 2>/dev/null || true
-    if [ -f "$SERVICE_FILE" ]; then
-        write_service || fatal "could not update the systemd service"
-    fi
+    _activate_config "$_tmpcfg" awg
 }
 
 regen_config() {
@@ -2302,13 +2258,9 @@ _build_pool() {
     [ -d "$POOL_DIR" ] && mv "$POOL_DIR" "$_old_pool"
     mv "$_stage" "$POOL_DIR" || { [ -d "$_old_pool" ] && mv "$_old_pool" "$POOL_DIR"; fatal "could not install pool dir"; }
     rm -rf "$_old_pool"
-    printf 'xraypool' | atomic_write "$ENGINE_FILE" 600 || fatal "could not write engine marker"
-    rm -f "$SERVER_CACHE" 2>/dev/null || true   # server changed -> drop the menu cache
     # pool mode has no single config.json; clear a stale one so status is accurate
     rm -f "$CONFIG" 2>/dev/null || true
-    if [ -f "$SERVICE_FILE" ]; then
-        write_service || fatal "could not update the systemd service"
-    fi
+    _activate_config - xraypool
 }
 
 # Import a JSON balancer/pool profile from a file (or piped content already saved
@@ -2641,17 +2593,9 @@ cmd_set() {
     fi
     # validate up front so a bad value is never persisted to settings.env
     case "$key" in
-        port)
-            case "$val" in ""|*[!0-9]*) fatal "port must be a number (1-65535)";; esac
-            { [ "$val" -ge 1 ] && [ "$val" -le 65535 ]; } || fatal "port out of range (1-65535)"
-            WG_PORT="$val" ;;
-        mtu)
-            case "$val" in ""|*[!0-9]*) fatal "mtu must be a number";; esac
-            { [ "$val" -ge 576 ] && [ "$val" -le 1500 ]; } || fatal "mtu out of range (576-1500)"
-            WG_MTU="$val" ;;
-        keepalive)
-            case "$val" in *[!0-9]*) fatal "keepalive must be a number";; esac
-            WG_KEEPALIVE="${val:-0}" ;;
+        port) _in_range "$val" 1 65535 || fatal "port must be a number 1-65535"; WG_PORT="$val" ;;
+        mtu) _in_range "$val" 576 1500 || fatal "mtu must be a number 576-1500"; WG_MTU="$val" ;;
+        keepalive) _in_range "${val:-0}" 0 65535 || fatal "keepalive must be a number 0-65535"; WG_KEEPALIVE="${val:-0}" ;;
         dns)
             val="$(printf '%s' "$val" | tr -d ' ')"            # comma-separated, no spaces
             [ -z "$val" ] && val="8.8.8.8"                      # empty -> reset to default
@@ -2730,22 +2674,10 @@ cmd_update() {
         UPDATE_BACKUP=""
         fatal "core update failed; previous binaries/assets restored"
     fi
-    if ! ( write_service ); then
-        _restore_update_backup "$_backup" || fatal "service regeneration failed and core rollback was incomplete"
-        UPDATE_BACKUP=""
-        ( write_service ) 2>/dev/null || true
-        if [ "$_update_was_active" = 1 ]; then systemctl restart "$SERVICE_NAME" 2>/dev/null || true
-        else systemctl stop "$SERVICE_NAME" 2>/dev/null || true; fi
-        fatal "service regeneration failed; previous binaries/assets restored"
-    fi
-    if [ "$_update_was_active" = 1 ] && ! restart_service; then
-        _restore_update_backup "$_backup" || fatal "updated core failed and binary rollback was incomplete"
-        UPDATE_BACKUP=""
-        ( write_service ) || true
-        if [ "$_update_was_active" = 1 ]; then systemctl restart "$SERVICE_NAME" 2>/dev/null || true
-        else systemctl stop "$SERVICE_NAME" 2>/dev/null || true; fi
-        fatal "updated core failed runtime health checks; rolled back"
-    fi
+    # From here on_exit also rewrites the unit and restores the service's state.
+    ( write_service ) || fatal "service regeneration failed; rolling back to the previous binaries/assets"
+    [ "$_update_was_active" = 0 ] || restart_service \
+        || fatal "updated core failed runtime health checks; rolling back"
     UPDATE_BACKUP=""
     if [ "$_update_was_active" = 1 ]; then c_grn "Updated and running."
     else c_grn "Updated. Service remains stopped."; fi
@@ -2781,22 +2713,20 @@ cmd_geo_update() {
         else
             : > "$_backup/$f.absent"
         fi
-        GEO_BACKUP="$_backup"
         info "downloading $f ..."
-        download_to "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${_tag}/$f" "$BIN_DIR/$f.new" 209715200 \
-            || { rm -f "$BIN_DIR/$f.new"; _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "download failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "failed to fetch $f"; }
-        _want="$(github_asset_digest Loyalsoldier/v2ray-rules-dat "$_tag" "$f" 2>/dev/null)" \
-            || { rm -f "$BIN_DIR/$f.new"; _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "digest lookup failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "could not obtain digest for $f"; }
-        verify_sha256 "$BIN_DIR/$f.new" "$_want" \
-            || { rm -f "$BIN_DIR/$f.new"; _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "checksum failed and geo rollback was incomplete"; GEO_BACKUP=""; fatal "checksum failed for $f"; }
+        # A file that fails here was never installed: the running service keeps
+        # the restored files and is not restarted.
+        { download_to "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${_tag}/$f" "$BIN_DIR/$f.new" 209715200 \
+            && _want="$(github_asset_digest Loyalsoldier/v2ray-rules-dat "$_tag" "$f" 2>/dev/null)" \
+            && verify_sha256 "$BIN_DIR/$f.new" "$_want"; } || {
+            rm -f "$BIN_DIR/$f.new"
+            _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "could not fetch or verify $f, and the geo rollback was incomplete"
+            GEO_BACKUP=""
+            fatal "could not fetch or verify $f; the previous geo files are kept"; }
         mv -f "$BIN_DIR/$f.new" "$BIN_DIR/$f"
+        GEO_BACKUP="$_backup"   # on_exit restores the files and the service from here
     done
-    if [ "$_geo_was_active" = 1 ] && ! restart_service; then
-        _restore_update_backup "$_backup" geoip.dat geosite.dat || fatal "geo runtime check failed and rollback was incomplete"
-        GEO_BACKUP=""
-        systemctl restart "$SERVICE_NAME" 2>/dev/null || true
-        fatal "geo update failed runtime health checks; rolled back"
-    fi
+    [ "$_geo_was_active" = 0 ] || restart_service || fatal "geo update failed runtime health checks; rolling back"
     GEO_BACKUP=""
     if [ "$_geo_was_active" = 1 ]; then c_grn "Geo files updated and service restarted."
     else c_grn "Geo files updated. Service remains stopped."; fi
@@ -2839,11 +2769,8 @@ _compute_server() {
         return
     fi
     if [ "$(current_engine)" = "awg" ]; then
-        _awg_path="$(awg_selected_profile)" || { printf 'AmneziaWG (selected profile missing)'; return; }
-        hp="$(py "$MKAWG" server --file "$_awg_path" 2>/dev/null)" \
-            || { printf 'AmneziaWG (invalid selected profile)'; return; }
-        _host="${hp%%"$TAB"*}"; _port="${hp#*"$TAB"}"
-        printf 'AWG %s' "$(format_endpoint "$_host" "$_port")"
+        hp="$(_server_hp)" || { printf 'AmneziaWG (selected profile missing or invalid)'; return; }
+        printf 'AWG %s' "$(format_endpoint "${hp%%"$TAB"*}" "${hp#*"$TAB"}")"
         return
     fi
     [ -f "$OUTBOUND_LINK" ] || { printf '(none imported)'; return; }
@@ -3003,7 +2930,7 @@ ping_tcp() {
     _h="${_hp%%"$TAB"*}"; _p="${_hp#*"$TAB"}"
     [ -n "$_h" ] || { err "could not parse server from link"; return 1; }
     ensure_service_user
-    if have python3; then _ping_python=python3; else _ping_python=python; fi
+    _ping_python="$(py_bin)"
     _ms="$(py "$SAFEEXEC" --user "$SERVICE_USER" --timeout "$((PING_TIMEOUT + 5))" \
         --memory-mb 128 --fsize-mb 1 -- "$_ping_python" - "$_h" "$_p" "$PING_TIMEOUT" <<'PYEOF'
 import socket, time, sys
@@ -3211,8 +3138,7 @@ cmd_bench() {   # [seconds] [url]
     # busy on every CPU spends ncpu times faster than wall time.
     _max=$((300 / _ncpu - 10)); [ "$_max" -le 60 ] || _max=60; [ "$_max" -ge 5 ] || _max=5
     _secs="${1:-10}"; _url="${2:-$BENCH_URL}"
-    { _uint "$_secs" && [ "$_secs" -ge 5 ] && [ "$_secs" -le "$_max" ]; } \
-        || fatal "bench duration must be 5-$_max seconds on this gateway"
+    _in_range "$_secs" 5 "$_max" || fatal "bench duration must be 5-$_max seconds on this gateway"
     case "$_url" in http://*|https://*) : ;; *) fatal "bench URL must start with http:// or https://" ;; esac
     case "$_url" in *[[:space:]]*|*[[:cntrl:]]*) fatal "bench URL must not contain spaces or control characters" ;; esac
     _quota="$(sed -n 's/^CPUQuota=//p' "$SERVICE_FILE" 2>/dev/null)"
@@ -3372,7 +3298,7 @@ print_menu() {
 # State-aware service controls used by the menu (idempotent feedback).
 menu_start() {
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then c_ylw "Service is already running."
-    elif systemctl start "$SERVICE_NAME" 2>/dev/null;          then c_grn "Service started."
+    elif cmd_start 2>/dev/null;                                  then c_grn "Service started."
     else c_red "Failed to start - is a link imported? Check 'View logs'."; fi
 }
 menu_stop() {
@@ -3381,28 +3307,17 @@ menu_stop() {
     else c_red "Failed to stop service."; fi
 }
 menu_restart() {
-    if systemctl restart "$SERVICE_NAME" 2>/dev/null; then c_grn "Service restarted."
+    if cmd_restart 2>/dev/null; then c_grn "Service restarted."
     else c_red "Failed to restart - is a link imported? Check 'View logs'."; fi
 }
-menu_enable() {
+menu_autostart() {   # enable|disable
     txn_begin
-    if ! systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null \
-        && ! systemctl enable "$SERVICE_NAME" >/dev/null 2>&1; then
-        fatal "failed to enable autostart (is the service installed?)"
-    fi
-    _save_autostart enabled || fatal "enabled service, but could not persist autostart marker"
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then _ma=enable; else _ma=disable; fi
+    [ "$_ma" = "$1" ] || systemctl "$1" "$SERVICE_NAME" >/dev/null 2>&1 \
+        || fatal "failed to $1 autostart (is the service installed?)"
+    _save_autostart "${1}d" || fatal "${1}d the service, but could not persist the autostart marker"
     txn_commit
-    c_grn "Autostart enabled."
-}
-menu_disable() {
-    txn_begin
-    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null \
-        && ! systemctl disable "$SERVICE_NAME" >/dev/null 2>&1; then
-        fatal "failed to disable autostart"
-    fi
-    _save_autostart disabled || fatal "disabled service, but could not persist autostart marker"
-    txn_commit
-    c_ylw "Autostart disabled (service keeps running until stopped)."
+    if [ "$1" = enable ]; then c_grn "Autostart enabled."; else c_ylw "Autostart disabled (service keeps running until stopped)."; fi
 }
 
 menu_set_ping() {
@@ -3462,14 +3377,13 @@ cmd_menu() {
             16) ( printf 'Lines to show [100]: '; read -r _n || true
                   case "${_n:-}" in ""|*[!0-9]*) _n=100 ;; esac
                   cmd_logs logs -n "$_n" --no-pager ) ;;
-            17) ( locked_call menu_enable ) ;;
-            18) ( locked_call menu_disable ) ;;
+            17) ( locked_call menu_autostart enable ) ;;
+            18) ( locked_call menu_autostart disable ) ;;
             19) ( locked_call cmd_update ) ;;
             20) ( locked_call cmd_geo_update ) ;;
             21) ( if [ -x "$XRAY" ]; then core_version "$XRAY"; else c_ylw "xray-core: not installed"; fi
                   if [ -x "$SBIN" ]; then core_version "$SBIN"; else c_ylw "sing-box: not installed"; fi
-                  if [ -x "$ABIN" ]; then core_version "$ABIN"; else c_ylw "AmneziaWG core: not installed"; fi
-                  echo "proxy-unifi CLI 1.0.0" ) ;;
+                  if [ -x "$ABIN" ]; then core_version "$ABIN"; else c_ylw "AmneziaWG core: not installed"; fi ) ;;
             22) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
                 if [ "${_c:-}" = "y" ]; then ( locked_call cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
             *)  c_red "Invalid selection." ;;
@@ -3544,8 +3458,7 @@ awg_secure_dirs() {
 
 awg_resolve() {
     _awg_resolve_id="$1"
-    case "$_awg_resolve_id" in ????????-????-????-????-????????????) : ;; *) fatal "invalid profile id" ;; esac
-    case "$_awg_resolve_id" in *[!0-9a-f-]*) fatal "invalid profile id" ;; esac
+    _awg_valid_id "$_awg_resolve_id" || fatal "invalid profile id"
     if [ "${2:-}" = allow ]; then _awg_allow="--allow-invalid"; else _awg_allow=""; fi
     # shellcheck disable=SC2086 # optional fixed flag, never user-controlled.
     _awg_pick_row="$(PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKAWG" pick \
@@ -3562,13 +3475,8 @@ awg_list() {
     if [ "$(current_engine)" = awg ]; then
         _awg_sel="$(cat "$AWG_SELECTED" 2>/dev/null || true)"
     fi
-    if [ -n "${1:-}" ]; then
-        PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKAWG" render \
-            --dir "$AWG_PROFILES_DIR" --selected "$_awg_sel" --map-file "$1"
-    else
-        PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKAWG" render \
-            --dir "$AWG_PROFILES_DIR" --selected "$_awg_sel"
-    fi
+    PROXY_UNIFI_TERMINAL_SAFE_EMOJI=1 py "$MKAWG" render \
+        --dir "$AWG_PROFILES_DIR" --selected "$_awg_sel" ${1:+--map-file "$1"}
 }
 
 awg_choose() {
@@ -3583,8 +3491,7 @@ awg_choose() {
     case "${_awg_index:-}" in ""|*[!0-9]*) c_ylw "Cancelled."; return 1 ;; esac
     AWG_CHOICE_ID="$(awk -v n="$_awg_index" 'NR == n { print; exit }' "$_awg_choose_map")"
     [ -n "$AWG_CHOICE_ID" ] || { c_red "No profile #$_awg_index."; return 1; }
-    if [ "$_awg_choose_mode" = allow ]; then awg_resolve "$AWG_CHOICE_ID" allow
-    else awg_resolve "$AWG_CHOICE_ID"; fi
+    awg_resolve "$AWG_CHOICE_ID" "$_awg_choose_mode"
 }
 
 awg_commit_new() {
@@ -3627,8 +3534,7 @@ awg_select() {
 
 awg_commit_edit() {
     _awg_id="$1"; _awg_draft="$2"; _awg_original_hash="$3"
-    case "$_awg_id" in ????????-????-????-????-????????????) : ;; *) fatal "invalid profile id" ;; esac
-    case "$_awg_id" in *[!0-9a-f-]*) fatal "invalid profile id" ;; esac
+    _awg_valid_id "$_awg_id" || fatal "invalid profile id"
     _awg_conf="$AWG_PROFILES_DIR/${_awg_id}.conf"
     if [ ! -f "$_awg_conf" ] || [ -L "$_awg_conf" ]; then
         fatal "profile no longer exists"
@@ -4154,7 +4060,7 @@ menu_sub() {
 # Each lives in $SUB_DIR/<id>/ (url.txt, catalog.json, name, optional ua,
 # status); ids are stable, so removing one never renumbers the others.
 # --------------------------------------------------------------------------
-sub_valid_id() { _uint "${1:-}" && [ "$1" -ge 1 ] && [ "$1" -le 999 ] && [ -s "$SUB_DIR/$1/url.txt" ]; }
+sub_valid_id() { _in_range "${1:-}" 1 999 && [ -s "$SUB_DIR/$1/url.txt" ]; }
 sub_ids() {
     for _sd in "$SUB_DIR"/*/; do
         _sd="${_sd%/}"; _sd="${_sd##*/}"
@@ -4642,20 +4548,20 @@ _fallback_apply() {   # <subscription id> <node id> <expected active node id, or
     _cur="$(cat "$SUB_SELECTED" 2>/dev/null || true)"
     [ "${_cur:--}" = "${3:-}" ] || { echo "the active node changed; not switching"; exit 3; }
     [ "$(_unit_state)" != inactive ] || { echo "the service was stopped; not switching"; exit 3; }
-    py - "$BIN_DIR" "$FB_POOL" "$1" "$2" <<'PYEOF' 2>/dev/null || { echo "the node left the pool; not switching"; exit 3; }
+    # Exit 3: the node left the pool (or the pool cannot be read).
+    _n="$(py - "$BIN_DIR" "$FB_POOL" "$1" "$2" "$SUB_DIR/$1/catalog.json" <<'PYEOF' 2>/dev/null
 import sys
 sys.path.insert(0, sys.argv[1])
-import mkfallback
-pool = mkfallback.load_pool(sys.argv[2])
-sys.exit(0 if any((e["sub"], e["meta"]["id"]) == (sys.argv[3], sys.argv[4]) for e in pool) else 1)
+import mkfallback, mksub
+try:
+    pool = mkfallback.load_pool(sys.argv[2])
+except SystemExit:
+    pool = []
+if not any((e["sub"], e["meta"]["id"]) == (sys.argv[3], sys.argv[4]) for e in pool):
+    sys.exit(3)
+print(next(n["n"] for n in mksub._load(sys.argv[5])["nodes"] if n["id"] == sys.argv[4]))
 PYEOF
-    _n="$(py - "$BIN_DIR" "$SUB_DIR/$1/catalog.json" "$2" <<'PYEOF' 2>/dev/null
-import sys
-sys.path.insert(0, sys.argv[1])
-import mksub
-print(next(n["n"] for n in mksub._load(sys.argv[2])["nodes"] if n["id"] == sys.argv[3]))
-PYEOF
-)" || fatal "the node is no longer in subscription $1"
+)" || { [ $? != 3 ] || { echo "the node left the pool; not switching"; exit 3; }; fatal "the node is no longer in subscription $1"; }
     _KEEP_FALLBACK=1 _QUIET=1 sub_select "$1" "$_n"
     echo "switched"
 }
@@ -4717,10 +4623,9 @@ cmd="${1:-}"
 if [ $# -ge 1 ]; then shift; fi
 case "$cmd" in
     ""|status|logs|ping|bench|-h|--help|help|_fw-lock|_fw-unlock|_ingress-up|_ingress-down) : ;;
-    # Takes the lock only to install each downloaded catalog.
-    sub-refresh-auto) need_root ;;
-    # Read-only, and called while the watchdog decides: never waits for the lock.
-    _fallback-probe|fallback-check) need_root ;;
+    # sub-refresh-auto takes the lock only to install each downloaded catalog;
+    # the watchdog's calls never wait for it.
+    sub-refresh-auto|_fallback-probe|fallback-check) need_root ;;
     *) need_root; acquire_lock; recover_transaction ;;
 esac
 load_settings

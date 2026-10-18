@@ -195,17 +195,14 @@ preflight() {
     { have wg || have openssl; } || { echo "wg or openssl is required for WireGuard keys" >&2; return 1; }
     have curl || { echo "curl is required for installation and proxy latency tests" >&2; return 1; }
     { have useradd || have adduser; } || { echo "useradd or adduser is required" >&2; return 1; }
-    if [ -z "${PROXY_UNIFI_RAW:-}" ] && [ ! -f "$SCRIPT_DIR/src/proxy-unifi" ]; then
-        have curl || { echo "curl is required to pin remote installs to an immutable GitHub commit" >&2; return 1; }
-    fi
     _free="$(df -Pk /data 2>/dev/null | awk 'NR==2 {print $4}')"
     case "$_free" in ""|*[!0-9]*) : ;; *) [ "$_free" -ge 250000 ] || { echo "need at least 250 MB free on /data" >&2; return 1; } ;; esac
 
     # Pin every project file in this install run to one immutable commit so CDN
     # caching or a branch update cannot produce a mixed-version package.
-    if [ -z "${PROXY_UNIFI_RAW:-}" ] && have curl; then
+    if [ -z "${PROXY_UNIFI_RAW:-}" ]; then
         _meta="$WORKDIR/proxy-unifi-commit.json"
-        bounded_curl https://api.github.com/repos/palmbeachpete9/proxy-unifi/commits/main \
+        bounded_curl "https://api.github.com/repos/${PROJECT_REPO}/commits/main" \
             "$_meta" 2097152 || return 1
         _sha="$("$PYTHON" - "$_meta" <<'PY'
 import json,sys
@@ -214,8 +211,8 @@ print(value if len(value)==40 and all(c in "0123456789abcdef" for c in value) el
 PY
 )"
         [ -n "$_sha" ] || { echo "could not resolve immutable project commit" >&2; return 1; }
-        printf '%s\n' "https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/${_sha}" > "$WORKDIR/repo-raw"
-        printf '%s\n' "https://cdn.jsdelivr.net/gh/palmbeachpete9/proxy-unifi@${_sha}" > "$WORKDIR/repo-cdn"
+        printf '%s\n' "https://raw.githubusercontent.com/${PROJECT_REPO}/${_sha}" > "$WORKDIR/repo-raw"
+        printf '%s\n' "https://cdn.jsdelivr.net/gh/${PROJECT_REPO}@${_sha}" > "$WORKDIR/repo-cdn"
         printf '%s\n' "$_sha" > "$WORKDIR/repo-sha"
     fi
 }
@@ -386,7 +383,7 @@ EOF
 # D19: fetch every script into a staging dir first, then promote each into the
 # live BIN_DIR with an atomic rename. An interrupted/failed download therefore
 # never leaves a half-written or mixed-version live install; the existing files
-    # stay intact. Engine binaries keep their own staged+rename logic.
+# stay intact. Engine binaries keep their own staged+rename logic.
 _install_files_locked() {
     mkdir -p "$BIN_DIR"
     _stage="$(mktemp -d "$WORKDIR/stage.XXXXXX")" || { echo "could not stage" >&2; return 1; }
@@ -424,11 +421,7 @@ _install_files_locked() {
     rm -f "$BIN_DIR/mkconfig.py"
     mv -f "$_stage/on_boot.sh" "$ONBOOT_DST" || return 1
     chmod 0755 "$ONBOOT_DST" || return 1
-    # the safe symlink is (re)created by 'install-service'; create it here too for
-    # immediate use, but never clobber an unrelated /usr/bin/proxy.
-    if [ ! -e /usr/bin/proxy ] || { [ -L /usr/bin/proxy ] && [ "$(readlink /usr/bin/proxy 2>/dev/null)" = "$BIN_DIR/proxy-unifi" ]; }; then
-        ln -sf "$BIN_DIR/proxy-unifi" /usr/bin/proxy || return 1
-    fi
+    # The 'proxy' symlink comes with the service step (boot-recover).
     # Keep the marker and backup through core update + service installation.
     # The parent clears it only after the final step succeeds; any later failure
     # therefore restores one coherent pre-install set of scripts and assets.
@@ -444,17 +437,13 @@ install_files() {
     return "$_rc"
 }
 
-install_and_verify_service() {
-    "$BIN_DIR/proxy-unifi" boot-recover
-}
-
 : > "$LOG" 2>/dev/null || true
 printf '\n  Installing proxy-unifi\n\n'
 run_step "Checking gateway prerequisites" preflight
 run_step "Preparing boot persistence" ensure_unifi_common
 run_step "Installing files"           install_files
 run_step "Updating proxy cores"       "$BIN_DIR/proxy-unifi" update
-run_step "Installing service"         install_and_verify_service
+run_step "Installing service"         "$BIN_DIR/proxy-unifi" boot-recover
 rm -f "$PROMOTION_MARKER" "$SERVICE_STATE_MARKER" || { red "Could not commit installation transaction."; exit 1; }
 printf '\n'
 grn "Installed."

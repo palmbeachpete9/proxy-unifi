@@ -51,7 +51,7 @@ class PluginOptionsTests(unittest.TestCase):
 
     def test_classifier_and_generator_agree_without_changing_link_identity(self):
         share = link("v2ray-plugin;mode=websocket;path=/tenant%2Fblue")
-        self.assertEqual(mkxray.ss_engine(share), "singbox")
+        self.assertEqual(mkxray.ss_info(share)[0], "singbox")
         node = mksub.node_from_link(share)
         self.assertTrue(node["recognized"])
         self.assertEqual(node["engine"], "singbox")

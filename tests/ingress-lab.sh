@@ -342,11 +342,26 @@ while True:
     PIDS="$PIDS $!"
 }
 
+# The UniFi side after a new _ingress-up: with kernel WireGuard a fresh peer
+# (it handshakes at once instead of after its session times out), without it
+# the addresses on the veth end the hook moved into the client namespace.
+client_link() {
+    if [ "$MODE" = wireguard ]; then
+        _server="$(cat "$T/root/etc/wg/wg_public.key")"
+        ip netns exec "$CLIENT" wg set "$CDEV" peer "$_server" remove
+        ip netns exec "$CLIENT" wg set "$CDEV" peer "$_server" endpoint "127.0.0.1:$WG_PORT" allowed-ips 0.0.0.0/0
+    elif ip -n "$CLIENT" link show "$CDEV" >/dev/null 2>&1; then
+        ip -n "$CLIENT" addr add 10.7.0.2/32 dev "$CDEV"
+        ip -n "$CLIENT" link set "$CDEV" mtu 1340 up
+        ip -n "$CLIENT" route add 10.7.0.1/32 dev "$CDEV"
+        ip -n "$CLIENT" route add default via 10.7.0.1 dev "$CDEV"
+    fi
+}
+reset_client() { ip netns del "$CLIENT" 2>/dev/null || true; ip netns add "$CLIENT"; ip -n "$CLIENT" link set lo up; }
+
 info "mode: $MODE"
 cli _ingress-down >/dev/null 2>&1 || true   # leftovers of an interrupted run
-ip netns del "$CLIENT" 2>/dev/null || true
-ip netns add "$CLIENT"
-ip -n "$CLIENT" link set lo up
+reset_client
 
 # The UniFi side of LAN route mode (see the top).
 _forward_was="$(cat /proc/sys/net/ipv4/ip_forward)"
@@ -409,10 +424,7 @@ if [ "$MODE" = wireguard ]; then
     ip -n "$CLIENT" link set "$CDEV" mtu 1340 up
     ip -n "$CLIENT" route add default dev "$CDEV"
 else
-    ip -n "$CLIENT" addr add 10.7.0.2/32 dev "$CDEV"
-    ip -n "$CLIENT" link set "$CDEV" mtu 1340 up
-    ip -n "$CLIENT" route add 10.7.0.1/32 dev "$CDEV"
-    ip -n "$CLIENT" route add default via 10.7.0.1 dev "$CDEV"
+    client_link
 fi
 
 start_core "$T/run/ingress.json"
@@ -540,7 +552,7 @@ check "teardown removes the marker and overlay" sh -c "[ ! -e '$T/run/kernel-ing
 if [ "$MODE" = wireguard ]; then
     check "teardown frees the WireGuard port" sh -c "! ss -lun | grep -q ':$WG_PORT '"
 else
-    ip netns del "$CLIENT"; ip netns add "$CLIENT"; ip -n "$CLIENT" link set lo up
+    reset_client
 fi
 
 # 4. A refused step falls back to Xray's WireGuard and cleans up.
@@ -576,11 +588,7 @@ rm -f "$T/run/kernel-ingress.failures"
 
 if [ "$MODE" = wireguard ]; then
     LAB_FAIL=1 cli _ingress-up >/dev/null 2>&1   # Xray's WireGuard again
-    # The same UniFi-side client now handshakes with Xray's own WireGuard
-    # (a fresh peer handshakes at once instead of after its session times out).
-    _server="$(cat "$T/root/etc/wg/wg_public.key")"
-    ip netns exec "$CLIENT" wg set "$CDEV" peer "$_server" remove
-    ip netns exec "$CLIENT" wg set "$CDEV" peer "$_server" endpoint "127.0.0.1:$WG_PORT" allowed-ips 0.0.0.0/0
+    client_link   # the same UniFi-side client now handshakes with Xray's own WireGuard
     start_core "$T/run/ingress.json"
     check "fallback core holds the WireGuard port" wait_listen -lun "127.0.0.1:$WG_PORT"
     check "UDP through Xray's WireGuard" [ "$(client_udp "$ECHO")" = ok ]
@@ -608,23 +616,10 @@ cli _ingress-down >/dev/null 2>&1
 
 # 6. A sing-box core on the same path: a tproxy inbound under its WireGuard
 # endpoint's tag, and that endpoint again when the kernel path is refused.
-client_link() {  # the UniFi side again, after a new _ingress-up
-    if [ "$MODE" = wireguard ]; then
-        # A fresh peer handshakes at once instead of after its session times out.
-        _server="$(cat "$T/root/etc/wg/wg_public.key")"
-        ip netns exec "$CLIENT" wg set "$CDEV" peer "$_server" remove
-        ip netns exec "$CLIENT" wg set "$CDEV" peer "$_server" endpoint "127.0.0.1:$WG_PORT" allowed-ips 0.0.0.0/0
-    elif ip -n "$CLIENT" link show "$CDEV" >/dev/null 2>&1; then
-        ip -n "$CLIENT" addr add 10.7.0.2/32 dev "$CDEV"
-        ip -n "$CLIENT" link set "$CDEV" mtu 1340 up
-        ip -n "$CLIENT" route add 10.7.0.1/32 dev "$CDEV"
-        ip -n "$CLIENT" route add default via 10.7.0.1 dev "$CDEV"
-    fi
-}
 if [ -n "$SB_SRC" ]; then
     info "sing-box: $("$SB_SRC" version | head -n 1)"
     cp "$SB_SRC" "$T/root/bin/sing-box"; chmod 755 "$T/root/bin/sing-box"
-    [ "$MODE" = wireguard ] || { ip netns del "$CLIENT"; ip netns add "$CLIENT"; ip -n "$CLIENT" link set lo up; }
+    [ "$MODE" = wireguard ] || reset_client
     printf 'singbox' > "$T/root/etc/engine"
     # Like mksingbox's config; the proxy is a direct route to loopback.
     python3 - "$T/root/etc/config.json" "$WG_PORT" "$(cat "$T/root/etc/wg/wg_private.key")" \
@@ -676,7 +671,7 @@ PY
     check "sing-box: status reports the kernel path" grep -q '^ingress:   kernel WireGuard -> sing-box' "$T/status.out"
     stop_core
     cli _ingress-down >/dev/null 2>&1
-    [ "$MODE" = wireguard ] || { ip netns del "$CLIENT"; ip netns add "$CLIENT"; ip -n "$CLIENT" link set lo up; }
+    [ "$MODE" = wireguard ] || reset_client
 
     # The unit's hooks in their order: the kernel path (refused), then the guard.
     LAB_FAIL=1 cli _ingress-up > "$T/fallback.log" 2>&1 && cli _fw-lock >> "$T/fallback.log" 2>&1 \

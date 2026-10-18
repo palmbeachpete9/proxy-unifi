@@ -37,7 +37,7 @@ import tempfile
 import unicodedata
 from urllib.parse import urlsplit, unquote, parse_qsl, urlencode, urlunsplit
 from proxylib import (die, display_width, dispatch_subcommand, is_non_public_host,
-                      terminal_emoji_fallback,
+                      terminal_emoji_fallback, b64decode_any, read_text_file,
                       nested_too_deep, xray_outbound_servers,
                       shadowsocks_method_password, shadowsocks_engine,
                       valid_host)
@@ -74,27 +74,11 @@ _BAD = set(range(0x00, 0x20)) | {0x7f} | set(range(0x80, 0xa0)) | {
     0x2060, 0x2066, 0x2067, 0x2068, 0x2069, 0xfeff,
 }
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
-_B64_ALPHABET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_=")
-
-
-def _utf8_stdout():
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
 
 
 def _b64(text):
-    """Decode possibly-unpadded url/standard base64; None on failure."""
-    s = "".join(text.split())
-    if any(ch not in _B64_ALPHABET for ch in s):
-        return None
-    s += "=" * (-len(s) % 4)
-    try:
-        return base64.b64decode(s, altchars=b"-_", validate=True).decode("utf-8", "replace")
-    except Exception:
-        return None
+    """Provider base64 (url or standard, padded or not); None on failure."""
+    return b64decode_any(text, "replace")
 
 
 _CP1252_MOJIBAKE_CHARS = set(
@@ -324,22 +308,11 @@ def _canonical_link(link, parsed, legacy_vmess):
 
 
 def _ss_engine(parsed):
-    """(engine, reason, variant) mirroring direct-import engine routing."""
+    """(engine, reason, variant) mirroring direct-import engine routing. The
+    query's other options are the generator check's to judge (node_from_link)."""
     if parsed is None:
         return "", "unparseable link", ""
-    try:
-        pairs = parse_qsl(parsed.query, keep_blank_values=True)
-    except ValueError:
-        return "", "malformed query string", ""
-    keys = [key for key, _value in pairs]
-    if len(keys) != len(set(keys)):
-        return "", "duplicate query parameter", ""
-    if any(key != "plugin" for key in keys):
-        return "", "unsupported Shadowsocks query parameter", ""
-    plugin = ""
-    for key, value in pairs:
-        if key == "plugin" and value:
-            plugin = value.split(";", 1)[0]
+    plugin = dict(parse_qsl(parsed.query, keep_blank_values=True)).get("plugin", "").split(";", 1)[0]
     method, password = shadowsocks_method_password(parsed)
     if not method or not password:
         return "", "unparseable Shadowsocks credentials", ""
@@ -356,9 +329,7 @@ def _profile_catalog_node(prof, label_hint="", identity_salt="",
     raw_json = json.dumps(prof, ensure_ascii=False, separators=(",", ":"))
     if len(raw_json) > MAX_PROFILE:
         return None
-    identity = dict(prof)
-    canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True,
-                           separators=(",", ":"))
+    canonical = json.dumps(prof, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if identity_salt:
         canonical += "\0" + identity_salt
     remarks = prof.get("remarks")
@@ -557,24 +528,11 @@ def _process_json(text, headers):
     for prof in profiles:
         if len(nodes) >= MAX_NODES:
             break
-        if not isinstance(prof, dict):
+        node = _profile_catalog_node(prof)
+        if node is None or node["id"] in seen:
             continue
-        if nested_too_deep(prof, MAX_JSON_DEPTH):
-            continue
-        raw_json = json.dumps(prof, ensure_ascii=False, separators=(",", ":"))
-        if len(raw_json) > MAX_PROFILE:
-            continue
-        identity = dict(prof)
-        canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True,
-                               separators=(",", ":"))
-        nid = hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()
-        if nid in seen:
-            continue
-        seen.add(nid)
-        label = prof.get("remarks") if isinstance(prof.get("remarks"), str) else ""
-        # classify + count balancer members; reject profiles we can't host
-        nodes.append(dict(_pool_verdict(prof), kind="pool", scheme="json", label=label,
-                          engine="xraypool", id=nid, profile=raw_json))
+        seen.add(node["id"])
+        nodes.append(node)
     for n, nd in enumerate(nodes, 1):
         nd["n"] = n
     if not nodes:
@@ -729,40 +687,34 @@ def _net():
     return _net._m
 
 
-def _public_ips(host, deadline=None):
+def _public_ips(host, deadline):
     """All validated public IPs for host (every resolved address), or die. A
     non-global/special-purpose address anywhere in the result set is rejected
     (CGNAT, private, loopback, link-local, reserved, multicast, etc.)."""
     socket, _ssl, _hc, _t, _uj = _net()
     # PROXY_UNIFI_SUB_ALLOW_PRIVATE=1 disables the SSRF guard (tests only).
     allow_private = os.environ.get("PROXY_UNIFI_SUB_ALLOW_PRIVATE") == "1"
-    if deadline is None:
-        try:
-            infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
-        except Exception as e:
-            die("could not resolve host: %s" % e)
-    else:
-        # getaddrinfo has no portable timeout. Resolve in a daemon thread and
-        # bound how long the fetch waits; a wedged libc resolver cannot hold the
-        # subscription worker past its global deadline.
-        import queue
-        import threading
-        result = queue.Queue(maxsize=1)
+    # getaddrinfo has no portable timeout. Resolve in a daemon thread and
+    # bound how long the fetch waits; a wedged libc resolver cannot hold the
+    # subscription worker past its global deadline.
+    import queue
+    import threading
+    result = queue.Queue(maxsize=1)
 
-        def resolve():
-            try:
-                result.put((socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP), None))
-            except Exception as exc:
-                result.put((None, exc))
-        thread = threading.Thread(target=resolve)
-        thread.daemon = True
-        thread.start()
-        thread.join(_remaining(deadline))
-        if thread.is_alive():
-            die("DNS resolution exceeded the subscription time budget")
-        infos, resolve_error = result.get_nowait()
-        if resolve_error is not None:
-            die("could not resolve host: %s" % resolve_error)
+    def resolve():
+        try:
+            result.put((socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP), None))
+        except Exception as exc:
+            result.put((None, exc))
+    thread = threading.Thread(target=resolve)
+    thread.daemon = True
+    thread.start()
+    thread.join(_remaining(deadline))
+    if thread.is_alive():
+        die("DNS resolution exceeded the subscription time budget")
+    infos, resolve_error = result.get_nowait()
+    if resolve_error is not None:
+        die("could not resolve host: %s" % resolve_error)
     out = []
     seen = set()
     for info in infos:
@@ -968,14 +920,6 @@ def fetch_url(url, hwid, ua):
 
 
 # ---- subcommands ----------------------------------------------------------
-def _read_secret(path):
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return fh.read().strip()
-    except Exception as e:
-        die("could not read %s: %s" % (path, e))
-
-
 def cmd_fetch(args):
     if args.body_file:                         # test hook: skip the network
         with open(args.body_file, "rb") as fh:
@@ -984,10 +928,10 @@ def cmd_fetch(args):
             die("body too large")
         headers = None
     else:
-        url = _read_secret(args.url_file) if args.url_file else args.url
-        if not url:
-            die("fetch needs --url-file/--url (or --body-file)")
-        hwid = _read_secret(args.hwid_file) if args.hwid_file else args.hwid
+        if not args.url_file:
+            die("fetch needs --url-file (or --body-file)")
+        url = read_text_file(args.url_file, "--url-file")
+        hwid = read_text_file(args.hwid_file, "--hwid-file") if args.hwid_file else ""
         # The per-read socket timeouts restart with every byte, so a provider
         # trickling its answer could hold the refresh forever: end it outright.
         import signal
@@ -1009,6 +953,10 @@ def cmd_fetch(args):
 _HEX64 = set("0123456789abcdef")
 
 
+def _is_pool(nd):
+    return nd.get("kind") == "pool" or nd.get("scheme") == "json"
+
+
 def _validate_node(nd):
     """Validate one catalog node's shape, or die. Returns the node."""
     if not isinstance(nd, dict):
@@ -1021,7 +969,7 @@ def _validate_node(nd):
     if not isinstance(nd.get("recognized"), bool):
         die("catalog node has an invalid 'recognized' flag")
     sch = nd.get("scheme")
-    if nd.get("kind") == "pool" or sch == "json":
+    if _is_pool(nd):
         # a JSON balancer/pool profile node: validate it carries raw profile JSON
         prof = nd.get("profile")
         if not isinstance(prof, str) or not prof.strip() or len(prof) > MAX_PROFILE:
@@ -1063,7 +1011,7 @@ def _load(path):
             die("catalog has a duplicate node id")
         seen_n.add(nd["n"])
         seen_id.add(nd["id"])
-        if nd.get("kind") == "pool" or nd.get("scheme") == "json":
+        if _is_pool(nd):
             # A catalog saved by an earlier version may carry stale verdicts.
             try:
                 prof = json.loads(nd["profile"])
@@ -1117,7 +1065,7 @@ def _selection_meta(nd):
         "schema": 1,
         "id": nd.get("id", ""),
         "n": nd.get("n", 0),
-        "kind": "pool" if (nd.get("kind") == "pool" or nd.get("scheme") == "json") else "link",
+        "kind": "pool" if _is_pool(nd) else "link",
         "scheme": scheme,
         "label": nd.get("label", ""),
         "server": nd.get("server", ""),
@@ -1192,7 +1140,7 @@ def cmd_extract(args):
     nd = next((node for node in cat.get("nodes", []) if node.get(key) == value), None)
     if nd is None:
         die("no such node in the subscription")
-    kind = "pool" if (nd.get("kind") == "pool" or nd.get("scheme") == "json") else "link"
+    kind = "pool" if _is_pool(nd) else "link"
     sys.stdout.write("%s\t%s\t%s\t%s\n" % (
         nd.get("id", ""), "1" if nd.get("recognized") else "0",
         clean(nd.get("reason", ""), 60), kind))
@@ -1308,14 +1256,11 @@ def cmd_subs(args):
 
 
 def main():
-    _utf8_stdout()
     ap = argparse.ArgumentParser(description="proxy-unifi subscription helper")
     sub = ap.add_subparsers(dest="cmd")
 
     f = sub.add_parser("fetch")
-    f.add_argument("--url", default="")
     f.add_argument("--url-file", default="")
-    f.add_argument("--hwid", default="")
     f.add_argument("--hwid-file", default="")
     # Happ/Remnawave-style providers return JSON catalogs only to compatible
     # app User-Agents; callers may still override this for other providers.

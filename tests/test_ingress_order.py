@@ -126,7 +126,8 @@ class IngressOrderingTests(unittest.TestCase):
             script = work / "case.sh"
             helpers = "\n".join(function(name) for name in (
                 "_fw_rule", "_input_first", "_fw_jump_first", "_fw_lock_one", "fw_lock",
-                "_ingress_step", "_ingress_rules_ok", "_ingress_rules_add",
+                "_ingress_step", "_ingress_chain_rules", "_ingress_chain_each",
+                "_ingress_rules_ok", "_ingress_rules_add",
             ))
             script.write_text("""set -eu
 INGRESS_PREF=10 INGRESS_VETH=pu-veth0 INGRESS_TABLE=7707

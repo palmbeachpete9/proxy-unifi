@@ -21,6 +21,7 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import sys
 import unicodedata
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -37,6 +38,13 @@ SINGBOX_SS_PLUGINS = ("obfs-local", "simple-obfs", "v2ray-plugin")
 
 
 _UNSAFE_TEXT = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+
+# Provider JSON may not name local files, devices or sockets (Xray profiles and
+# share-link JSON options alike).
+LOCAL_PATH_FIELDS = {"certificateFile", "keyFile", "masterKeyLog", "socketPath",
+                     "unixSocket", "unixSocketPath"}
+PATHLIKE_KEY = re.compile(
+    r"(?:File|FilePath|SocketPath|KeyLog)$|(?:^|_)(?:file|file_path|socket_path|key_log)$")
 
 
 def die(msg):
@@ -56,7 +64,7 @@ def b64_pad(s):
     return s + "=" * (-len(s) % 4)
 
 
-def b64decode_any(s):
+def b64decode_any(s, errors="strict"):
     """Decode url-safe or standard base64, with or without padding; None on failure."""
     s = "".join(s.split())
     if any(ch not in _B64_ALPHABET for ch in s):
@@ -64,7 +72,7 @@ def b64decode_any(s):
     try:
         # altchars accepts URL-safe (-_) and standard (+/) alphabets in one
         # strict decoder pass.
-        return base64.b64decode(b64_pad(s), altchars=b"-_", validate=True).decode("utf-8")
+        return base64.b64decode(b64_pad(s), altchars=b"-_", validate=True).decode("utf-8", errors)
     except Exception:
         return None
 
@@ -98,6 +106,18 @@ def reject_unknown_query(q, allowed):
     unknown = sorted(k for k in q if k not in allowed)
     if unknown:
         die("unsupported query parameter(s): %s" % ", ".join(unknown))
+
+
+def bool_option(value, label):
+    """True/False for 1/true/yes or 0/false/no, None when empty, else die."""
+    if value in (None, ""):
+        return None
+    lowered = str(value).lower()
+    if lowered in ("1", "true", "yes"):
+        return True
+    if lowered in ("0", "false", "no"):
+        return False
+    die("%s must be true/false or 1/0" % label)
 
 
 def qg(q, *names, default=""):
@@ -203,41 +223,14 @@ def valid_host(host):
 
 
 def _legacy_ipv4(host):
-    """Return an IPv4Address for a historical numeric spelling, else None."""
+    """The IPv4Address a historical numeric spelling (2130706433, 0x7f.1, 0177.0.0.1)
+    means to the gateway's resolver, which reads it like inet_aton; else None."""
     value = host.rstrip(".")
-    if not value or ":" in value:
-        return None
-    parts = value.split(".")
-    if len(parts) > 4 or any(part == "" for part in parts):
+    if not value or not all(ch.isalnum() or ch == "." for ch in value):
         return None
     try:
-        def parse_part(part):
-            if part.lower().startswith("0x"):
-                return int(part[2:], 16)
-            if len(part) > 1 and part.startswith("0"):
-                return int(part, 8)
-            return int(part, 10)
-        numbers = [parse_part(part) for part in parts]
-    except ValueError:
-        return None
-    if any(number < 0 for number in numbers):
-        return None
-    try:
-        if len(numbers) == 1:
-            number = numbers[0]
-        else:
-            widths = (8, 8, 8, 8)
-            if any(number >= 1 << width for number, width in zip(numbers[:-1], widths)):
-                return None
-            remaining = 32 - 8 * (len(numbers) - 1)
-            if numbers[-1] >= 1 << remaining:
-                return None
-            number = 0
-            for item in numbers[:-1]:
-                number = (number << 8) | item
-            number = (number << remaining) | numbers[-1]
-        return ipaddress.IPv4Address(number)
-    except ipaddress.AddressValueError:
+        return ipaddress.IPv4Address(socket.inet_aton(value))
+    except (OSError, ValueError):
         return None
 
 
@@ -451,23 +444,13 @@ def shadowsocks_credentials(link):
     return parsed, method, password, valid_host(host), safe_port(port)
 
 
-def _read_text_file(path, label):
+def read_text_file(path, label):
+    """A small text file's stripped content, or die."""
     try:
         with open(path, "r", encoding="utf-8") as fh:
             return fh.read().strip()
     except Exception as e:
         die("could not read %s: %s" % (label, e))
-
-
-def apply_secret_files(args):
-    """Load individual secret fields from files when those flags are present."""
-    for attr, file_attr, label in (
-            ("link", "link_file", "--link-file"),
-            ("secret_key", "secret_key_file", "--secret-key-file"),
-            ("peer_pubkey", "peer_pubkey_file", "--peer-pubkey-file")):
-        path = getattr(args, file_attr, "")
-        if path:
-            setattr(args, attr, _read_text_file(path, label))
 
 
 def add_secret_file_arguments(parser):
@@ -479,7 +462,12 @@ def add_secret_file_arguments(parser):
 
 
 def load_generator_inputs(args):
-    apply_secret_files(args)
+    """Load the secret fields from their files (when given), and require a link."""
+    for attr, label in (("link", "--link-file"), ("secret_key", "--secret-key-file"),
+                        ("peer_pubkey", "--peer-pubkey-file")):
+        path = getattr(args, attr + "_file", "")
+        if path:
+            setattr(args, attr, read_text_file(path, label))
     if not args.link:
         die("no link provided (use --link or --link-file)")
 

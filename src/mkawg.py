@@ -38,43 +38,14 @@ PROFILE_ID_RE = re.compile(
 HEADER_RE = re.compile(r"^(0|[1-9][0-9]*)(?:-(0|[1-9][0-9]*))?$")
 TAG_RE = re.compile(r"<([^<>]*)>")
 
-INTERFACE_KEYS = {
-    "privatekey": "private_key",
-    "address": "address",
-    "dns": "dns",
-    "mtu": "mtu",
-    "listenport": "listen_port",
-    "jc": "jc",
-    "jmin": "jmin",
-    "jmax": "jmax",
-    "s1": "s1",
-    "s2": "s2",
-    "s3": "s3",
-    "s4": "s4",
-    "h1": "h1",
-    "h2": "h2",
-    "h3": "h3",
-    "h4": "h4",
-    "i1": "i1",
-    "i2": "i2",
-    "i3": "i3",
-    "i4": "i4",
-    "i5": "i5",
-    # AWG 3.0
-    "headerprotectionkey": "header_protection_key",
-    "contentpaddingaddition": "content_padding_addition",
-    "rekeyaftertime": "rekey_after_time",
-    "rekeytimeout": "rekey_timeout",
-    "rejectaftertime": "reject_after_time",
-    "keepalivetimeout": "keepalive_timeout",
-    "maxhandshakeattempts": "max_handshake_attempts",
-    # AWG 3.1
-    "randomtrailers": "random_trailers",
-    "disablecookies": "disable_cookies",
-}
 AWG3_RANGES = ("content_padding_addition", "rekey_after_time", "rekey_timeout",
                "reject_after_time", "keepalive_timeout", "max_handshake_attempts")
 AWG31_FLAGS = ("random_trailers", "disable_cookies")
+# A config key in lower case ("rekeyaftertime") -> its field ("rekey_after_time").
+INTERFACE_KEYS = {key.replace("_", ""): key for key in (
+    "private_key", "address", "dns", "mtu", "listen_port", "jc", "jmin", "jmax",
+    "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4", "i5",
+    "header_protection_key") + AWG3_RANGES + AWG31_FLAGS}
 # amneziawg-go uses the first 12 bytes of every S1-S4 padding as the header
 # protection nonce and refuses to start with a shorter padding.
 HEADER_NONCE_BYTES = 12
@@ -349,39 +320,20 @@ def _endpoint(value):
     return host, core_host, port
 
 
-def _prefixes(value, label, required=True, maximum=MAX_INTERFACE_ADDRESSES):
+def _prefixes(value, label, maximum=MAX_INTERFACE_ADDRESSES, parse=ipaddress.ip_interface):
     result = []
     for item in (value or "").split(","):
         item = item.strip()
         if not item:
             continue
         try:
-            interface = ipaddress.ip_interface(item)
+            result.append(str(parse(item)))
         except ValueError:
             fail("%s contains invalid address/prefix %s" % (label, item))
-        result.append(str(interface))
         if len(result) > maximum:
             fail("%s has too many entries (maximum %d)" % (label, maximum))
-    if required and not result:
-        fail("%s is required" % label)
-    return result
-
-
-def _allowed_prefixes(value):
-    result = []
-    for item in (value or "").split(","):
-        item = item.strip()
-        if not item:
-            continue
-        try:
-            result.append(str(ipaddress.ip_network(item, strict=False)))
-        except ValueError:
-            fail("Peer AllowedIPs contains invalid prefix %s" % item)
-        if len(result) > MAX_ALLOWED_IPS:
-            fail("Peer AllowedIPs has too many entries (maximum %d)" %
-                 MAX_ALLOWED_IPS)
     if not result:
-        fail("Peer AllowedIPs is required")
+        fail("%s is required" % label)
     return result
 
 
@@ -414,15 +366,8 @@ def load_profile(path):
         "jmin": _integer(raw_interface.get("jmin"), "Jmin", 0, MAX_CPS_PACKET),
         "jmax": _integer(raw_interface.get("jmax"), "Jmax", 0, MAX_CPS_PACKET),
     }
-    for number in range(1, 5):
-        if number == 1:
-            maximum = MAX_CPS_PACKET - 148
-        elif number == 2:
-            maximum = MAX_CPS_PACKET - 92
-        elif number == 3:
-            maximum = MAX_CPS_PACKET - 64
-        else:
-            maximum = MAX_CPS_PACKET - interface["mtu"] - 32
+    for number, overhead in enumerate((148, 92, 64, interface["mtu"] + 32), 1):
+        maximum = MAX_CPS_PACKET - overhead
         interface["s%d" % number] = _integer(
             raw_interface.get("s%d" % number), "S%d" % number, 0, maximum)
 
@@ -446,12 +391,8 @@ def load_profile(path):
             if not (first[2] < second[1] or second[2] < first[1]):
                 fail("H1-H4 ranges must not overlap")
 
-    cps_sizes = []
     for number in range(1, 6):
-        value, size = _cps(raw_interface.get("i%d" % number), "I%d" % number)
-        interface["i%d" % number] = value
-        cps_sizes.append(size)
-    interface["cps_sizes"] = cps_sizes
+        interface["i%d" % number] = _cps(raw_interface.get("i%d" % number), "I%d" % number)[0]
 
     interface["header_protection_key"] = _strict_key(
         raw_interface.get("header_protection_key", ""), "HeaderProtectionKey",
@@ -461,18 +402,14 @@ def load_profile(path):
             if interface["s%d" % number] < HEADER_NONCE_BYTES:
                 fail("HeaderProtectionKey requires S1-S4 to be at least %d" %
                      HEADER_NONCE_BYTES)
-    labels = {"content_padding_addition": "ContentPaddingAddition",
-              "rekey_after_time": "RekeyAfterTime", "rekey_timeout": "RekeyTimeout",
-              "reject_after_time": "RejectAfterTime",
-              "keepalive_timeout": "KeepaliveTimeout",
-              "max_handshake_attempts": "MaxHandshakeAttempts",
-              "random_trailers": "RandomTrailers", "disable_cookies": "DisableCookies"}
+    def label(key):   # "rekey_after_time" -> "RekeyAfterTime"
+        return "".join(word.title() for word in key.split("_"))
     # awg-tools stores these AWG 3 values as 16-bit ranges.
     for key in AWG3_RANGES:
-        parsed = _range(raw_interface.get(key), labels[key], 0xFFFF)
+        parsed = _range(raw_interface.get(key), label(key), 0xFFFF)
         interface[key] = parsed[0] if parsed else ""
     for key in AWG31_FLAGS:
-        interface[key] = _flag(raw_interface.get(key), labels[key])
+        interface[key] = _flag(raw_interface.get(key), label(key))
 
     peers = []
     public_keys = set()
@@ -489,7 +426,8 @@ def load_profile(path):
             "preshared_key": _strict_key(raw.get("preshared_key", ""),
                                          "Peer %d PresharedKey" % index,
                                          allow_empty=True),
-            "allowed_ips": _allowed_prefixes(raw.get("allowed_ips")),
+            "allowed_ips": _prefixes(raw.get("allowed_ips"), "Peer AllowedIPs", MAX_ALLOWED_IPS,
+                                     lambda item: ipaddress.ip_network(item, strict=False)),
             "host": host,
             "core_host": core_host,
             "port": port,
@@ -608,7 +546,6 @@ def _display(value, maximum=80):
     value = unicodedata.normalize("NFC", value)
     value = "".join("" if _unsafe_text_char(ch) else ch
                     for ch in value)
-    value = " ".join(value.split())
     if os.environ.get("PROXY_UNIFI_TERMINAL_SAFE_EMOJI") == "1":
         value = terminal_emoji_fallback(value)
     value = " ".join(value.split())

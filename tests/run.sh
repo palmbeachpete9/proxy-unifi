@@ -219,7 +219,7 @@ PY
     {
         echo "ABIN='$_aw/amnezia-box'; AWG_CORE_VERSION=1.1.0"
         echo 'fatal() { exit 1; }; cmd_install_awg() { return 1; }'
-        sed -n '/^_awg_version_ok() {/,/^}/p; /^ensure_awg() {/,/^}/p' "$SRC/proxy-unifi"
+        fn_src _awg_version_ok ensure_awg
         echo 'ensure_awg'
     } > "$_aw/e.sh"
     if sh "$_aw/e.sh" 2>/dev/null; then bad "a failed AmneziaWG update rejects the older core"
@@ -235,7 +235,7 @@ INGRESS=kernel
 systemctl() { :; }; sub_any() { return 1; }; fw_reconcile() { :; }; write_fallback_timer() { :; }
 write_service() { echo "$INGRESS" > "$SERVICE_FILE"; }
 SH
-        sed -n '/^_uint() {/p; /^_in_range() {/p; /^load_settings() {/,/^}/p; /^restore_runtime_state() {/,/^}/p' "$SRC/proxy-unifi"
+        fn_src _uint _in_range load_settings restore_runtime_state
         # shellcheck disable=SC2016 # expands in the generated script
         echo 'mkdir -p "$1/s"; : > "$1/s/runtime-state"; restore_runtime_state "$1/s"; cat "$SERVICE_FILE"'
     } > "$_rr/r.sh"
@@ -250,7 +250,7 @@ SH
         echo '_uint() { case "$1" in ""|*[!0-9]*) return 1;; *) return 0;; esac; }'
         echo 'SUB_USER_AGENT_DEFAULT="Happ/2.0"'
         echo 'SUB_USER_AGENT_LEGACY_DEFAULT="proxy-unifi/1.1"'
-        sed -n '/^load_settings() {/,/^}/p' "$SRC/proxy-unifi"
+        fn_src load_settings
     } > "$_ud/ua-lib.sh"
     cat > "$_ud/ua-check.sh" <<'SH'
 . "$1"
@@ -275,8 +275,8 @@ PY
 
     _ed="$(mktemp -d)"
     {
-        sed -n '/^wg_endpoint() {/,/^}/p' "$SRC/proxy-unifi"
-        sed -n '/^format_endpoint() {/,/^}/p' "$SRC/proxy-unifi"
+        fn_src wg_endpoint
+        fn_src format_endpoint
         cat <<'SH'
 WG_LISTEN="127.0.0.1"; WG_PORT="51821"
 [ "$(wg_endpoint)" = "127.0.0.1:51821" ] || exit 1
@@ -290,7 +290,7 @@ SH
     else bad "CLI WireGuard endpoint formats IPv6"; fi
     rm -rf "$_ed"
 
-    _ping_proxy="$(sed -n '/^_probe_start() {/,/^}/p;/^ping_proxy() {/,/^}/p' "$SRC/proxy-unifi")"
+    _ping_proxy="$(fn_src _probe_start ping_proxy)"
     # shellcheck disable=SC2016 # Match literal variables in the extracted source.
     if printf '%s\n' "$_ping_proxy" | grep -Fq '_proxy_scheme="socks5h"' \
        && printf '%s\n' "$_ping_proxy" | grep -Fq '_proxy_scheme="socks5"' \
@@ -301,9 +301,9 @@ SH
     {
         echo 'py() { python3 "$@"; }'
         sed -n 's/^AWG_CORE_VERSION="\([^"]*\)"/AWG_CORE_VERSION="\1"/p' "$SRC/proxy-unifi"
-        sed -n '/^xray_min_safe_sha256() {/,/^}/p' "$SRC/proxy-unifi"
-        sed -n '/^awg_core_sha256() {/,/^}/p' "$SRC/proxy-unifi"
-        sed -n '/^xray_tag_at_least() {/,/^}/p' "$SRC/proxy-unifi"
+        fn_src xray_min_safe_sha256
+        fn_src awg_core_sha256
+        fn_src xray_tag_at_least
         cat <<'SH'
 [ "$(xray_min_safe_sha256 64)" = aa11c3685c71da0ffc71e511db50404609e7e963bb914b048f59a6a00af8930e ]
 [ "$(xray_min_safe_sha256 arm64-v8a)" = 89cfe01674d7c9f6847b7dd9389537be9acb3b9dc3c6cb9fdeba87a3e4e57fc1 ]
@@ -364,7 +364,7 @@ current_engine() { echo xray; }
 info() { :; }; err() { :; }; c_grn() { :; }
 core_version() { "$1" version | head -1; }
 SH
-    sed -n '/^safe_untar() {/,/^}/p; /^cmd_install_awg() {/,/^}/p' "$SRC/proxy-unifi" >> "$_ad/install-awg.sh"
+    fn_src safe_untar _swap_core _install_core cmd_install_awg >> "$_ad/install-awg.sh"
     cat >> "$_ad/install-awg.sh" <<'SH'
 cmd_install_awg
 [ -x "$ABIN" ]
@@ -565,7 +565,7 @@ cpu_count() { echo "${NCPU:-4}"; }
 SH
     {
         sed -n '/^CORE_GO[A-Z]*=/p' "$SRC/proxy-unifi"
-        sed -n '/^core_gomaxprocs() {/,/^}/p' "$SRC/proxy-unifi"
+        fn_src core_gomaxprocs
         awk '/^write_service\(\) \{/,/^}/' "$SRC/proxy-unifi"
         echo 'write_service'
     } >> "$_ud/h.sh"
@@ -595,7 +595,7 @@ systemctl() { printf 'MainPID=42\nActiveState=active\n'; }
 ingress_active() { return 1; }
 ss() { echo 'UNCONN 0  0   0.0.0.0:51821  0.0.0.0:*  users:(("sing-box",pid=42,fd=8))'; }
 SH
-        sed -n '/^health_why() {/,/^}/p' "$SRC/proxy-unifi"
+        fn_src health_why
         echo 'health_why'
     } > "$_ud/why.sh"
     [ "$(sh "$_ud/why.sh")" = 'MainPID=42 ActiveState=active UDP 51821: UNCONN 0 0 0.0.0.0:51821 0.0.0.0:* users:(("sing-box",pid=42,fd=8)); kernel ingress off' ] \
@@ -605,7 +605,7 @@ SH
     {
         printf '_cfg=%s\n' "$_ud/ping.json"
         echo 'err() { echo "error: $*"; }; _ping_cleanup() { :; }'
-        sed -n '/^_probe_fail() {/,/^}/p' "$SRC/proxy-unifi"
+        fn_src _probe_fail
         echo '_probe_fail "could not build test config"'
     } > "$_ud/pf.sh"
     printf 'mksingbox: error: unsupported cipher\n' > "$_ud/ping.json.err"
@@ -653,7 +653,7 @@ ExecStopPost=-+/b/proxy-unifi _fw-unlock' ] || _ki_ok=0
     # shellcheck disable=SC2016 # $NCPU and $c expand in the generated script
     {
         echo 'cpu_count() { echo "$NCPU"; }'
-        sed -n '/^core_gomaxprocs() {/,/^}/p' "$SRC/proxy-unifi"
+        fn_src core_gomaxprocs
         echo 'for c in 1:1 2:2 3:2 4:3 8:7; do [ "$(NCPU=${c%:*} core_gomaxprocs)" = "${c#*:}" ] || exit 1; done'
     } > "$_ud/procs.sh"
     sh "$_ud/procs.sh" || _cpu_ok=0
@@ -1159,10 +1159,10 @@ def link(method,password,query=""):
 k16,k32=key(16),key(32)
 standard=link("2022-blake3-aes-128-gcm",k16)
 compat=link("2022-blake3-aes-128-gcm",k32)
-assert mkxray.ss_engine(standard)=="singbox"
-assert mkxray.ss_engine(compat)=="xray"
-assert mkxray.ss_engine(link("aes-256-gcm","password"))=="xray"
-assert mkxray.ss_engine(link("aes-256-gcm","password","?plugin=obfs-local"))=="singbox"
+assert mkxray.ss_info(standard)[0]=="singbox"
+assert mkxray.ss_info(compat)[0]=="xray"
+assert mkxray.ss_info(link("aes-256-gcm","password"))[0]=="xray"
+assert mkxray.ss_info(link("aes-256-gcm","password","?plugin=obfs-local"))[0]=="singbox"
 out,_,_=mksingbox.parse_ss(standard)
 assert out["method"]=="2022-blake3-aes-128-gcm" and "multiplex" not in out
 assert out["password"]==k16
@@ -1234,7 +1234,9 @@ compat=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",k32))
 assert compat["recognized"] and compat["engine"]=="xray" and "compatibility" in compat["reason"], compat
 bad=mksub.node_from_link(sslink("2022-blake3-aes-256-gcm",k16))
 assert not bad["recognized"] and "32 bytes" in bad["reason"], bad
-unknown=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",k16,"?uot=1"))
+uot=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",k16,"?uot=1"))
+assert uot["recognized"], uot
+unknown=mksub.node_from_link(sslink("2022-blake3-aes-128-gcm",k16,"?foo=1"))
 assert not unknown["recognized"] and "query parameter" in unknown["reason"], unknown
 with tempfile.TemporaryDirectory() as directory:
     path=os.path.join(directory,"catalog.json")
@@ -1425,8 +1427,9 @@ ss_private = "ss://" + base64.b64encode(b"aes-256-gcm:pw@192.168.1.3:8388").deco
 assert mksub.node_from_link(vm_private)["recognized"] is False
 assert mksub.node_from_link(ss_private)["recognized"] is False
 # Historical numeric IPv4 spellings must not bypass the shared non-public-target guard.
-for host in ("2130706433", "0x7f000001", "0177.0.0.1", "127.1"):
+for host in ("2130706433", "0x7f000001", "0177.0.0.1", "127.1", "0x7f.1", "127.0.1", "017700000001", "10.0x10.1"):
     assert mksub.node_from_link("vless://u@%s:443#x" % host)["recognized"] is False, host
+assert mksub.node_from_link("vless://u@134744072:443#x")["recognized"] is True   # 8.8.8.8
 # Xray Trojan/SS profile shapes use settings.servers and must classify correctly
 for proto in ("trojan", "shadowsocks"):
     shape={"inbounds":[{"protocol":"socks","settings":{}}],"outbounds":[{"protocol":proto,"tag":"proxy","settings":{"servers":[{"address":"public.example","port":443}]}}]}
@@ -1451,7 +1454,7 @@ import socket
 g = socket.getaddrinfo
 socket.getaddrinfo = lambda *a, **k: [(2,1,6,"",("100.64.0.1",443))]
 try:
-    mksub._public_ips("x"); raise AssertionError("CGNAT allowed")
+    mksub._public_ips("x", __import__("time").monotonic() + 5); raise AssertionError("CGNAT allowed")
 except SystemExit:
     pass
 finally:
@@ -1864,10 +1867,12 @@ PY
     # A provider that answers slowly enough never trips a per-read timeout; the
     # whole fetch still ends at its deadline instead of hanging the refresh.
     py_case "subscription fetch ends at its deadline" "$SRC" <<'PY'
-import subprocess, sys, time
+import subprocess, sys, tempfile, time
+url = tempfile.NamedTemporaryFile("w", suffix=".url", delete=False)
+url.write("https://x.example/"); url.close()
 code = ("import sys, time; sys.path.insert(0, %r); import mksub; mksub.DEADLINE = 1; "
         "mksub.fetch_url = lambda *a: time.sleep(30); "
-        "sys.argv = ['mksub.py', 'fetch', '--url', 'https://x.example/']; mksub.main()" % sys.argv[1])
+        "sys.argv = ['mksub.py', 'fetch', '--url-file', %r]; mksub.main()" % (sys.argv[1], url.name))
 start = time.time()
 done = subprocess.run([sys.executable, "-c", code], stderr=subprocess.PIPE, timeout=25)
 assert time.time() - start < 6 and done.returncode != 0, (time.time() - start, done)
@@ -2696,14 +2701,10 @@ PY
     else bad "xray loads the kernel ingress overlay (link and pool)"; fi
     # sing-box: the kernel-mode config swaps the WireGuard endpoint for a tproxy
     # inbound under its tag, and sing-box accepts it.
-    {
-        echo 'py() { python3 "$@"; }'
-        echo 'INGRESS_HOST_IP=169.254.77.1; INGRESS_PORT=41820'
-        fn_src ingress_singbox_for
-    } > "$_d/sb-kernel.sh"
+    fn_src ingress_singbox_for >> "$_d/overlay.sh"
     # shellcheck disable=SC2016 # $1-$3 expand inside the child shell.
     if gs "hysteria2://pw@h:443?sni=h" \
-       && sh -c '. "$1"; ingress_singbox_for "$2" > "$3"' sh "$_d/sb-kernel.sh" "$_d/s.json" "$_d/sb-kernel.json" \
+       && sh -c '. "$1"; ingress_singbox_for "$2" > "$3"' sh "$_d/overlay.sh" "$_d/s.json" "$_d/sb-kernel.json" \
        && "$SG" check -c "$_d/sb-kernel.json" >/dev/null 2>&1 \
        && python3 - "$_d/s.json" "$_d/sb-kernel.json" <<'PY'
 import json, sys
@@ -2805,10 +2806,10 @@ ensure_run_dir() { :; }
 ensure_service_user() { SERVICE_USER="$(id -un)"; SERVICE_GROUP="$(id -gn)"; }
 chown() { :; }   # the CLI hands the run dir to root; CI does not run as root
 SH
-        sed -n '/^py_bin() {/,/^}/p; /^_free_port() {/,/^}/p; /^_ping_cleanup() {/,/^}/p' "$SRC/proxy-unifi"
+        fn_src py_bin _free_port _ping_cleanup
         sed -n '/^_socket_listening() {/,/^tcp_socket_listening()/p; /^_probe_start() {/,/^}/p' "$SRC/proxy-unifi"
-        sed -n '/^_ms_from_seconds() {/,/^}/p; /^ping_proxy() {/,/^}/p; /^_http_probe() {/,/^}/p' "$SRC/proxy-unifi"
-        sed -n '/^service_healthy() {/,/^}/p; /^socket_owned_by_pid() {/,/^}/p; /^ingress_active() {/p' "$SRC/proxy-unifi"
+        fn_src _ms_from_seconds ping_proxy _http_probe
+        fn_src service_healthy socket_owned_by_pid ingress_active
     } > "$_pd/lib.sh"
     {
         cat "$_pd/lib.sh"
@@ -2941,7 +2942,7 @@ s = h.HTTPServer(("127.0.0.1", 0), R); print(s.server_port, flush=True); s.serve
     _r="$(sh -c '. "$1"; _bench_run 2 "$2"' sh "$_bd/bench-lib.sh" "http://127.0.0.1:$(cat "$_bd/429.port")/")"
     kill "$_rl_pid" 2>/dev/null; wait "$_rl_pid" 2>/dev/null
     { printf '%s\n' "$_r" | awk 'NF == 4 && $1 == 0 && $4 == 429 { found=1 } END { exit !found }' \
-        && _bench_why="$(sed -n '/^_bench_refusal() {/,/^}/p' "$SRC/proxy-unifi" | { cat; echo '_bench_refusal 429 x'; } | sh)" \
+        && _bench_why="$(fn_src _bench_refusal | { cat; echo '_bench_refusal 429 x'; } | sh)" \
         && [ "$_bench_why" = "the target answered HTTP 429: rate-limited; try again later or pass another URL" ]; } \
         && ok "bench names a target's refusal" || bad "bench names a target's refusal (got: $_r / ${_bench_why:-})"
     rm -rf "$_bd"

@@ -103,8 +103,8 @@ class XrayLinks(unittest.TestCase):
 
     def test_engine_choice_accepts_tfo(self):
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(mkxray.ss_engine("ss://%s@example.com:8388?tfo=1" % SS22), "singbox")
-            self.assertEqual(mkxray.ss_engine("ss://%s@example.com:8388?tfo=1" % SS_LEGACY), "xray")
+            self.assertEqual(mkxray.ss_info("ss://%s@example.com:8388?tfo=1" % SS22)[0], "singbox")
+            self.assertEqual(mkxray.ss_info("ss://%s@example.com:8388?tfo=1" % SS_LEGACY)[0], "xray")
 
 
 class SubscriptionVerdicts(unittest.TestCase):
@@ -114,11 +114,17 @@ class SubscriptionVerdicts(unittest.TestCase):
             "hysteria2://pw@example.com:20000-30000?sni=example.com#hopping",
             "hysteria2://pw@example.com:443?pinSHA256=ab#pinned",
             "vless://%s@example.com:443?security=tls&tfo=1#vless" % UUID,
+            "ss://%s@example.com:8388?tfo=1&uot=1#ss22" % SS22,
+            "ss://%s@example.com:8388?fastopen=1#legacy" % SS_LEGACY,
+            "ss://%s@example.com:8388?tfo=maybe#bad-tfo" % SS22,
         )).encode()
         nodes = {n["label"]: n for n in mksub.process_body(feed)["nodes"]}
         self.assertTrue(nodes["tfo"]["recognized"], nodes["tfo"])
         self.assertTrue(nodes["hopping"]["recognized"], nodes["hopping"])
         self.assertTrue(nodes["vless"]["recognized"], nodes["vless"])
+        self.assertTrue(nodes["ss22"]["recognized"], nodes["ss22"])
+        self.assertTrue(nodes["legacy"]["recognized"], nodes["legacy"])
+        self.assertIn("true/false", nodes["bad-tfo"]["reason"])
         self.assertFalse(nodes["pinned"]["recognized"])
         self.assertIn("pinSHA256", nodes["pinned"]["reason"])
 

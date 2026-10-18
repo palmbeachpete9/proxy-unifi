@@ -21,7 +21,8 @@ from urllib.parse import unquote
 from proxylib import (die, flat_query, qg, safe_urlsplit, host_port, safe_port,
                       split_port_list, valid_host, reject_unknown_query, shadowsocks_credentials,
                       add_secret_file_arguments, load_generator_inputs,
-                      handle_common_generator_modes, shadowsocks_engine)
+                      handle_common_generator_modes, shadowsocks_engine,
+                      bool_option as _bool_value)
 
 
 _TLS_QUERY = {"sni", "peer", "alpn", "insecure", "allowInsecure",
@@ -29,17 +30,6 @@ _TLS_QUERY = {"sni", "peer", "alpn", "insecure", "allowInsecure",
 # TCP Fast Open. Hysteria2 and TUIC run over QUIC (UDP), where it means nothing,
 # so their links may carry it and it is not used.
 _TFO_QUERY = {"tfo", "fastopen"}
-
-
-def _bool_value(value, label):
-    if value in (None, ""):
-        return None
-    lowered = str(value).lower()
-    if lowered in ("1", "true", "yes"):
-        return True
-    if lowered in ("0", "false", "no"):
-        return False
-    die("%s must be true/false or 1/0" % label)
 
 
 def _tls(sni, q, default_alpn=None):
@@ -81,12 +71,6 @@ def _whole_number(value, label, low, high, unit=""):
     return int(match.group(1))
 
 
-def plugin_alias(name):
-    if name in ("simple-obfs", "obfs-local"):
-        return "obfs-local"
-    return name
-
-
 # --------------------------------------------------------------------------
 # Per-protocol outbound builders -> (outbound dict, host, port)
 # --------------------------------------------------------------------------
@@ -110,7 +94,7 @@ def parse_ss(link):
     out = {"type": "shadowsocks", "tag": "proxy", "server": host,
            "server_port": port, "method": method, "password": password}
     if name:
-        out["plugin"] = plugin_alias(name)
+        out["plugin"] = "obfs-local" if name == "simple-obfs" else name
         out["plugin_opts"] = opts
     if _bool_value(qg(query, "tfo", "fastopen"), "TCP Fast Open option"):
         out["tcp_fast_open"] = True
@@ -164,10 +148,10 @@ def parse_hysteria2(link):
         obfs_type = ""
     if bool(obfs_type) != bool(obfs_pw):
         die("hysteria2 obfs requires both type and password")
-    if obfs_type and obfs_pw:
+    if obfs_type:
         # sing-box only implements 'salamander'; reject any other requested type
         # rather than silently substituting it.
-        if obfs_type not in ("salamander",):
+        if obfs_type != "salamander":
             die("hysteria2 obfs type '%s' is not supported (only salamander)" % obfs_type)
         out["obfs"] = {"type": "salamander", "password": obfs_pw}
     return out, host, port
