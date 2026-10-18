@@ -460,6 +460,30 @@ SH
     grep -q '^ExecStartPre=-+/b/proxy-unifi _fw-unlock$' "$_ud/unit" || _fw_ok=0
     grep -q '_fw-lock' "$_ud/unit" && _fw_ok=0          # xray must NOT lock a port
     [ "$_fw_ok" = 1 ] && ok "singbox/AWG WG port firewalled (unit)" || bad "singbox/AWG WG port firewalled (unit)"
+    # A failed start says what the health check saw.
+    {
+        cat <<'SH'
+set -eu; SERVICE_NAME=proxy-unifi; WG_PORT=51821
+systemctl() { printf 'MainPID=42\nActiveState=active\n'; }
+ss() { echo 'UNCONN 0  0   0.0.0.0:51821  0.0.0.0:*  users:(("sing-box",pid=42,fd=8))'; }
+SH
+        sed -n '/^health_why() {/,/^}/p' "$SRC/proxy-unifi"
+        echo 'health_why'
+    } > "$_ud/why.sh"
+    [ "$(sh "$_ud/why.sh")" = 'MainPID=42 ActiveState=active UDP 51821: UNCONN 0 0 0.0.0.0:51821 0.0.0.0:* users:(("sing-box",pid=42,fd=8))' ] \
+        && ok "a failed start reports what the health check saw" \
+        || bad "a failed start reports what the health check saw (got: $(sh "$_ud/why.sh" 2>&1))"
+    # A test core whose config the generator refused says why.
+    {
+        printf '_cfg=%s\n' "$_ud/ping.json"
+        echo 'err() { echo "error: $*"; }; _ping_cleanup() { :; }'
+        sed -n '/^_probe_fail() {/,/^}/p' "$SRC/proxy-unifi"
+        echo '_probe_fail "could not build test config"'
+    } > "$_ud/pf.sh"
+    printf 'mksingbox: error: unsupported cipher\n' > "$_ud/ping.json.err"
+    [ "$(sh "$_ud/pf.sh")" = "error: could not build test config (unsupported cipher)" ] \
+        && ok "a refused test config names the generator's reason" \
+        || bad "a refused test config names the generator's reason (got: $(sh "$_ud/pf.sh" 2>&1))"
     rm -rf "$_ud"
 
     # Exercise firewall ownership and IPv6 fail-closed behavior against a stateful

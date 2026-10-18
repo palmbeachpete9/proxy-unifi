@@ -1734,7 +1734,15 @@ restart_service() {
         fi
         _i=$((_i + 1)); sleep 0.25 2>/dev/null || sleep 1
     done
+    err "health check: $(health_why)"
     return 1
+}
+
+# What the health check saw, for the error a failed start ends with.
+health_why() {
+    _hw_unit="$(systemctl show -p ActiveState -p MainPID "$SERVICE_NAME" 2>/dev/null | tr '\n' ' ')"
+    _hw_port="$(ss -lunp 2>/dev/null | awk -v p=":$WG_PORT" 'index($0, p) { $1 = $1; print }' | head -n 2 | paste -sd '|' -)"
+    echo "${_hw_unit}UDP $WG_PORT: ${_hw_port:-no listener}"
 }
 
 restart_if_previously_active() {
@@ -1993,8 +2001,15 @@ _free_port() {
 
 _ping_cleanup() {
     [ -n "${_pid:-}" ] && { kill "$_pid" 2>/dev/null || true; wait "$_pid" 2>/dev/null || true; }
-    [ -n "${_cfg:-}" ] && rm -f "$_cfg"
+    [ -n "${_cfg:-}" ] && rm -f "$_cfg" "$_cfg.err"
     _pid=""; _cfg=""; BG_PID=""
+}
+
+# A test config the generator refused: say why, with its first error line.
+_probe_fail() {   # <message>
+    _pf=""; IFS= read -r _pf < "$_cfg.err" 2>/dev/null || true
+    err "$1${_pf:+ (${_pf#*error: })}"
+    _ping_cleanup
 }
 
 ping_proxy() {   # $1 = get|head
@@ -2009,8 +2024,8 @@ ping_proxy() {   # $1 = get|head
         # inbound so we measure latency through the same balancer xray uses live.
         [ -x "$XRAY" ] || { err "xray binary not installed"; _ping_cleanup; return 1; }
         [ -f "$POOL_SRC" ] || { err "no pool profile on disk"; _ping_cleanup; return 1; }
-        py "$MKJSON" socksconfig --profile "$POOL_SRC" --socks-port "$_port" > "$_cfg" 2>/dev/null \
-            || { err "could not build test config"; _ping_cleanup; return 1; }
+        py "$MKJSON" socksconfig --profile "$POOL_SRC" --socks-port "$_port" > "$_cfg" 2>"$_cfg.err" \
+            || { _probe_fail "could not build test config"; return 1; }
         set -- "$XRAY" run -config "$_cfg" -format json
     elif [ "$_e" = "awg" ]; then
         [ -x "$ABIN" ] || { err "AmneziaWG core not installed"; _ping_cleanup; return 1; }
@@ -2020,18 +2035,18 @@ ping_proxy() {   # $1 = get|head
         # test URL on the gateway, then carry the resulting connection over AWG.
         _proxy_scheme="socks5"
         py "$MKAWG" build --file "$_awg_profile" --socks-port "$_port" \
-            --loglevel "$(sb_loglevel)" > "$_cfg" 2>/dev/null \
-            || { err "could not build AmneziaWG test config"; _ping_cleanup; return 1; }
+            --loglevel "$(sb_loglevel)" > "$_cfg" 2>"$_cfg.err" \
+            || { _probe_fail "could not build AmneziaWG test config"; return 1; }
         set -- "$ABIN" run -c "$_cfg"
     elif [ "$_e" = "singbox" ]; then
         [ -x "$SBIN" ] || { err "sing-box not installed"; _ping_cleanup; return 1; }
-        py "$MKSB" --link-file "$OUTBOUND_LINK" --socks-port "$_port" > "$_cfg" 2>/dev/null \
-            || { err "could not build test config"; _ping_cleanup; return 1; }
+        py "$MKSB" --link-file "$OUTBOUND_LINK" --socks-port "$_port" > "$_cfg" 2>"$_cfg.err" \
+            || { _probe_fail "could not build test config"; return 1; }
         set -- "$SBIN" run -c "$_cfg"
     else
         [ -x "$XRAY" ] || { err "xray binary not installed"; _ping_cleanup; return 1; }
-        py "$MKXRAY" --link-file "$OUTBOUND_LINK" --socks-port "$_port" > "$_cfg" 2>/dev/null \
-            || { err "could not build test config"; _ping_cleanup; return 1; }
+        py "$MKXRAY" --link-file "$OUTBOUND_LINK" --socks-port "$_port" > "$_cfg" 2>"$_cfg.err" \
+            || { _probe_fail "could not build test config"; return 1; }
         set -- "$XRAY" run -config "$_cfg" -format json
     fi
     ensure_service_user
