@@ -755,6 +755,10 @@ engine_for_link_file() {
     echo ""
 }
 
+# The active core's name for messages.
+engine_label() {
+    case "$(current_engine)" in singbox) echo sing-box ;; awg) echo "AmneziaWG core" ;; *) echo Xray ;; esac
+}
 current_engine() {
     # Trust the engine marker only if it is one of the known values; otherwise
     # infer from on-disk state (an empty/corrupt marker must not default to the
@@ -2086,8 +2090,21 @@ EOF
     if [ "$FALLBACK" = on ]; then fallback_set on; fi
 }
 
+# Rebuild the active link's config with this version's generators, so a fix in
+# them reaches a running node with an update or reboot. A link they now refuse
+# keeps the config it runs with.
+rebuild_active_config() {
+    case "$(current_engine)" in xray|singbox) : ;; *) return 0 ;; esac
+    [ -s "$OUTBOUND_LINK" ] && [ -f "$CONFIG" ] || return 0
+    ensure_run_dir
+    ( _build_config_file "$OUTBOUND_LINK" ) >/dev/null 2>"$RUN_DIR/rebuild.err" && return 0
+    _rb="$(head -n 1 "$RUN_DIR/rebuild.err" | tr -d '\033' | sed 's/\[[0-9;]*m//g')"
+    c_ylw "Kept the current config: the saved link does not build with this version (${_rb#*error: })."
+}
+
 boot_recover() {
     install_service
+    rebuild_active_config
     if { [ -f "$CONFIG" ] || [ -f "$POOL_DIR/99-overlay.json" ]; } \
         && [ "$(cat "$AUTOSTART_FILE" 2>/dev/null || echo enabled)" != "disabled" ]; then
         restart_service || fatal "service failed its boot recovery health check"
@@ -2409,6 +2426,8 @@ cmd_status() {
             echo "ingress:   kernel WireGuard (once the service runs)"
         fi
         ingress_active || [ "$LAN_ROUTE" = off ] || echo "lan route: on, inactive until kernel WireGuard ingress runs"
+    else
+        echo "ingress:   userspace ($(engine_label)'s own WireGuard; kernel ingress and LAN route need an Xray-based node)"
     fi
     if have ss; then
         if socket_listening "$WG_PORT"; then c_grn "udp/${WG_PORT}: listening"; else c_ylw "udp/${WG_PORT}: not listening"; fi
@@ -3003,6 +3022,15 @@ cmd_ping() {
 BENCH_URL="https://speed.cloudflare.com/__down?bytes=99000000"
 BENCH_STREAMS=4
 
+# Why a bench line got no data: the target's own refusal, else <fallback hint>.
+_bench_refusal() {   # <HTTP status or -> <fallback hint>
+    case "$1" in
+        429) echo "the target answered HTTP 429: rate-limited; try again later or pass another URL" ;;
+        [0-9][0-9][0-9]) echo "the target answered HTTP $1" ;;
+        *) echo "$2" ;;
+    esac
+}
+
 # _bench_run <seconds> <url> [proxy URL] [probe pid] [interface] [core pid]
 # downloads through the proxy or interface, if given, and prints "<Mbit/s>
 # <gateway CPU busy %> <core CPU % of one core>". The sampled core is the
@@ -3053,6 +3081,7 @@ def system_cpu():
     return sum(values), values[3] + (values[4] if len(values) > 4 else 0)
 
 moved = [[0, 0.0] for _ in range(streams)]      # bytes, seconds spent receiving
+refused = []                                    # HTTP status of a refused request
 
 # Measure exactly the path asked for: curl would otherwise honor proxy and
 # no-proxy settings from the environment, even over an explicit --proxy.
@@ -3075,6 +3104,8 @@ def stream(slot, deadline):
                                 stderr=subprocess.DEVNULL, universal_newlines=True,
                                 env=env).stdout.split()
         if len(fields) != 4 or not fields[0].startswith("2") or int(fields[1]) <= 0:
+            if fields and fields[0] not in ("000", "") and not fields[0].startswith("2"):
+                refused.append(fields[0])
             return
         moved[slot][0] += int(fields[1])
         # Count time spent receiving, not each request's connect/TLS setup.
@@ -3099,7 +3130,7 @@ all_ticks = total_after - total_before
 busy = 100.0 * (1 - (idle_after - idle_before) / all_ticks) if all_ticks else 0.0
 core = 100.0 * (group_ticks(group) - ticks_before) / os.sysconf("SC_CLK_TCK") / elapsed
 mbit = sum(size / spent for size, spent in moved if spent) * 8 / 1e6
-print("%.1f %.0f %.0f" % (mbit, busy, core))
+print("%.1f %.0f %.0f %s" % (mbit, busy, core, refused[0] if refused else "-"))
 PYEOF
 }
 
@@ -3136,11 +3167,7 @@ cmd_bench() {   # [seconds] [url]
     case "$_url" in *[[:space:]]*|*[[:cntrl:]]*) fatal "bench URL must not contain spaces or control characters" ;; esac
     _quota="$(sed -n 's/^CPUQuota=//p' "$SERVICE_FILE" 2>/dev/null)"
     _procs="$(sed -n 's/^Environment=GOMAXPROCS=//p' "$SERVICE_FILE" 2>/dev/null)"
-    case "$(current_engine)" in
-        singbox) _ingress="sing-box WireGuard (userspace)" ;;
-        awg)     _ingress="AmneziaWG core WireGuard (userspace)" ;;
-        *)       if ingress_active; then _ingress="kernel WireGuard"; else _ingress="Xray WireGuard (userspace)"; fi ;;
-    esac
+    if ingress_active; then _ingress="kernel WireGuard"; else _ingress="$(engine_label) WireGuard (userspace)"; fi
 
     c_bold "proxy-unifi bench: ${_secs}s per test, ${BENCH_STREAMS} parallel downloads"
     echo "target:  $_url"
@@ -3149,10 +3176,10 @@ cmd_bench() {   # [seconds] [url]
     echo
     printf '%-38s' "1. WAN direct (no proxy)"
     _r="$(_bench_run "$_secs" "$_url")" || _r=""
-    read -r _wan _wan_busy _ <<EOF
-${_r:-0 0 0}
+    read -r _wan _wan_busy _ _http <<EOF
+${_r:-0 0 0 -}
 EOF
-    if [ "$_wan" = "0.0" ] || [ "$_wan" = 0 ]; then c_red "failed (is the target reachable?)"; return 1; fi
+    if [ "$_wan" = "0.0" ] || [ "$_wan" = 0 ]; then c_red "failed ($(_bench_refusal "${_http:--}" "is the target reachable?"))"; return 1; fi
     echo "$(c_grn "$_wan Mbit/s")   gateway CPU ${_wan_busy}%"
 
     printf '%-38s' "2. Proxy outbound only (no WireGuard)"
@@ -3167,10 +3194,10 @@ EOF
         _ping_cleanup
     fi
     unset GOMAXPROCS GOMEMLIMIT
-    read -r _out _out_busy _core <<EOF
-${_r:-0 0 0}
+    read -r _out _out_busy _core _http <<EOF
+${_r:-0 0 0 -}
 EOF
-    if [ "$_out" = "0.0" ] || [ "$_out" = 0 ]; then c_red "failed (see 'proxy ping')"; return 1; fi
+    if [ "$_out" = "0.0" ] || [ "$_out" = 0 ]; then c_red "failed ($(_bench_refusal "${_http:--}" "see 'proxy ping'"))"; return 1; fi
     echo "$(c_grn "$_out Mbit/s")   gateway CPU ${_out_busy}%, core CPU ${_core}% of $((_ncpu * 100))%"
 
     # The real path: the gateway's own UniFi VPN client, both WireGuard ends,
@@ -3185,11 +3212,11 @@ EOF
         c_red "failed (no reply through $_wgif)"
     else
         _r="$(_bench_run "$_secs" "$_url" "" 0 "$_wgif" "${_main:-0}")" || _r=""
-        read -r _tun _tun_busy _tun_core <<EOF
-${_r:-0 0 0}
+        read -r _tun _tun_busy _tun_core _http <<EOF
+${_r:-0 0 0 -}
 EOF
         if [ "$_tun" = "0.0" ] || [ "$_tun" = 0 ]; then
-            c_red "failed (through $_wgif)"; _tun=""
+            c_red "failed ($(_bench_refusal "${_http:--}" "through $_wgif"))"; _tun=""
         else
             echo "$(c_grn "$_tun Mbit/s")   gateway CPU ${_tun_busy}%, core CPU ${_tun_core}% of $((_ncpu * 100))%"
         fi
@@ -3201,7 +3228,10 @@ EOF
             echo "Line 3 is close to line 2: the WireGuard hop is not the limit; the outbound is."
         else
             echo "Line 3 is well below line 2: the gateway's WireGuard-to-proxy hop is the limit."
-            ingress_active || c_ylw "Kernel WireGuard ingress is not active ('proxy status' says why)."
+            case "$(current_engine)" in
+                xray|xraypool) ingress_active || c_ylw "Kernel WireGuard ingress is not active ('proxy status' says why)." ;;
+                *) c_ylw "Kernel WireGuard ingress needs an Xray-based node; this one runs $(engine_label)'s own WireGuard." ;;
+            esac
         fi
         echo "(Line 3 also decrypts the test downloads on the gateway; LAN devices may get a bit more.)"
     else
@@ -3407,6 +3437,10 @@ menu_wg_settings() {
     echo "  3. DNS resolvers   (current: $INNER_DNS)"
     echo "  4. Ingress         (current: $INGRESS)"
     echo "  5. LAN route       (current: $LAN_ROUTE)"
+    case "$(current_engine)" in
+        xray|xraypool) : ;;
+        *) echo "     (4 and 5 take effect with Xray-based nodes; the active node runs $(engine_label).)" ;;
+    esac
     printf 'Please select a setting for modification [1-5]: '
     read -r _w || true
     echo

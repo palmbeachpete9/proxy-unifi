@@ -2721,7 +2721,7 @@ print(json.dumps(c))' "http://127.0.0.1:$_wp/slow" > "$_d/race-core.json"
     _r="$(sh -c '. "$1"; _bench_run 3 "$2" "$3" "$4"' sh "$_bd/bench-lib.sh" \
         "http://127.0.0.1:$_bulk_port/" "socks5h://127.0.0.1:$_sp" "$_sx")"
     kill "$_sx" "$_bulk_pid" 2>/dev/null; wait "$_sx" "$_bulk_pid" 2>/dev/null
-    if printf '%s\n' "$_r" | awk 'NF == 3 && $1 > 0 && $3 > 0 { found=1 } END { exit !found }'
+    if printf '%s\n' "$_r" | awk 'NF == 4 && $1 > 0 && $3 > 0 && $4 == "-" { found=1 } END { exit !found }'
     then ok "bench measures a SOCKS core's throughput and CPU"
     else bad "bench measures a SOCKS core's throughput and CPU (got: $_r)"; fi
     rm -rf "$_bd"
@@ -2868,9 +2868,23 @@ network_tests() {
     # shellcheck disable=SC2016 # $1-$2 expand inside the child shell.
     _r="$(sh -c '. "$1"; _bench_run 2 "$2"' sh "$_bd/bench-lib.sh" "http://127.0.0.1:$_bulk_port/")"
     kill "$_bulk_pid" 2>/dev/null; wait "$_bulk_pid" 2>/dev/null
-    if printf '%s\n' "$_r" | awk 'NF == 3 && $1 > 0 && $3 == 0 { found=1 } END { exit !found }'
+    if printf '%s\n' "$_r" | awk 'NF == 4 && $1 > 0 && $3 == 0 && $4 == "-" { found=1 } END { exit !found }'
     then ok "bench measures a direct download"
     else bad "bench measures a direct download (got: $_r)"; fi
+    # A target that refuses (a rate limit) is named, not reported as unreachable.
+    python3 -c 'import http.server as h
+class R(h.BaseHTTPRequestHandler):
+    def do_GET(self): self.send_response(429); self.send_header("Content-Length", "0"); self.end_headers()
+    def log_message(self, *a): pass
+s = h.HTTPServer(("127.0.0.1", 0), R); print(s.server_port, flush=True); s.serve_forever()' > "$_bd/429.port" &
+    _rl_pid=$!; _i=0; while [ ! -s "$_bd/429.port" ] && [ "$_i" -lt 50 ]; do _i=$((_i + 1)); sleep 0.1; done
+    # shellcheck disable=SC2016 # $1-$2 expand inside the child shell.
+    _r="$(sh -c '. "$1"; _bench_run 2 "$2"' sh "$_bd/bench-lib.sh" "http://127.0.0.1:$(cat "$_bd/429.port")/")"
+    kill "$_rl_pid" 2>/dev/null; wait "$_rl_pid" 2>/dev/null
+    { printf '%s\n' "$_r" | awk 'NF == 4 && $1 == 0 && $4 == 429 { found=1 } END { exit !found }' \
+        && _bench_why="$(sed -n '/^_bench_refusal() {/,/^}/p' "$SRC/proxy-unifi" | { cat; echo '_bench_refusal 429 x'; } | sh)" \
+        && [ "$_bench_why" = "the target answered HTTP 429: rate-limited; try again later or pass another URL" ]; } \
+        && ok "bench names a target's refusal" || bad "bench names a target's refusal (got: $_r / ${_bench_why:-})"
     rm -rf "$_bd"
     _d="$(mktemp -d)"
     openssl req -x509 -newkey rsa:2048 -keyout "$_d/key.pem" -out "$_d/cert.pem" -days 1 \
