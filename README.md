@@ -209,22 +209,16 @@ the DNS advertised to UniFi remains the global value under **WireGuard settings*
 
 ## Usage
 
-Run `proxy` for the interactive menu, or use the direct commands:
+Run `proxy`: everything is in its menu.
 
-| Command | Description |
-|---|---|
-| `proxy` | Main menu |
-| `proxy status` | Engine, configured server, and listener status |
-| `proxy ping [...]` | Test the link — `...` = `get`·`head`·`tcp`·`icmp` (default `get`) |
-| `proxy start` · `stop` · `restart` | Service controls |
-| `proxy logs [args]` | Service logs (passed to `journalctl`) |
-| `proxy help` | Show help |
-| `proxy update` | Updates xray, installed sing-box/AWG cores, and bundled geo files |
-| `proxy geo-update` | Updates the independent routing geo database |
-
-The menu covers: single links, subscriptions, AmneziaWG profiles, Xray JSON profiles, UniFi WireGuard config,
-regenerate keys, change port/MTU/DNS, ping test + protocol, enable/disable
-autostart, update cores, update geo files, and uninstall.
+- **Connections:** a single link, a subscription, AmneziaWG profiles, and Xray
+  JSON profiles; the current server and config.
+- **UniFi side:** the WireGuard VPN Client config, new keys, and the WireGuard
+  settings (port, MTU, DNS).
+- **Tests:** the ping test and its protocol.
+- **Service:** start, stop, restart, status, logs, and autostart.
+- **Updates:** proxy-unifi, the proxy cores, the geo files, automatic updates,
+  and version info (see [Update](#update)). Then **Uninstall**.
 
 ## Notes
 
@@ -255,7 +249,22 @@ every boot.
 
 ## Update
 
-To update client functionality (pull files from GitHub), simply run the script again:
+The menu's **Updates** entry updates proxy-unifi, the proxy cores (Xray,
+sing-box, AmneziaWG), and the geo files. **Update proxy-unifi now** installs the
+newest version of the branch you installed (`main` or `experimental`) whose
+GitHub tests passed; each update does nothing when you already have it.
+
+**Automatic updates** are off until you turn them on there. Once on, the gateway
+checks daily around 04:00: it installs a new proxy-unifi version 24 hours after
+its tests passed (time to catch a bad version before it reaches routers), then
+updates the cores. An update restarts the tunnel once, for a few seconds; a day
+with nothing new restarts nothing. **Check status** shows the version you run
+and how the last automatic update ended; **View logs** has the details.
+
+Every update runs the installer of the version it installs: it checks the
+gateway, backs up the scripts, cores and services, and restores them all if any
+step, the tunnel's health check included, fails. Running the install command
+again does the same by hand:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/main/install.sh | sh

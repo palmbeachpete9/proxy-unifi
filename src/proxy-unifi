@@ -57,6 +57,13 @@ GUARD_SERVICE_FILE="/etc/systemd/system/${GUARD_SERVICE_NAME}.service"
 GUARD_TIMER_FILE="/etc/systemd/system/${GUARD_SERVICE_NAME}.timer"
 ONBOOT_DST="/data/on_boot.d/15-proxy-unifi.sh"
 LOCK_DIR="$ROOT/.lock"
+PROJECT_REPO="palmbeachpete9/proxy-unifi"
+UPDATE_BRANCH="main"                        # this copy's branch while $VERSION_FILE is missing (experimental's says experimental)
+VERSION_FILE="$ROOT/version"                # "<branch> <commit or local>", written by install.sh
+AU_LAST="$ROOT/auto-update.last"            # when and how the last automatic update ended
+AU_MIN_AGE=86400                            # automatic updates take versions whose tests passed 24 h ago
+AU_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}-autoupdate.service"
+AU_TIMER_FILE="/etc/systemd/system/${SERVICE_NAME}-autoupdate.timer"
 TXN_ROOT="$ROOT/.transactions"
 TXN_MARKER="$TXN_ROOT/active"
 
@@ -91,6 +98,7 @@ SUB_REFRESH_HOURS="6"
 SUB_USER_AGENT_DEFAULT="Happ/2.0"
 SUB_USER_AGENT_LEGACY_DEFAULT="proxy-unifi/1.1"
 SUB_USER_AGENT="$SUB_USER_AGENT_DEFAULT"
+AUTO_UPDATE="off"                           # daily proxy-unifi and core updates (see auto_update)
 TAB="$(printf '\t')"
 
 # --------------------------------------------------------------------------
@@ -127,6 +135,7 @@ load_settings() {
             UNIFI_ADDR) case "$_value" in ""|*[!0-9A-Fa-f:.,/]*) : ;; *) UNIFI_ADDR="$_value" ;; esac ;;
             INNER_DNS) case "$_value" in *[!0-9A-Fa-f:.,]*) : ;; *) INNER_DNS="$_value" ;; esac ;;
             LOGLEVEL) case "$_value" in debug|info|warning|error|none) LOGLEVEL="$_value" ;; esac ;;
+            AUTO_UPDATE) case "$_value" in on|off) AUTO_UPDATE="$_value" ;; esac ;;
             PING_MODE) case "$_value" in get|head|tcp|icmp) PING_MODE="$_value" ;; esac ;;
             PING_URL) case "$_value" in https://*) PING_URL="$_value" ;; esac ;;
             PING_TIMEOUT)
@@ -205,6 +214,7 @@ PING_URL="$PING_URL"
 PING_TIMEOUT="$PING_TIMEOUT"
 SUB_REFRESH_HOURS="$SUB_REFRESH_HOURS"
 SUB_USER_AGENT="$SUB_USER_AGENT"
+AUTO_UPDATE="$AUTO_UPDATE"
 EOF
 }
 
@@ -929,15 +939,24 @@ ensure_awg() {
 # Commands
 # --------------------------------------------------------------------------
 
+# The Xray release an update installs: the latest, but never one older than
+# the first patched release.
+_xray_target_tag() {
+    _xt="$(resolve_latest_tag "https://github.com/XTLS/Xray-core/releases" 2>/dev/null || true)"
+    if [ -n "$_xt" ] && xray_tag_at_least "$_xt" "$XRAY_MIN_SAFE_TAG"; then echo "$_xt"; else echo "$XRAY_MIN_SAFE_TAG"; fi
+}
+
+# Whether every installed core already is what an update would install.
+_cores_current() {   # <Xray tag>
+    "$XRAY" version 2>/dev/null | head -n 1 | grep -q "^Xray ${1#v} " || return 1
+    [ ! -x "$SBIN" ] || "$SBIN" version 2>/dev/null | head -n 1 | grep -q "version ${SINGBOX_TAG#v}\$" || return 1
+    [ ! -x "$ABIN" ] || _awg_version_ok
+}
+
 cmd_install_binary() {
     mkdir -p "$BIN_DIR"
     slug="$(arch_slug)"
-    _latest_tag="$(resolve_latest_tag "https://github.com/XTLS/Xray-core/releases" 2>/dev/null || true)"
-    if [ -n "$_latest_tag" ] && xray_tag_at_least "$_latest_tag" "$XRAY_MIN_SAFE_TAG"; then
-        _tag="$_latest_tag"
-    else
-        _tag="$XRAY_MIN_SAFE_TAG"
-    fi
+    _tag="${XRAY_TARGET:-$(_xray_target_tag)}"
     _asset="Xray-linux-${slug}.zip"
     _pinned="https://github.com/XTLS/Xray-core/releases/download/${_tag}/${_asset}"
     ensure_run_dir
@@ -1356,10 +1375,35 @@ Unit=$GUARD_SERVICE_NAME.service
 [Install]
 WantedBy=timers.target
 EOF
+    # The daily update check; it does nothing unless automatic updates are on.
+    atomic_write "$AU_SERVICE_FILE" 644 <<EOF || fatal "could not write the auto-update service"
+[Unit]
+Description=proxy-unifi automatic update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$BIN_DIR/proxy-unifi _auto-update
+TimeoutStartSec=30min
+EOF
+    atomic_write "$AU_TIMER_FILE" 644 <<EOF || fatal "could not write the auto-update timer"
+[Unit]
+Description=proxy-unifi daily update check
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
+EOF
     systemctl daemon-reload >/dev/null 2>&1 || fatal "could not reload systemd"
     # systemctl takes unit names here; a file path is not a startable unit.
     systemctl enable --now "$GUARD_SERVICE_NAME.timer" >/dev/null 2>&1 \
         || fatal "could not start firewall guard timer"
+    systemctl enable --now "$SERVICE_NAME-autoupdate.timer" >/dev/null 2>&1 \
+        || fatal "could not start the update timer"
 }
 
 # Rebuild the active link's config with this version's generators, so a fix in
@@ -1557,7 +1601,7 @@ cmd_import_json() {
 }
 
 cmd_import() {
-    [ $# -ge 1 ] || fatal "usage: proxy import <vless:// | vmess:// | trojan:// | ss:// | hysteria2:// | tuic:// ...>"
+    [ $# -ge 1 ] || fatal "a proxy link is required"
     link="$1"
     case "$link" in
         vless://*|vmess://*|trojan://*|ss://*|hysteria2://*|hy2://*|tuic://*) : ;;
@@ -1645,6 +1689,8 @@ cmd_status() {
     _eng="$(current_engine)"
     echo "engine:    $_eng"
     echo "protocol:  $(current_protocol)"
+    echo "version:   $(installed_version_text)"
+    echo "updates:   automatic $AUTO_UPDATE$( [ ! -s "$AU_LAST" ] || printf ', last run %s' "$(cat "$AU_LAST")")"
     if [ "$_eng" = "awg" ]; then
         if [ -x "$ABIN" ]; then echo "core:      $(core_version "$ABIN")"; else echo "core:      AmneziaWG core not installed"; fi
     elif [ "$_eng" = "singbox" ]; then
@@ -1694,9 +1740,8 @@ current_protocol() {
     esac
 }
 
-cmd_logs()    { shift || true; journalctl -u "$SERVICE_NAME" "$@"; }
+cmd_logs()    { journalctl -u "$SERVICE_NAME" -u "$SERVICE_NAME-autoupdate" "$@"; }
 cmd_start()   { systemctl start "$SERVICE_NAME"; }
-cmd_stop()    { systemctl stop "$SERVICE_NAME"; }
 cmd_restart() { systemctl restart "$SERVICE_NAME"; }
 
 # Restart the service and confirm it actually came up. Returns nonzero (and does
@@ -1789,14 +1834,15 @@ cmd_set() {
     key="$1"; val="$2"
     _cmd_owned=0
     if [ -z "$TXN_DIR" ]; then txn_begin; _cmd_owned=1; fi
-    # 'ping' only changes a CLI default; it never touches the xray config.
-    if [ "$key" = "ping" ]; then
-        case "$val" in
-            get|head|tcp|icmp) PING_MODE="$val"; save_settings; [ "$_cmd_owned" = 1 ] && txn_commit; c_grn "Default ping protocol = $val." ;;
-            *) fatal "ping protocol must be get|head|tcp|icmp" ;;
-        esac
-        return
-    fi
+    # These change only what the CLI does, never the core's config.
+    case "$key" in
+        ping)
+            case "$val" in get|head|tcp|icmp) PING_MODE="$val" ;; *) fatal "ping protocol must be get|head|tcp|icmp" ;; esac
+            save_settings; [ "$_cmd_owned" = 1 ] && txn_commit; c_grn "Default ping protocol = $val."; return ;;
+        auto-update)
+            case "$val" in on|off) AUTO_UPDATE="$val" ;; *) fatal "auto-update must be on|off" ;; esac
+            save_settings; [ "$_cmd_owned" = 1 ] && txn_commit; c_grn "Automatic updates: $val."; return ;;
+    esac
     # validate up front so a bad value is never persisted to settings.env
     case "$key" in
         port)
@@ -1862,6 +1908,8 @@ cmd_regen_keys() {
 
 cmd_update() {
     ensure_run_dir
+    XRAY_TARGET="$(_xray_target_tag)"
+    if _cores_current "$XRAY_TARGET"; then c_grn "The proxy cores are up to date."; return 0; fi
     _update_was_active=0
     systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && _update_was_active=1
     UPDATE_WAS_ACTIVE="$_update_was_active"
@@ -1949,6 +1997,157 @@ cmd_geo_update() {
     else c_grn "Geo files updated. Service remains stopped."; fi
 }
 
+
+# --------------------------------------------------------------------------
+# proxy-unifi updates
+# --------------------------------------------------------------------------
+# "experimental 1a2b3c4" (the branch and commit install.sh recorded).
+installed_version_text() {
+    if [ -s "$VERSION_FILE" ] && read -r _iv_branch _iv_commit < "$VERSION_FILE"; then
+        echo "$_iv_branch $(printf %.7s "$_iv_commit")"
+    else
+        echo "$UPDATE_BRANCH, commit unknown (installed before versions were recorded)"
+    fi
+}
+
+# The commit an update installs: on <branch>'s own line (first parents; a
+# merge's other parent belongs to another branch), the newest whose GitHub
+# checks all passed at least <seconds> ago. Prints nothing when that is
+# <installed> or older, or when no commit qualifies.
+update_candidate() {   # <branch> <seconds> <installed commit>
+    py - "$PROJECT_REPO" "$1" "$2" "$3" <<'PYEOF'
+import calendar, json, os, sys, time, urllib.request
+repo, branch, min_age, installed = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+api = os.environ.get("PROXY_UNIFI_GITHUB_API", "https://api.github.com")   # tests: a local server
+headers = {"Accept": "application/vnd.github+json", "User-Agent": "proxy-unifi"}
+if os.environ.get("PROXY_UNIFI_GITHUB_TOKEN"):
+    headers["Authorization"] = "Bearer " + os.environ["PROXY_UNIFI_GITHUB_TOKEN"]
+
+def get(path):
+    with urllib.request.urlopen(urllib.request.Request(api + path, headers=headers), timeout=20) as reply:
+        return json.load(reply)
+
+def seconds(stamp):
+    return calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))
+
+try:
+    sha = get("/repos/%s/commits/%s" % (repo, branch))["sha"]
+    history = {c["sha"]: c for c in get("/repos/%s/commits?sha=%s&per_page=100" % (repo, sha))}
+    checked = 0
+    # ponytail: the newest 100 commits and 5 test lookups per run bound the API use
+    # (60 requests an hour without a login); an older install waits for newer ones.
+    while sha in history and sha != installed and checked < 5:
+        # Tests run after a commit is made: one made since the cutoff cannot qualify.
+        if seconds(history[sha]["commit"]["committer"]["date"]) > time.time() - min_age:
+            sha = (history[sha].get("parents") or [{}])[0].get("sha")
+            continue
+        runs = get("/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha))["check_runs"]
+        checked += 1
+        if runs and all(r["status"] == "completed" and r["conclusion"] in ("success", "neutral", "skipped")
+                        for r in runs) \
+                and max(seconds(r["completed_at"]) for r in runs) <= time.time() - min_age:
+            print(sha)
+            break
+        sha = (history[sha].get("parents") or [{}])[0].get("sha")
+except (OSError, ValueError, KeyError, TypeError) as error:
+    sys.exit("could not ask GitHub: %s" % error)
+PYEOF
+}
+
+# Install the newest version of this copy's branch whose tests passed at least
+# <seconds> ago, through that version's own installer: it checks the gateway,
+# backs everything up and restores it if any step (the health check included)
+# fails. Sets SU_UPDATED=1 once a new version is in place, and SU_SUMMARY.
+self_update() {   # <seconds>
+    SU_UPDATED=""
+    _su_branch="$UPDATE_BRANCH"; _su_have=unknown
+    if [ -s "$VERSION_FILE" ]; then read -r _su_branch _su_have < "$VERSION_FILE" || true; fi
+    if ! _su_sha="$(update_candidate "$_su_branch" "$1" "$_su_have")"; then
+        SU_SUMMARY="could not check GitHub for updates"
+    elif [ -z "$_su_sha" ]; then
+        SU_SUMMARY="proxy-unifi is up to date ($(installed_version_text))"
+        c_grn "$SU_SUMMARY."
+        return 0
+    elif [ "${#_su_sha}" != 40 ] || [ -n "$(printf '%s' "$_su_sha" | tr -d 0-9a-f)" ]; then
+        SU_SUMMARY="GitHub returned an unexpected commit id"
+    else
+        _su_to="$_su_branch $(printf %.7s "$_su_sha")"
+        info "updating proxy-unifi to $_su_to ..."
+        ensure_run_dir
+        if ! download_to "https://raw.githubusercontent.com/$PROJECT_REPO/$_su_sha/install.sh" \
+                "$RUN_DIR/install.sh" 1048576; then
+            SU_SUMMARY="could not download the installer of $_su_to"
+        elif ! PROXY_UNIFI_BRANCH="$_su_branch" PROXY_UNIFI_COMMIT="$_su_sha" sh "$RUN_DIR/install.sh"; then
+            SU_SUMMARY="the update to $_su_to failed; the previous version was restored"
+        else
+            SU_UPDATED=1
+            SU_SUMMARY="proxy-unifi updated to $_su_to"
+            c_grn "$SU_SUMMARY."
+            return 0
+        fi
+    fi
+    err "$SU_SUMMARY"
+    return 1
+}
+
+# 0 when a live process holds the CLI lock.
+lock_busy() {
+    [ -d "$LOCK_DIR" ] || return 1
+    _lb="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    case "$_lb" in ""|*[!0-9]*) return 0 ;; esac
+    kill -0 "$_lb" 2>/dev/null
+}
+
+# The daily timer's run (when AUTO_UPDATE=on): proxy-unifi, 24 h after a
+# version passed its tests, then the cores; each does nothing when current.
+# The journal keeps the whole run, AU_LAST its result for 'Check status'.
+auto_update() {
+    [ "$AUTO_UPDATE" = on ] || return 0
+    if lock_busy; then _au_record "skipped: another proxy-unifi operation was running"; return 0; fi
+    ensure_run_dir
+    if ! self_update "$AU_MIN_AGE" > "$RUN_DIR/au.log" 2>&1; then
+        cat "$RUN_DIR/au.log"; _au_record "failed: $SU_SUMMARY"; return 1
+    fi
+    # The cores with the CLI now installed, which takes the lock itself.
+    "$BIN_DIR/proxy-unifi" _update >> "$RUN_DIR/au.log" 2>&1 && _au_rc=0 || _au_rc=1
+    cat "$RUN_DIR/au.log"
+    _au_cores="$(tail -n 1 "$RUN_DIR/au.log" | tr -d '\033' | sed 's/\[[0-9;]*m//g; s/^error: //')"
+    if [ "$_au_rc" = 0 ]; then _au_record "ok: $SU_SUMMARY; $_au_cores"
+    else _au_record "failed: $SU_SUMMARY; cores: $_au_cores"; fi
+    return "$_au_rc"
+}
+
+_au_record() {   # <result>
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M')" "$1" | cut -c1-200 | atomic_write "$AU_LAST" 644 || true
+}
+
+menu_updates() {
+    load_settings
+    if [ "$AUTO_UPDATE" = on ]; then _mu_flip=off; else _mu_flip=on; fi
+    echo "Updates (proxy-unifi $(installed_version_text); automatic updates $AUTO_UPDATE):"
+    echo " 1. Update proxy-unifi now (the newest version that passed GitHub's tests)"
+    echo " 2. Update proxy cores"
+    echo " 3. Update geo files"
+    echo " 4. Turn automatic updates $_mu_flip (daily around 04:00: proxy-unifi once a"
+    echo "    version passed its tests 24 h ago, then the cores)"
+    echo " 5. Version info"
+    echo " 0. Back"
+    printf 'Choice: '; read -r _mu || true
+    echo
+    case "${_mu:-0}" in
+        1) self_update 0 && [ -n "$SU_UPDATED" ] && return 10 ;;
+        2) locked_call cmd_update ;;
+        3) locked_call cmd_geo_update ;;
+        4) locked_call cmd_set auto-update "$_mu_flip" ;;
+        5) echo "proxy-unifi: $(installed_version_text)"
+           if [ -x "$XRAY" ]; then core_version "$XRAY"; else c_ylw "xray-core: not installed"; fi
+           if [ -x "$SBIN" ]; then core_version "$SBIN"; else c_ylw "sing-box: not installed"; fi
+           if [ -x "$ABIN" ]; then core_version "$ABIN"; else c_ylw "AmneziaWG core: not installed"; fi ;;
+        0|"") : ;;
+        *) c_red "invalid choice" ;;
+    esac
+    return 0
+}
 
 # Print 'host<TAB>port' for the current link using the engine-appropriate generator.
 _server_hp() {
@@ -2161,13 +2360,12 @@ cmd_ping() {
         c_ylw "No proxy/VPN imported yet. Add a link, subscription, JSON profile, or AmneziaWG profile first."
         return 1
     fi
-    _mode="${1:-$PING_MODE}"
-    case "$_mode" in
+    case "$PING_MODE" in
         get)  ping_proxy get ;;
         head) ping_proxy head ;;
         tcp)  ping_tcp ;;
         icmp) ping_icmp ;;
-        *) fatal "unknown ping protocol '$_mode' (get|head|tcp|icmp)" ;;
+        *) fatal "unknown ping protocol '$PING_MODE' (get|head|tcp|icmp)" ;;
     esac
 }
 
@@ -2222,10 +2420,8 @@ print_menu() {
     ml " 16. Enable autostart"
     ml " 17. Disable autostart"
     printf '├%s┤\n' "$HR"
-    ml " 18. Update proxy cores"
-    ml " 19. Update geo files"
-    ml " 20. Version info"
-    ml " 21. Uninstall"
+    ml " 18. Updates"
+    ml " 19. Uninstall"
     printf '└%s┘\n' "$HR"
     printf '\n'
     printf 'Service:    %s\n' "$svc_d"
@@ -2299,7 +2495,7 @@ cmd_menu() {
     while true; do
         clear 2>/dev/null || true
         print_menu
-        printf '\nPlease enter your selection [0-21]: '
+        printf '\nPlease enter your selection [0-19]: '
         read -r sel || exit 0
         echo
         case "$sel" in
@@ -2323,15 +2519,11 @@ cmd_menu() {
             14) ( cmd_status ) ;;
             15) ( printf 'Lines to show [100]: '; read -r _n || true
                   case "${_n:-}" in ""|*[!0-9]*) _n=100 ;; esac
-                  cmd_logs logs -n "$_n" --no-pager ) ;;
+                  cmd_logs -n "$_n" --no-pager ) ;;
             16) ( locked_call menu_enable ) ;;
             17) ( locked_call menu_disable ) ;;
-            18) ( locked_call cmd_update ) ;;
-            19) ( locked_call cmd_geo_update ) ;;
-            20) ( if [ -x "$XRAY" ]; then core_version "$XRAY"; else c_ylw "xray-core: not installed"; fi
-                  if [ -x "$SBIN" ]; then core_version "$SBIN"; else c_ylw "sing-box: not installed"; fi
-                  if [ -x "$ABIN" ]; then core_version "$ABIN"; else c_ylw "AmneziaWG core: not installed"; fi ) ;;
-            21) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
+            18) ( menu_updates ) || { [ $? != 10 ] || { c_grn "proxy-unifi was updated: run 'proxy' again."; exit 0; }; } ;;
+            19) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
                 if [ "${_c:-}" = "y" ]; then ( locked_call cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
             *)  c_red "Invalid selection." ;;
         esac
@@ -2916,35 +3108,13 @@ cmd_uninstall() {
         && fatal "service is still running; refusing to remove its unit"
     fw_unlock                       # drop the userspace-core firewall guard, if any
     disable_guard_timer
-    rm -f "$SERVICE_FILE" "$REFRESH_SERVICE_FILE" "$REFRESH_TIMER_FILE" "$ONBOOT_DST"
+    systemctl disable --now "$SERVICE_NAME-autoupdate.timer" >/dev/null 2>&1 || true
+    rm -f "$SERVICE_FILE" "$REFRESH_SERVICE_FILE" "$REFRESH_TIMER_FILE" "$ONBOOT_DST" \
+        "$AU_SERVICE_FILE" "$AU_TIMER_FILE"
     remove_proxy_link
     systemctl daemon-reload 2>/dev/null || true
     c_ylw "Removed service + boot hook. Data kept at $ROOT (delete it manually to purge keys/config)."
     c_ylw "Don't forget to delete the WireGuard VPN Client in the UniFi UI."
-}
-
-usage() {
-    cat <<EOF
-proxy - multi-core proxy/VPN client (xray-core + sing-box + AmneziaWG) for UniFi gateways
-
-Run 'proxy' with no arguments for the interactive management menu — it is the
-full interface: links, subscriptions, AmneziaWG profiles, WireGuard config, keys,
-port/MTU/DNS, ping tests, autostart, updates, and uninstall.
-
-Direct commands (quick ops / scripting):
-  proxy start        Start the service
-  proxy stop         Stop the service
-  proxy restart      Restart the service
-  proxy status       Show engine / server / listener status
-  proxy ping [mode]  Test via get|head|tcp|icmp (default from settings)
-  proxy logs [args]  Tail service logs (passes args to journalctl)
-  proxy update       Update cores/assets with runtime rollback
-  proxy geo-update   Update geo files with checksum + rollback
-  proxy help         This help
-
-Everything else lives in the menu (run 'proxy').
-Data lives in $ROOT and survives reboots/firmware upgrades via unifi-common.
-EOF
 }
 
 # --------------------------------------------------------------------------
@@ -2953,27 +3123,22 @@ EOF
 cmd="${1:-}"
 if [ $# -ge 1 ]; then shift; fi
 case "$cmd" in
-    ""|status|logs|ping|-h|--help|help|_fw-lock|_fw-unlock) : ;;
-    *) need_root; acquire_lock; recover_transaction ;;
+    ""|_fw-lock|_fw-unlock) : ;;
+    # An automatic update leaves the lock to the installer.
+    _auto-update) need_root ;;
+    _update|install-binary|install-service|boot-recover|_fw-reconcile|sub-refresh-auto)
+        need_root; acquire_lock; recover_transaction ;;
+    *) err "proxy has no command '$cmd': run 'proxy' for the menu"; exit 1 ;;
 esac
 load_settings
 case "$cmd" in
-    # interactive menu (default) — the menu is the full interface for everything:
-    # import, subscriptions, keys, port/MTU/DNS, ping, autostart, update, uninstall.
+    # Everything people do is in the menu.
     "")           cmd_menu ;;
-    # kept direct commands (quick ops / scripting)
-    start)        cmd_start ;;
-    stop)         cmd_stop ;;
-    restart)      cmd_restart ;;
-    status)       cmd_status ;;
-    logs)         cmd_logs logs "$@" ;;
-    ping)         cmd_ping "${1:-}" ;;
-    update)       cmd_update ;;
-    geo-update)   cmd_geo_update ;;
-    -h|--help|help) usage ;;
-    # internal hooks (used only by install.sh, the boot hook, and the systemd
-    # unit's ExecStartPre/ExecStopPost; not user-facing). _fw-lock is deliberately
-    # fail-closed for sing-box/amnezia-box, while _fw-unlock is cleanup-only.
+    # Internal hooks: install.sh, the boot hook, the systemd units and timers.
+    # _fw-lock is deliberately fail-closed for sing-box/amnezia-box, while
+    # _fw-unlock is cleanup-only.
+    _update)         cmd_update ;;
+    _auto-update)    auto_update ;;
     install-binary)  cmd_install_binary ;;
     install-service) install_service ;;
     boot-recover)    boot_recover ;;
@@ -2981,5 +3146,4 @@ case "$cmd" in
     sub-refresh-auto) _AUTO_REFRESH=1 sub_refresh ;;
     _fw-lock)        fw_lock ;;
     _fw-unlock)      fw_unlock ;;
-    *) err "unknown command: $cmd"; echo; usage; exit 1 ;;
 esac

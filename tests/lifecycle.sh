@@ -37,6 +37,8 @@ sed \
     -e "s|^REFRESH_TIMER_FILE=.*|REFRESH_TIMER_FILE=\"$T/proxy-unifi-refresh.timer\"|" \
     -e "s|^GUARD_SERVICE_FILE=.*|GUARD_SERVICE_FILE=\"$T/proxy-unifi-guard.service\"|" \
     -e "s|^GUARD_TIMER_FILE=.*|GUARD_TIMER_FILE=\"$T/proxy-unifi-guard.timer\"|" \
+    -e "s|^AU_SERVICE_FILE=.*|AU_SERVICE_FILE=\"$T/proxy-unifi-autoupdate.service\"|" \
+    -e "s|^AU_TIMER_FILE=.*|AU_TIMER_FILE=\"$T/proxy-unifi-autoupdate.timer\"|" \
     -e "s|^ONBOOT_DST=.*|ONBOOT_DST=\"$T/on_boot.sh\"|" \
     -e "s|^PROXY_LINK=\"/usr/bin/proxy\"|PROXY_LINK=\"$T/proxy\"|" \
     "$REPO/src/proxy-unifi" > "$T/root/bin/proxy-base"
@@ -176,6 +178,8 @@ menu_input() {
         PATH="$T/mock-bin:$PATH" \
         "$T/root/bin/proxy-unifi"
 }
+# The menu entries the checks use (the menu is the only user interface).
+menu_status() { printf '14\n\n0\n' | menu_input; }
 hash_file() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | awk '{print $1}'
@@ -204,8 +208,23 @@ positions=[plain.index(label) for label in
             "Import an Xray JSON profile")]
 assert positions == sorted(positions), positions
 numbers=[int(x) for x in re.findall(r"│\s+([0-9]+)\. ", plain)]
-assert numbers[:22] == list(range(22)), numbers[:22]
+assert numbers == list(range(20)), numbers
+assert "[0-19]" in plain
 PY
+
+# Only the menu takes people's commands; automatic updates are off until turned
+# on under Updates, and the daily timer does nothing until then.
+if run_cli status > "$T/gone.out" 2>&1; then exit 1; fi
+grep -q "proxy has no command 'status': run 'proxy' for the menu" "$T/gone.out"
+grep -q '^OnCalendar=\*-\*-\* 04:00:00$' "$T/proxy-unifi-autoupdate.timer"
+grep -q 'proxy-unifi _auto-update$' "$T/proxy-unifi-autoupdate.service"
+run_cli _auto-update
+[ ! -e "$T/root/auto-update.last" ]
+menu_status | grep -q '^updates:   automatic off'
+printf '18\n4\n\n0\n' | menu_input >/dev/null
+grep -q '^AUTO_UPDATE="on"' "$T/root/etc/settings.env"
+printf '18\n4\n\n0\n' | menu_input >/dev/null
+grep -q '^AUTO_UPDATE="off"' "$T/root/etc/settings.env"
 
 LINK='vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.1.1.1:443?security=none&type=tcp#test'
 printf '1\n%s\n\n0\n' "$LINK" | menu_input >/dev/null
@@ -224,9 +243,9 @@ printf '1\n%s\n\n0\n' "${LINK%#test}&unknownSemantic=x#bad" | menu_input >/dev/n
 [ ! -e "$T/root/.lock" ] || exit 1
 
 # Settings maintenance must not start a service that was deliberately stopped.
-run_cli stop >/dev/null
+printf '12\n\n0\n' | menu_input >/dev/null
 printf '8\n1\n51822\n\n0\n' | menu_input >/dev/null
-if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
+if menu_status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
 grep -q '"port": 51822' "$T/root/etc/config.json"
 
 # Standards-compliant SS2022 switches to the existing sing-box core, preserves
@@ -254,7 +273,7 @@ assert cfg["route"]["final"]=="proxy"
 PY
 [ "$(hash_file "$T/root/etc/wg/wg_private.key")" = "$SS_WG_PRIVATE_HASH" ]
 [ "$(hash_file "$T/root/etc/wg/unifi_public.key")" = "$SS_UNIFI_PUBLIC_HASH" ]
-run_cli status > "$T/ss2022-status.out"
+menu_status > "$T/ss2022-status.out"
 grep -q '^engine:    singbox$' "$T/ss2022-status.out"
 grep -q '^protocol:  Shadowsocks 2022$' "$T/ss2022-status.out"
 SS_CONFIG_HASH="$(hash_file "$T/root/etc/config.json")"
@@ -422,7 +441,7 @@ assert "outbounds" not in cfg
 PY
 [ "$(hash_file "$T/root/etc/wg/wg_private.key")" = "$WG_PRIVATE_HASH" ]
 [ "$(hash_file "$T/root/etc/wg/unifi_public.key")" = "$UNIFI_PUBLIC_HASH" ]
-run_cli status > "$T/awg-status.out"
+menu_status > "$T/awg-status.out"
 grep -q '^engine:    awg$' "$T/awg-status.out"
 printf '5\n\n0\n' | menu_input > "$T/awg-details.out"
 grep -q '^Protocol:       AmneziaWG 1.5$' "$T/awg-details.out"
@@ -435,7 +454,7 @@ printf '3\n6\n1\ny\n\n0\n' | menu_input >/dev/null
 [ ! -e "$T/root/etc/config.json" ]
 [ ! -e "$T/root/etc/engine" ]
 [ "$(find "$T/root/etc/awg/profiles" -name '*.conf' -type f | wc -l | tr -d ' ')" = 0 ]
-if run_cli status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
+if menu_status 2>/dev/null | grep -q '^service:   active'; then exit 1; fi
 
 # A stale AWG marker must never make profile maintenance replace or stop a
 # different authoritative engine. Simulate damaged legacy state around edit and
@@ -450,14 +469,14 @@ printf '3\n4\n1\n\n0\n' | menu_input >/dev/null
 [ "$(cat "$T/root/etc/engine")" = xray ]
 [ "$(hash_file "$T/root/etc/config.json")" = "$STALE_CONFIG_HASH" ]
 [ ! -e "$T/root/etc/awg/selected" ]
-run_cli status 2>/dev/null | grep -q '^service:   active'
+menu_status 2>/dev/null | grep -q '^service:   active'
 printf '%s' "$STALE_ID" > "$T/root/etc/awg/selected"
 printf '3\n6\n1\ny\n\n0\n' | menu_input >/dev/null
 [ "$(cat "$T/root/etc/engine")" = xray ]
 [ "$(hash_file "$T/root/etc/config.json")" = "$STALE_CONFIG_HASH" ]
 [ ! -e "$T/root/etc/awg/selected" ]
 [ ! -e "$STALE_CONF" ]
-run_cli status 2>/dev/null | grep -q '^service:   active'
+menu_status 2>/dev/null | grep -q '^service:   active'
 
 # An invalid on-disk profile remains editable and deletable from the CLI.
 BAD_ID=33333333-3333-4333-8333-333333333333
