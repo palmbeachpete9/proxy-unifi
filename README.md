@@ -67,7 +67,7 @@ selected profile.
 
 ## Kernel WireGuard ingress (Xray and sing-box)
 
-For xray-core and sing-box links and JSON profiles, the gateway's kernel
+For Xray and sing-box links and Xray JSON profiles, the gateway's kernel
 terminates the UniFi VPN Client's WireGuard by default; the core no longer does it. Xray's own WireGuard
 decrypts in userspace, one packet at a time: on a UCG-Ultra that held the tunnel
 near 35 Mbit/s while the proxy outbound alone reached ~350 Mbit/s. On the same

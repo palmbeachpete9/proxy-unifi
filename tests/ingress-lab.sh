@@ -444,6 +444,8 @@ check "status names a clashing service port" grep -q "^udp note: .* $FIXED/pytho
 check "status names programs on ephemeral ports" grep -q "^udp note: .*and ephemeral ports of .*python" "$T/status.out"
 if grep -q "^udp note: .*\\b$CLASH/" "$T/status.out"; then fail "status omits ephemeral port numbers"
 else pass "status omits ephemeral port numbers"; fi
+if grep -q "^udp note: .*\\(kernel\\|\\b$WG_PORT/\\)" "$T/status.out"; then fail "status skips the WireGuard port and kernel client ports"
+else pass "status skips the WireGuard port and kernel client ports"; fi
 if grep -q "^udp note: .*\\b$SHARED/" "$T/status.out"; then fail "status skips a shared UDP port"
 else pass "status skips a shared UDP port"; fi
 

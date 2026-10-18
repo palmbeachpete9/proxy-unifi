@@ -2013,7 +2013,7 @@ ingress_up() {
     elif _ingress_setup && ingress_overlay kernel && : > "$INGRESS_ACTIVE"; then
         echo "proxy-unifi: kernel WireGuard ingress up ($INGRESS_WG in netns $INGRESS_NS -> $(engine_label) $INGRESS_HOST_IP:$INGRESS_PORT)"
         _iu_ports="$(ingress_udp_conflicts)" || _iu_ports=""
-        [ -z "$_iu_ports" ] || echo "proxy-unifi: replies from remote UDP ports the gateway itself listens on cannot reach tunnel clients: $_iu_ports"
+        [ -z "$_iu_ports" ] || echo "proxy-unifi: replies from remote UDP $_iu_ports cannot reach tunnel clients (the gateway itself listens there)"
         return 0
     fi
     _ingress_failed="${_ingress_failed:-setup failed}"
@@ -2024,14 +2024,16 @@ ingress_up() {
     ingress_overlay userspace
 }
 
-# Xray answers a transparent UDP flow from a socket bound to the remote address
-# and port. That bind fails for ports the gateway holds on a wildcard address
-# without SO_REUSEADDR, so those replies are lost. Probe each such port exactly
-# as Xray binds (IP_TRANSPARENT, SO_REUSEADDR; its SO_REUSEPORT never helps
-# across users) and print "port/owner" for every port that fails.
+# The core (Xray or sing-box) answers a transparent UDP flow from a socket bound
+# to the remote address and port. That bind fails for ports the gateway holds on
+# a wildcard address without SO_REUSEADDR, so those replies are lost. Probe each
+# such port exactly as the core binds (IP_TRANSPARENT, SO_REUSEADDR; Xray's
+# SO_REUSEPORT never helps across users) and print "ports port/owner, ..." for
+# the ports that fail, or nothing. The kernel WireGuard device's own port is no
+# conflict worth naming.
 ingress_udp_conflicts() {
-    py - <<'PYEOF' 2>/dev/null
-import errno, os, socket
+    py - "$WG_PORT" <<'PYEOF' 2>/dev/null
+import errno, os, socket, sys
 IP_TRANSPARENT = 19
 ports = set()
 for table in ("/proc/net/udp", "/proc/net/udp6"):
@@ -2041,7 +2043,7 @@ for table in ("/proc/net/udp", "/proc/net/udp6"):
             for row in rows:
                 fields = row.split()
                 address, port = fields[1].rsplit(":", 1)
-                if int(address, 16) == 0:
+                if int(address, 16) == 0 and int(port, 16) != int(sys.argv[1]):
                     ports.add((int(port, 16), fields[9]))
     except (OSError, ValueError, IndexError, StopIteration):
         pass
@@ -2068,17 +2070,19 @@ for port, inode in sorted(ports):
     finally:
         probe.close()
 # Ports in the ephemeral range belong to short-lived client sockets (dnsmasq's
-# upstream queries) and change all the time: name only their programs.
+# upstream queries) and change all the time: name only their programs. Those
+# of the kernel are WireGuard clients' random ports, which no one dials.
 try:
     with open("/proc/sys/net/ipv4/ip_local_port_range") as span:
         low, high = map(int, span.read().split())
 except (OSError, ValueError):
     low, high = 32768, 60999
 fixed = ["%d/%s" % item for item in sorted(busy.items()) if not low <= item[0] <= high]
-ephemeral = sorted({owner for port, owner in busy.items() if low <= port <= high})
+ephemeral = sorted({owner for port, owner in busy.items() if low <= port <= high and owner != "kernel"})
+parts = ["ports " + ", ".join(fixed)] if fixed else []
 if ephemeral:
-    fixed.append("and ephemeral ports of " + ", ".join(ephemeral))
-print(" ".join(fixed))
+    parts.append("ephemeral ports of " + ", ".join(ephemeral))
+print(" and ".join(parts))
 PYEOF
 }
 
@@ -2458,7 +2462,7 @@ cmd_status() {
             echo "lan route: $(ingress_rt_status)"
             if [ "$(id -u)" = 0 ]; then
                 _st_udp="$(ingress_udp_conflicts)" || _st_udp=""
-                [ -z "$_st_udp" ] || echo "udp note:  replies from remote ports $_st_udp cannot reach tunnel clients"
+                [ -z "$_st_udp" ] || echo "udp note:  replies from remote $_st_udp cannot reach tunnel clients"
             fi
         elif [ "$INGRESS" = userspace ]; then
             echo "ingress:   userspace ($(engine_label)'s own WireGuard, as configured)"

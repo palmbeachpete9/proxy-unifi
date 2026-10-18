@@ -68,7 +68,7 @@ AmneziaWG из выбранного профиля.
 
 ## Kernel WireGuard ingress (Xray и sing-box)
 
-Для ссылок xray-core и sing-box и JSON-профилей WireGuard от UniFi VPN Client по
+Для ссылок Xray и sing-box и JSON-профилей Xray WireGuard от UniFi VPN Client по
 умолчанию завершает ядро Linux шлюза, а не прокси-ядро. Собственный WireGuard Xray расшифровывает
 трафик в userspace по одному пакету: на UCG-Ultra это держало туннель около
 35 Мбит/с, хотя сам прокси-исход давал ~350 Мбит/с. На том же шлюзе путь через
