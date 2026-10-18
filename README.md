@@ -117,6 +117,15 @@ single UniFi VPN Client entry works no matter which core is active.
 > the port is firewalled to loopback **and** WireGuard only ever answers the one
 > configured peer key.
 
+Common share-link extras are honoured where the core supports them: `tfo` /
+`fastopen` (TCP Fast Open; not used by QUIC-based Hysteria2 and TUIC), Hysteria2
+port hopping (`mport`, `hop-interval`, or a port list such as `host:443,20000-30000`),
+`upmbps` / `downmbps`, `obfs=none`, TUIC `disable_sni` and Shadowsocks `uot`.
+A `fp` fingerprint on Hysteria2 or TUIC is ignored: sing-box cannot apply it over
+QUIC. Options that would change security (for example `insecure=1` or Hysteria2
+`pinSHA256`) are still refused, and the subscription list marks such nodes
+unsupported with the reason instead of offering them.
+
 ## Shadowsocks 2022
 
 SS2022 is imported through the existing single-link and subscription workflows;

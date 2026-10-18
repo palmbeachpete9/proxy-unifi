@@ -574,6 +574,12 @@ PY
 
 parser_tests() {
     echo "== parsers =="
+    if _options_test="$(python3 "$ROOT/tests/test_share_link_options.py" 2>&1)"; then
+        ok "share-link options map to what the cores support"
+    else
+        bad "share-link options map to what the cores support"
+        printf '%s\n' "$_options_test"
+    fi
     KEY=cvttX9u3nd7XD16gF4LJ09KjFZ0ZN4x9nk2TQePX5jk
     VM="vmess://$(printf '{"add":"h","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","net":"ws","tls":"tls","host":"h","path":"/w"}' | base64 | tr -d '\n')"
     SS16="$(ss_test_key 16)"; SS32="$(ss_test_key 32)"; SS15="$(ss_test_key 15)"
@@ -594,7 +600,9 @@ parser_tests() {
     expect mkxray.py "ss://$(printf 'aes-256-gcm:pw@[2001:4860:4860::8888]:8388' | base64 | tr -d '\n')" accept "ss legacy IPv6"
     expect mkxray.py "vless://u@h:443?type=kcp&security=none" accept "mKCP plain"
     expect mksingbox.py "hysteria2://pw@h:443?sni=h" accept "hysteria2"
-    expect mksingbox.py "hysteria2://pw@h:443?mport=4000-5000" reject "hysteria2 port hopping"
+    expect mksingbox.py "hysteria2://pw@h:443?mport=4000-5000" accept "hysteria2 port hopping"
+    expect mksingbox.py "hysteria2://pw@h:443?mport=5000-4000" reject "hysteria2 reversed port range"
+    expect mksingbox.py "hysteria2://pw@h:443?hop-interval=30" reject "hysteria2 hop interval without hopping"
     expect mksingbox.py "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:pw@h:443?sni=h" accept "tuic"
     expect mksingbox.py "ss://$(printf 'aes-256-gcm:pw' | base64 | tr -d '\n')@h:8388?plugin=obfs-local%3Bobfs%3Dhttp" accept "ss+obfs"
     expect mksingbox.py "$SS22A128" accept "SS2022 AES-128"
