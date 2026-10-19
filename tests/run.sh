@@ -1209,7 +1209,7 @@ PY
     {
         echo "XRAY='$_xt/xray'; XRAY_MIN_SAFE_TAG=v26.7.11; py() { python3 \"\$@\"; }"
         echo "resolve_latest_tag() { cat '$_xt/latest' 2>/dev/null; }"
-        fn_src xray_tag_at_least _xray_target_tag
+        for _fn in xray_tag_at_least _xray_target_tag; do sed -n "/^$_fn() {/,/^}/p" "$SRC/proxy-unifi"; done
     } > "$_xt/lib.sh"
     _xt_case() {   # <latest or -> <installed version or -> → the chosen tag
         if [ "$1" = - ]; then rm -f "$_xt/latest"; else echo "$1" > "$_xt/latest"; fi
