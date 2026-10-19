@@ -231,6 +231,11 @@ Run `proxy`: everything is in its menu.
   cannot be installed.
 - **MTU** defaults to `1340` (Change via main menu if large transfers stall);
   **DNS** defaults to `8.8.8.8`.
+- **Routes by domain:** UniFi matches a domain through the gateway's own DNS, so
+  such a route only catches devices that use the gateway as their DNS server
+  (not a hard-coded `8.8.8.8`) with the browser's Secure DNS / DNS over HTTPS off.
+  After changing a route, test in a fresh private window, as cached DNS answers
+  and open connections keep their old path.
 - **Privilege separation:** proxy cores run as the dedicated `proxy-unifi` user
   in a hardened systemd service. Imports and updates are validated before an
   atomic state change; failed starts restore the prior working state.
