@@ -101,6 +101,15 @@ class XrayLinks(unittest.TestCase):
         self.assertEqual(ss["streamSettings"], {"sockopt": {"tcpFastOpen": True}})
         self.assertIs(ss["settings"]["servers"][0]["uot"], True)
 
+    def test_legacy_vmess_grpc_mode_and_authority(self):
+        def vmess(**fields):
+            body = dict(add="example.com", port="443", id=UUID, net="grpc", path="svc", tls="tls", **fields)
+            return "vmess://" + base64.b64encode(json.dumps(body).encode()).decode()
+        grpc = outbound(mkxray, vmess(type="multi", host="auth.example.com"))["streamSettings"]["grpcSettings"]
+        self.assertEqual(grpc, {"serviceName": "svc", "multiMode": True, "authority": "auth.example.com"})
+        self.assertFalse(outbound(mkxray, vmess(type="gun"))["streamSettings"]["grpcSettings"]["multiMode"])
+        self.assertNotIn("multiMode", outbound(mkxray, vmess(type="none"))["streamSettings"]["grpcSettings"])
+
     def test_engine_choice_accepts_tfo(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(mkxray.ss_engine("ss://%s@example.com:8388?tfo=1" % SS22), "singbox")
