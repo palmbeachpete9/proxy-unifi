@@ -1203,6 +1203,26 @@ assert pick(0)[0] != 0, pick(0)                      # GitHub trouble is an erro
 PY
     rm -rf "$_ud2"
 
+    # The Xray release a core update installs: GitHub's latest, the installed
+    # one when GitHub does not answer, and never one below the first patched.
+    _xt="$(mktemp -d)"
+    {
+        echo "XRAY='$_xt/xray'; XRAY_MIN_SAFE_TAG=v26.7.11; py() { python3 \"\$@\"; }"
+        echo "resolve_latest_tag() { cat '$_xt/latest' 2>/dev/null; }"
+        for _fn in xray_tag_at_least _xray_target_tag; do sed -n "/^$_fn() {/,/^}/p" "$SRC/proxy-unifi"; done
+    } > "$_xt/lib.sh"
+    _xt_case() {   # <latest or -> <installed version or -> → the chosen tag
+        if [ "$1" = - ]; then rm -f "$_xt/latest"; else echo "$1" > "$_xt/latest"; fi
+        printf '#!/bin/sh\necho "Xray %s (Xray, Penetrates Everything.)"\n' "$2" > "$_xt/xray"
+        if [ "$2" = - ]; then rm -f "$_xt/xray"; else chmod +x "$_xt/xray"; fi
+        sh -c '. "$1"; _xray_target_tag' sh "$_xt/lib.sh"
+    }
+    _xt_got="$(_xt_case v26.9.1 26.8.2) $(_xt_case - 26.8.2) $(_xt_case - 1.8.24) $(_xt_case - -)"
+    if [ "$_xt_got" = "v26.9.1 v26.8.2 v26.7.11 v26.7.11" ]; then
+        ok "core updates keep the installed Xray when GitHub does not name its latest"
+    else bad "core updates keep the installed Xray when GitHub does not name its latest (got: $_xt_got)"; fi
+    rm -rf "$_xt"
+
     py_case "subscription fetch ends at its deadline" "$SRC" <<'PY'
 import subprocess, sys, time
 code = ("import sys, time; sys.path.insert(0, %r); import mksub; mksub.DEADLINE = 1; "

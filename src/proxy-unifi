@@ -299,6 +299,9 @@ GEO_WAS_ACTIVE=0
 ensure_run_dir() {
     [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] && return 0
     mkdir -p "$ROOT"
+    # The menu's actions run in subshells, whose exit removes nothing: they use
+    # the menu's directory, which a locked action's cleanup may have removed.
+    if [ -n "$RUN_DIR" ] && mkdir -m 700 "$RUN_DIR" 2>/dev/null; then return 0; fi
     RUN_DIR="$(mktemp -d "$ROOT/.run.XXXXXX")" || fatal "could not create private run directory"
     chmod 700 "$RUN_DIR"
 }
@@ -943,7 +946,9 @@ ensure_awg() {
 # the first patched release.
 _xray_target_tag() {
     _xt="$(resolve_latest_tag "https://github.com/XTLS/Xray-core/releases" 2>/dev/null || true)"
-    if [ -n "$_xt" ] && xray_tag_at_least "$_xt" "$XRAY_MIN_SAFE_TAG"; then echo "$_xt"; else echo "$XRAY_MIN_SAFE_TAG"; fi
+    # GitHub did not answer: keep the installed release rather than go back to the pin.
+    [ -n "$_xt" ] || _xt="v$("$XRAY" version 2>/dev/null | awk 'NR == 1 { print $2 }')"
+    if xray_tag_at_least "$_xt" "$XRAY_MIN_SAFE_TAG" 2>/dev/null; then echo "$_xt"; else echo "$XRAY_MIN_SAFE_TAG"; fi
 }
 
 # Whether every installed core already is what an update would install.
@@ -2491,6 +2496,8 @@ cmd_menu() {
     # Repair an interrupted transaction before displaying any persisted state,
     # but release the lock before waiting for the user's first selection.
     ( locked_call true ) || fatal "could not recover interrupted state"
+    ensure_run_dir                   # shared by the actions, removed when the menu exits
+    _menu_version="$(cat "$VERSION_FILE" 2>/dev/null || true)"
     set +e
     while true; do
         clear 2>/dev/null || true
@@ -2498,6 +2505,11 @@ cmd_menu() {
         printf '\nPlease enter your selection [0-19]: '
         read -r sel || exit 0
         echo
+        # An update from elsewhere (the daily timer) replaced the helpers this
+        # menu calls; its own code is the old version's.
+        if [ "$(cat "$VERSION_FILE" 2>/dev/null || true)" != "$_menu_version" ]; then
+            c_ylw "proxy-unifi was updated meanwhile: run 'proxy' again."; exit 0
+        fi
         case "$sel" in
             0)  exit 0 ;;
             1)  ( printf 'Paste proxy link (vless/vmess/trojan/ss/hysteria2/tuic): '; read -r _l || true
@@ -3126,7 +3138,9 @@ case "$cmd" in
     ""|_fw-lock|_fw-unlock) : ;;
     # An automatic update leaves the lock to the installer.
     _auto-update) need_root ;;
-    _update|install-binary|install-service|boot-recover|_fw-reconcile|sub-refresh-auto)
+    # The guard timer's 30 s runs skip a held lock: that operation restarts what it changes.
+    _fw-reconcile) need_root; if lock_busy; then exit 0; fi; acquire_lock; recover_transaction ;;
+    _update|install-binary|install-service|boot-recover|sub-refresh-auto)
         need_root; acquire_lock; recover_transaction ;;
     *) err "proxy has no command '$cmd': run 'proxy' for the menu"; exit 1 ;;
 esac

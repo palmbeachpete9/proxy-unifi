@@ -469,14 +469,16 @@ def parse_vmess(link):
     net = str(v.get("net", "tcp") or "tcp")
 
     q = {}
-    for src, dst in (("sni", "sni"), ("host", "host"), ("fp", "fp"),
-                     ("alpn", "alpn"), ("type", "headerType"),
+    # v2rayN keeps a gRPC link's mode in "type" and its authority in "host".
+    grpc = net == "grpc"
+    for src, dst in (("sni", "sni"), ("host", "authority" if grpc else "host"), ("fp", "fp"),
+                     ("alpn", "alpn"), ("type", "mode" if grpc else "headerType"),
                      ("pbk", "pbk"), ("sid", "sid"), ("spx", "spx")):
-        if v.get(src) not in (None, ""):
+        if v.get(src) not in (None, "") and not (dst == "mode" and v[src] == "none"):
             q[dst] = str(v[src])
     if v.get("path") not in (None, ""):
         q["path"] = str(v["path"])
-        if net == "grpc":
+        if grpc:
             q["serviceName"] = str(v["path"])   # grpc carries serviceName in "path"
     try:
         aid = int(v.get("aid", 0) or 0)
