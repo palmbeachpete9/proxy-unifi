@@ -866,4 +866,17 @@ grep -q '^restart proxy-unifi-fallback.timer$' "$STATE/systemctl.log"
 [ ! -e "$T/root/.lock" ] || exit 1
 
 [ ! -e "$STATE/stale-lock" ] || { echo "lock recorded a dead owner" >&2; exit 1; }
+# Every menu action's temporary files went with the menu.
+no_run_dirs() { [ -z "$(find "$T/root" -maxdepth 1 -name '.run.*')" ] || { echo "a menu action left its run directory" >&2; exit 1; }; }
+no_run_dirs
+
+# A menu left open across an update (the daily timer) stops before it calls
+# the new helpers with its old code.
+{ until [ -n "$(find "$T/root" -maxdepth 1 -name '.run.*')" ]; do sleep 0.1; done; sleep 0.5
+  echo 'experimental 0123456789abcdef0123456789abcdef01234567' > "$T/root/version"; printf '15\n\n0\n'; } \
+    | menu_input > "$T/updated.out" 2>&1
+grep -q "proxy-unifi was updated meanwhile: run 'proxy' again." "$T/updated.out"
+if grep -q '^service:' "$T/updated.out"; then exit 1; fi
+rm -f "$T/root/version"
+no_run_dirs
 echo lifecycle-ok
