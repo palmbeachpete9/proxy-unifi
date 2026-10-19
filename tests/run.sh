@@ -1217,10 +1217,10 @@ PY
         if [ "$2" = - ]; then rm -f "$_xt/xray"; else chmod +x "$_xt/xray"; fi
         sh -c '. "$1"; _xray_target_tag' sh "$_xt/lib.sh"
     }
-    if [ "$(_xt_case v26.9.1 26.8.2)" = v26.9.1 ] && [ "$(_xt_case - 26.8.2)" = v26.8.2 ] \
-        && [ "$(_xt_case - 1.8.24)" = v26.7.11 ] && [ "$(_xt_case - -)" = v26.7.11 ]; then
+    _xt_got="$(_xt_case v26.9.1 26.8.2) $(_xt_case - 26.8.2) $(_xt_case - 1.8.24) $(_xt_case - -)"
+    if [ "$_xt_got" = "v26.9.1 v26.8.2 v26.7.11 v26.7.11" ]; then
         ok "core updates keep the installed Xray when GitHub does not name its latest"
-    else bad "core updates keep the installed Xray when GitHub does not name its latest"; fi
+    else bad "core updates keep the installed Xray when GitHub does not name its latest (got: $_xt_got)"; fi
     rm -rf "$_xt"
 
     py_case "subscription fetch ends at its deadline" "$SRC" <<'PY'
