@@ -46,7 +46,8 @@ from urllib.parse import urlsplit
 from proxylib import (die, valid_host, safe_port, xray_outbound_servers,
                       is_non_public_host as _is_non_public,
                       validate_xhttp_download_settings, nested_too_deep,
-                      dispatch_subcommand, LOCAL_PATH_FIELDS as _FORBIDDEN_KEYS,
+                      dispatch_subcommand, check_field_spelling,
+                      LOCAL_PATH_FIELDS as _FORBIDDEN_KEYS,
                       PATHLIKE_KEY as _PATHLIKE_KEY)
 
 
@@ -55,26 +56,6 @@ MAX_DEPTH = 64
 MAX_OUTBOUNDS = 256
 MAX_BALANCERS = 64
 MIN_PROBE_SECONDS = 5.0
-# Xray matches JSON field names case-insensitively, with Unicode folding (the
-# long s "ſ" counts as "s"). Every field this module validates or strips must
-# arrive spelled exactly as it reads it, or a copy spelled differently
-# ("Inbounds", "inboundſ", "Redirect") would reach the core unchecked.
-_CHECKED_FIELDS = {}
-for _name in ("log", "api", "dns", "routing", "policy", "inbounds", "outbounds", "transport",
-              "stats", "reverse", "fakedns", "metrics", "observatory", "burstObservatory",
-              "geodata", "settings", "streamSettings", "tlsSettings", "sockopt", "mux",
-              "proxySettings", "dialerProxy", "vnext", "servers", "peers", "users", "accounts",
-              "address", "server", "port", "server_port", "endpoint", "redirect", "protocol",
-              "tag", "rules", "balancers", "selector", "subjectSelector", "fallbackTag",
-              "balancerTag", "outboundTag", "inboundTag", "webhook", "strategy", "probeURL",
-              "probeUrl",
-              "pingConfig", "destination", "interval", "timeout", "sampling", "probeInterval",
-              "hosts", "sniffing", "network", "source", "sourceIP", "sourcePort", "localIP",
-              "localPort", "user", "type", "remarks",
-              "dnsLog", "access", "error", "loglevel", "downloadSettings", "unixSettings",
-              "dsSettings", "certificateFile", "keyFile", "masterKeyLog", "socketPath",
-              "unixSocket", "unixSocketPath"):
-    _CHECKED_FIELDS.setdefault(_name.casefold(), set()).add(_name)
 
 
 def _load(path):
@@ -127,20 +108,10 @@ def _validate_untrusted_tree(value, path="profile"):
         if path.endswith(".downloadSettings"):
             validate_xhttp_download_settings(value)
         folded = {}
-        # Header names, DNS host aliases and routing attribute names are data,
-        # not core fields: a header called "Webhook" is not a webhook.
-        data_map = path.rsplit(".", 1)[-1] in ("headers", "hosts", "attrs")
         for key, child in value.items():
             if not isinstance(key, str):
                 die("%s has a non-string key" % path)
-            spellings = None if data_map else _CHECKED_FIELDS.get(key.casefold())
-            if spellings and key not in spellings:
-                die("%s.%s must be spelled %s" % (path, key, " or ".join(sorted(spellings))))
-            # Two spellings of one field ("probeURL" and "probeUrl"): we would
-            # check one, the core would use the other.
-            if spellings and key.casefold() in folded:
-                die("%s has both %s and %s" % (path, folded[key.casefold()], key))
-            folded[key.casefold()] = key
+            check_field_spelling(path, key, folded)
             if key in _FORBIDDEN_KEYS and child not in (None, "", []):
                 die("unsafe local file/device field is not allowed: %s.%s" % (path, key))
             if _PATHLIKE_KEY.search(key) and key not in _FORBIDDEN_KEYS \

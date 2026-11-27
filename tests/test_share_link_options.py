@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from urllib.parse import quote
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
@@ -136,6 +137,59 @@ class SubscriptionVerdicts(unittest.TestCase):
         self.assertIn("true/false", nodes["bad-tfo"]["reason"])
         self.assertFalse(nodes["pinned"]["recognized"])
         self.assertIn("pinSHA256", nodes["pinned"]["reason"])
+
+
+class ProviderInputHardening(unittest.TestCase):
+    def test_case_variant_download_settings_are_refused(self):
+        def xhttp(extra):
+            return "vless://%s@example.com:443?security=tls&type=xhttp&extra=%s" % (
+                UUID, quote(json.dumps(extra)))
+        self.assertEqual(refused(mkxray, xhttp({"downloadSettings": {"address": "cdn.example.com"}})), "")
+        for extra in ({"downloadSettings": {"Address": "127.0.0.1", "port": 443}},
+                      {"downloadSettings": {"address": "cdn.example.com", "Port": 0}},
+                      {"DownloadSettings": {"address": "127.0.0.1"}}):
+            self.assertIn("must be spelled", refused(mkxray, xhttp(extra)), extra)
+
+    def test_decoded_control_characters_are_refused(self):
+        self.assertIn("control", refused(mkxray, "vless://%s@example.com:443?security=tls&sni=a%%0Ab" % UUID))
+        self.assertIn("control", refused(mksingbox, "hysteria2://pw@example.com:443?sni=a%0D%0Ab"))
+        self.assertIn("control", refused(mkxray, "vless://%s@example.com:443?security=tls&type=xhttp"
+                                          "&extra=%s" % (UUID, quote('{"headers":{"X":"a\\nb"}}'))))
+        legacy = dict(add="example.com", port="443", id=UUID, net="ws", host="a\r\nb")
+        link = "vmess://" + base64.b64encode(json.dumps(legacy).encode()).decode()
+        self.assertIn("control", refused(mkxray, link))
+
+    def test_saved_catalog_verdicts_are_recomputed(self):
+        link = "vless://%s@127.0.0.1:443?security=tls#loopback" % UUID
+        node = {"id": "a" * 64, "n": 1, "scheme": "vless", "link": link, "label": "loopback",
+                "server": "127.0.0.1:443", "recognized": True, "engine": "xray", "reason": "",
+                "variant": ""}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "catalog.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"schema": mksub.SCHEMA_VERSION, "meta": {}, "nodes": [node]}, fh)
+            loaded = mksub._load(path)["nodes"][0]
+        self.assertFalse(loaded["recognized"])
+        self.assertIn("non-public", loaded["reason"])
+
+    def test_direct_egress_warning_follows_the_protocol(self):
+        profile = {
+            "inbounds": [{"protocol": "socks", "tag": "socks", "port": 10808}],
+            "outbounds": [{"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{
+                               "address": "example.com", "port": 443,
+                               "users": [{"id": UUID, "encryption": "none"}]}]}},
+                          {"protocol": "freedom", "tag": "plain"}],
+            "routing": {"rules": [{"type": "field", "domain": ["full:x.example"],
+                                   "outboundTag": "plain"}]},
+        }
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIn("direct bypass", mksub._classify_profile(profile)[1])
+            profile["routing"]["rules"][0]["outboundTag"] = "proxy"
+            self.assertEqual(mksub._classify_profile(profile)[1], "")
+
+    def test_unterminated_osc_runs_are_stripped(self):
+        self.assertNotIn("\x1b", mksub.clean("\x1b]x" * 1000 + "ok\x1b]0;t\x07!"))
+        self.assertEqual(mksub.clean("a\x1b]0;title\x07b"), "ab")
 
 
 class CoresAcceptTheConfigs(unittest.TestCase):

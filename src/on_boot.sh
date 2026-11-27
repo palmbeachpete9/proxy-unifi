@@ -14,6 +14,8 @@ LOG="$ROOT/boot.log"
 # nothing to do if the package isn't installed
 [ -x "$CLI" ] || exit 0
 umask 077
+# Keep the log small: it lives on the gateway's flash for its lifetime.
+if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -ge 262144 ]; then mv -f "$LOG" "$LOG.old" || true; fi
 exec >>"$LOG" 2>&1
 printf '%s proxy-unifi boot recovery starting\n' "$(date -Iseconds 2>/dev/null || date)"
 
