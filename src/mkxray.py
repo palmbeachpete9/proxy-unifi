@@ -27,7 +27,8 @@ from proxylib import (die, b64decode_any, flat_query, qg, safe_urlsplit,
                       shadowsocks_credentials, add_secret_file_arguments,
                       load_generator_inputs, handle_common_generator_modes,
                       validate_xhttp_download_settings, shadowsocks_engine,
-                      bool_option, LOCAL_PATH_FIELDS, PATHLIKE_KEY)
+                      bool_option, check_field_spelling, has_control_chars,
+                      LOCAL_PATH_FIELDS, PATHLIKE_KEY)
 
 
 _COMMON_QUERY = {
@@ -64,9 +65,11 @@ def _validate_json_option(value, path, depth=0):
     if isinstance(value, dict):
         if path.endswith(".downloadSettings"):
             validate_xhttp_download_settings(value)
+        folded = {}
         for key, child in value.items():
             if not isinstance(key, str):
                 die("share-link JSON option contains a non-string key")
+            check_field_spelling(path, key, folded)
             if (key in LOCAL_PATH_FIELDS or PATHLIKE_KEY.search(key)) \
                     and child not in (None, "", []):
                 die("share-link JSON option contains an unsafe local path field")
@@ -78,6 +81,8 @@ def _validate_json_option(value, path, depth=0):
             die("share-link JSON option contains an oversized array")
         for index, child in enumerate(value):
             _validate_json_option(child, "%s[%d]" % (path, index), depth + 1)
+    elif isinstance(value, str) and has_control_chars(value):
+        die("share-link option '%s' contains control characters" % path)
 
 
 def _q_json(q, name):
@@ -448,6 +453,9 @@ def parse_vmess(link):
         q["path"] = str(v["path"])
         if grpc:
             q["serviceName"] = str(v["path"])   # grpc carries serviceName in "path"
+    for key, value in q.items():
+        if has_control_chars(value):
+            die("vmess link field '%s' contains control characters" % key)
     try:
         aid = int(v.get("aid", 0) or 0)
     except (TypeError, ValueError):

@@ -29,8 +29,8 @@ lsmod 2>/dev/null | awk 'NR > 1 && tolower($1) ~ /sfe|ecm|nss|flow|hnat|ppe|fast
 
 say "gateway's own downloads, 10 MB each (Mbit/s)"
 MARK="$(ip rule show | awk -v t="$TABLE" '$NF == t && /fwmark/ { for (i = 1; i <= NF; i++) if ($i == "fwmark") { split($(i + 1), a, "/"); print a[1]; exit } }')"
-printf 'WAN directly:       '; curl -4so /dev/null --max-time 30 -w '%{speed_download}\n' "$URL" | awk '{ printf "%.0f\n", $1 * 8 / 1e6 }'
-printf 'WireGuard (wgclt):  '; curl -4so /dev/null --max-time 30 -w '%{speed_download}\n' \
+printf 'WAN directly:       '; curl -q -4so /dev/null --noproxy '*' --max-time 30 -w '%{speed_download}\n' "$URL" | awk '{ printf "%.0f\n", $1 * 8 / 1e6 }'
+printf 'WireGuard (wgclt):  '; curl -q -4so /dev/null --noproxy '*' --max-time 30 -w '%{speed_download}\n' \
     --interface "$(ip route show table "$TABLE" | awk '/^default dev/ { print $3; exit }')" "$URL" | awk '{ printf "%.0f\n", $1 * 8 / 1e6 }'
 printf 'LAN route pair:     '; [ -n "$MARK" ] || MARK="none"; python3 - "$URL" "$MARK" <<'PY'
 import socket, ssl, sys, time, urllib.parse
