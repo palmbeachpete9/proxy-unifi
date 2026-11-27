@@ -153,12 +153,13 @@ def clean(s, maxlen=FIELD_MAX):
     """Return terminal-safe Unicode while preserving letters and emoji."""
     if not s:
         return ""
-    # ponytail: a label never needs more than this; the escape-stripping regexes
-    # below slow down quadratically on long hostile input.
+    # ponytail: a label never needs more than this.
     value = unicodedata.normalize("NFC", _repair_mojibake(str(s)[:4096]))
     if os.environ.get("PROXY_UNIFI_TERMINAL_SAFE_EMOJI") == "1":
         value = terminal_emoji_fallback(value)
-    value = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", value)
+    # No ESC inside the OSC body: each unterminated "ESC ]" then stops at the
+    # next ESC instead of rescanning to the end (quadratic on hostile input).
+    value = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", value)
     value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
     out = []
     for ch in value:
@@ -574,8 +575,14 @@ def _classify_profile(prof):
             strategies.append(str(strategy["type"]))
     if not bals:
         members = len(servers)
-    direct_bypass = any(bal.get("fallbackTag") == "direct" for bal in bals) or any(
-        rule.get("outboundTag") == "direct" for rule in routing.get("rules", []))
+    # Direct egress is any freedom outbound, whatever the provider tagged it.
+    direct = {str(outbound.get("tag", "")) for outbound in outs
+              if str(outbound.get("protocol", "")).lower() in ("freedom", "direct")}
+    direct_bypass = any(bal.get("fallbackTag") in direct
+                        or any(tag.startswith(selector) for tag in direct
+                               for selector in bal.get("selector", []))
+                        for bal in bals) or any(
+        rule.get("outboundTag") in direct for rule in routing.get("rules", []))
     warning = "provider routing permits direct bypass" if direct_bypass else ""
     return True, warning, members, ",".join(dict.fromkeys(strategies)) or "single", servers
 
@@ -1019,13 +1026,19 @@ def _load(path):
             die("catalog has a duplicate node id")
         seen_n.add(nd["n"])
         seen_id.add(nd["id"])
+        # A catalog saved by an earlier version may carry stale verdicts.
         if nd.get("kind") == "pool" or nd.get("scheme") == "json":
-            # A catalog saved by an earlier version may carry stale verdicts.
             try:
                 prof = json.loads(nd["profile"])
             except ValueError:
                 die("catalog pool node has an invalid profile")
             nd.update(_pool_verdict(prof))
+        else:
+            fresh = node_from_link(nd["link"])
+            if fresh is None or fresh.get("kind") == "pool" or fresh.get("scheme") == "json":
+                fresh = {"recognized": False, "reason": "no longer supported", "engine": "",
+                         "variant": ""}
+            nd.update({key: fresh[key] for key in ("recognized", "reason", "engine", "variant")})
     return cat
 
 
