@@ -42,7 +42,7 @@ from urllib.parse import urlsplit
 from proxylib import (die, valid_host, safe_port, xray_outbound_servers,
                       is_non_public_host as _is_non_public,
                       validate_xhttp_download_settings, nested_too_deep,
-                      dispatch_subcommand)
+                      dispatch_subcommand, check_field_spelling)
 
 
 MAX_PROFILE_BYTES = 2000000
@@ -52,24 +52,6 @@ MAX_BALANCERS = 64
 MIN_PROBE_SECONDS = 5.0
 _FORBIDDEN_KEYS = {"certificateFile", "keyFile", "masterKeyLog",
                    "socketPath", "unixSocket", "unixSocketPath"}
-# Xray matches JSON field names case-insensitively, with Unicode folding (the
-# long s "ſ" counts as "s"). Every field this module validates or strips must
-# arrive spelled exactly as it reads it, or a copy spelled differently
-# ("Inbounds", "inboundſ", "Redirect") would reach the core unchecked.
-_CHECKED_FIELDS = {}
-for _name in ("log", "api", "dns", "routing", "policy", "inbounds", "outbounds", "transport",
-              "stats", "reverse", "fakedns", "metrics", "observatory", "burstObservatory",
-              "geodata", "settings", "streamSettings", "tlsSettings", "sockopt", "mux",
-              "proxySettings", "dialerProxy", "vnext", "servers", "peers", "users", "accounts",
-              "address", "server", "port", "server_port", "endpoint", "redirect", "protocol",
-              "tag", "rules", "balancers", "selector", "subjectSelector", "fallbackTag",
-              "balancerTag", "outboundTag", "inboundTag", "strategy", "probeURL", "probeUrl",
-              "pingConfig", "destination", "interval", "timeout", "sampling", "probeInterval",
-              "hosts", "sniffing", "network", "source", "sourcePort", "user", "type", "remarks",
-              "dnsLog", "access", "error", "loglevel", "downloadSettings", "unixSettings",
-              "dsSettings", "certificateFile", "keyFile", "masterKeyLog", "socketPath",
-              "unixSocket", "unixSocketPath"):
-    _CHECKED_FIELDS.setdefault(_name.casefold(), set()).add(_name)
 _PATHLIKE_KEY = re.compile(
     r"(?:File|FilePath|SocketPath|KeyLog)$|(?:^|_)(?:file|file_path|socket_path|key_log)$")
 
@@ -127,14 +109,7 @@ def _validate_untrusted_tree(value, path="profile"):
         for key, child in value.items():
             if not isinstance(key, str):
                 die("%s has a non-string key" % path)
-            spellings = _CHECKED_FIELDS.get(key.casefold())
-            if spellings and key not in spellings:
-                die("%s.%s must be spelled %s" % (path, key, " or ".join(sorted(spellings))))
-            # Two spellings of one field ("probeURL" and "probeUrl"): we would
-            # check one, the core would use the other.
-            if spellings and key.casefold() in folded:
-                die("%s has both %s and %s" % (path, folded[key.casefold()], key))
-            folded[key.casefold()] = key
+            check_field_spelling(path, key, folded)
             if key in _FORBIDDEN_KEYS and child not in (None, "", []):
                 die("unsafe local file/device field is not allowed: %s.%s" % (path, key))
             if _PATHLIKE_KEY.search(key) and key not in _FORBIDDEN_KEYS \

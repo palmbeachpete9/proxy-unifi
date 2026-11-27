@@ -131,7 +131,7 @@ fi
 bounded_curl() {
     _url="$1"; _dest="$2"; _max="$3"
     ( ulimit -f $(((_max + 511) / 512)) 2>/dev/null || exit 1
-      curl -fsSL --connect-timeout 15 --max-time 120 --retry 3 \
+      curl -fsSL --proto-redir =https --connect-timeout 15 --max-time 120 --retry 3 \
           --max-filesize "$_max" "$_url" -o "$_dest" ) || { rm -f "$_dest"; return 1; }
     _size="$(wc -c < "$_dest" | tr -d ' ')"
     case "$_size" in ""|*[!0-9]*) rm -f "$_dest"; return 1 ;; esac
@@ -266,6 +266,8 @@ with tarfile.open(archive_path, "r:gz") as archive:
         dest = os.path.realpath(os.path.join(outdir, parts[2]))
         if dest != root and not dest.startswith(root + os.sep):
             raise SystemExit("unsafe archive path")
+        if parts[2] in found:
+            raise SystemExit("duplicate archive member")
         source = archive.extractfile(member)
         if source is None:
             raise SystemExit("could not extract archive member")

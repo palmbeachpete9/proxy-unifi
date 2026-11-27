@@ -36,7 +36,50 @@ SS2022_MAX_KEYS = 16
 SINGBOX_SS_PLUGINS = ("obfs-local", "simple-obfs", "v2ray-plugin")
 
 
+_CONTROL_CHARS = re.compile("[\x00-\x1f\x7f]")
 _UNSAFE_TEXT = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+
+# Xray matches JSON field names case-insensitively, with Unicode folding (the
+# long s "ſ" counts as "s"). Every field the validators read or strip must
+# arrive spelled exactly as they read it, or a copy spelled differently
+# ("Inbounds", "inboundſ", "Redirect") would reach the core unchecked.
+CHECKED_FIELDS = {}
+for _name in ("log", "api", "dns", "routing", "policy", "inbounds", "outbounds", "transport",
+              "stats", "reverse", "fakedns", "metrics", "observatory", "burstObservatory",
+              "geodata", "settings", "streamSettings", "tlsSettings", "sockopt", "mux",
+              "proxySettings", "dialerProxy", "vnext", "servers", "peers", "users", "accounts",
+              "address", "server", "port", "server_port", "endpoint", "redirect", "protocol",
+              "tag", "rules", "balancers", "selector", "subjectSelector", "fallbackTag",
+              "balancerTag", "outboundTag", "inboundTag", "strategy", "probeURL", "probeUrl",
+              "pingConfig", "destination", "interval", "timeout", "sampling", "probeInterval",
+              "hosts", "sniffing", "network", "source", "sourcePort", "user", "type", "remarks",
+              "dnsLog", "access", "error", "loglevel", "downloadSettings", "unixSettings",
+              "dsSettings", "certificateFile", "keyFile", "masterKeyLog", "socketPath",
+              "unixSocket", "unixSocketPath"):
+    CHECKED_FIELDS.setdefault(_name.casefold(), set()).add(_name)
+
+
+def has_control_chars(value):
+    return bool(_CONTROL_CHARS.search(value))
+
+
+def check_field_spelling(path, key, folded):
+    """Die unless a field the validators read arrives spelled exactly as they
+    read it, and only once (folded collects this object's spellings). Header
+    names, DNS host aliases and routing attribute names are data, not core
+    fields: a header called "Address" is not an address."""
+    if path.rsplit(".", 1)[-1] in ("headers", "hosts", "attrs"):
+        return
+    spellings = CHECKED_FIELDS.get(key.casefold())
+    if not spellings:
+        return
+    if key not in spellings:
+        die("%s.%s must be spelled %s" % (path, key, " or ".join(sorted(spellings))))
+    # Two spellings of one field ("probeURL" and "probeUrl"): we would
+    # check one, the core would use the other.
+    if key.casefold() in folded:
+        die("%s has both %s and %s" % (path, folded[key.casefold()], key))
+    folded[key.casefold()] = key
 
 
 def die(msg):
@@ -84,6 +127,10 @@ def flat_query(u):
     for key, value in pairs:
         if key in out:
             die("duplicate query parameter '%s'" % key)
+        # A decoded newline in an SNI, Host or plugin option would reach the
+        # generated config and the wire.
+        if has_control_chars(key + value):
+            die("query parameter '%s' contains control characters" % key)
         out[key] = value
     return out
 

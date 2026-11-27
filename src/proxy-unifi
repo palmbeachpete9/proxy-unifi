@@ -753,7 +753,7 @@ PYEOF
 download_to() {
     _d_url="$1"; _d_dst="$2"; _d_max="${3:-419430400}"
     ( ulimit -f $(((_d_max + 511) / 512)) 2>/dev/null || exit 1
-      curl -fsSL --connect-timeout 30 --max-time 600 --retry 6 --retry-delay 3 \
+      curl -fsSL --proto-redir =https --connect-timeout 30 --max-time 600 --retry 6 --retry-delay 3 \
           --max-filesize "$_d_max" "$_d_url" -o "$_d_dst" ) \
         || { rm -f "$_d_dst"; return 1; }
     _d_size="$(wc -c < "$_d_dst" | tr -d ' ')"
@@ -763,7 +763,7 @@ download_to() {
 
 # Resolve the latest tag from a .../releases/latest redirect.
 resolve_latest_tag() {
-    curl -fsSLI --connect-timeout 30 --max-time 120 --retry 5 --retry-delay 3 "$1/latest" 2>/dev/null \
+    curl -fsSLI --proto-redir =https --connect-timeout 30 --max-time 120 --retry 5 --retry-delay 3 "$1/latest" 2>/dev/null \
         | awk -F'/tag/' '
         tolower($0) ~ /location:/ {
             value=$2; sub(/[[:space:]\r].*$/, "", value); tag=value
